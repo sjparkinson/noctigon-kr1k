@@ -26,6 +26,7 @@
     )
 )]
 
+pub mod aw2016;
 pub mod battery;
 pub mod board;
 pub mod button;

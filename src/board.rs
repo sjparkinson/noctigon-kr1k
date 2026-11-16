@@ -26,9 +26,9 @@
 //! | PF7           | UPDI, left alone                                       |
 //!
 //! The RGB aux LEDs hang off the AW2016, an I2C LED driver, so no MCU pin
-//! lights a colour. `ui::Aux` still says which colour the library wants, and
-//! turning that into AW2016 channel writes is a job for a TWI driver that
-//! doesn't exist yet. Until then the aux stays dark.
+//! lights a colour. `kr1k::aw2016` turns `ui::Aux` into AW2016 register
+//! writes, and the AW2016 outputs each colour is on are below, as
+//! [`AUX_RED`], [`AUX_GREEN`] and [`AUX_BLUE`].
 //!
 //! PA1 is the one pin that isn't what the stock board definition says. That
 //! has nothing on it and gives it a pull-up, but the build this torch shipped
@@ -75,6 +75,15 @@ pub const UNUSED_PD5: u8 = 5;
 pub const DAC: u8 = 6;
 /// PD7, a power-bank enable on other boards.
 pub const POWER_BANK: u8 = 7;
+
+/// The AW2016 output the red aux are on, counting LED1 as 0. These three are
+/// the stock firmware's channel map, and nobody has traced them on a real
+/// board.
+pub const AUX_RED: u8 = 1;
+/// The AW2016 output the green aux are on, LED1.
+pub const AUX_GREEN: u8 = 0;
+/// The AW2016 output the blue aux are on, LED3.
+pub const AUX_BLUE: u8 = 2;
 
 /// PF6, the reset pin.
 pub const RESET: u8 = 6;
