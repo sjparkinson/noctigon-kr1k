@@ -118,10 +118,10 @@ Write the result in the [table](#results) before going on.
 
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
-| 4.1 | | `cargo xtask flash <port>` with no file, then `ping`, then probe off and leave it a few seconds with no cell, so VDD really collapses | Verify passes, and it still talks | |
+| 4.1 | Pass | `cargo xtask flash <port>` with no file, then `ping`, then probe off and leave it a few seconds with no cell, so VDD really collapses | Verify passes, and it still talks | |
 | 4.2 | | If the light's dark from here on | `cargo xtask peek <port>` first, since only the first run shows how far the firmware got. Then flash the first-light image again. If that still works, it's the firmware, and the board's fine | |
-| 4.3 | | Cell in, head on, ten times, watching the emitter | No flash, and off until clicked | |
-| 4.4 | | 1C on, 1C off, a few dozen times, then holds | Same feel as the docs/ui.md rows | |
+| 4.3 | Pass | Cell in, head on, ten times, watching the emitter | No flash, and off until clicked | |
+| 4.4 | Pass | 1C on, 1C off, a few dozen times, then holds | Same feel as the docs/ui.md rows | |
 | 4.5 | | Tail current, off, on the 4 A range | 0.000 to 0.003 once it's asleep. Anything steadily over about 5 mA isn't a sleeping chip, or it's a reset loop | The rough version of the off current |
 | 4.6 | | An hour on at a low level, in sight | Stays on and doesn't move. Going out is the watchdog biting or the tick deadline | "It never trips in normal use", in part |
 | 4.7 | | Leave it off overnight, then 1C | Comes on at once | |
@@ -201,3 +201,6 @@ Fill this in as you go, with the commit you flashed.
 | 2.4 | 2026-11-16 | `a9ef250` | `cargo xtask ping` after the flash answered `AVR     P:2D:1-3`, the same as before it |
 | 3.1, 3.2 | 2026-11-16 | `a9ef250` | First light on the torch. Cell in and head done up, then clicked on and off. Reported as all fine, no flash and a steady low light. The count of cell insertions and clicks wasn't recorded |
 | 3.3, 3.4 | 2026-11-16 | `a9ef250` | Skipped, no tail current measured |
+| 3.5, 3.6 | 2026-11-16 | `a9ef250` | Not done. The full firmware went on without them, by the owner's choice after 3.1 and 3.2 looked right |
+| 4.1 | 2026-11-16 | `910c667` | `cargo xtask flash` wrote all 32 KB of the full firmware (stamp `kr1k 910c66741a`, SHA-256 `8168f352…64c3`), verified and restarted. `ping` answered `AVR     P:2D:1-3` after it. The first full-size write this programmer has done on a real chip |
+| 4.3, 4.4 | 2026-11-16 | `910c667` | Cell in and head on, then clicks and holds. Reported as all good, the light off until clicked and the UI as docs/ui.md has it. The counts weren't recorded |
