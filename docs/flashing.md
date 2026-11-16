@@ -1,36 +1,42 @@
 # Flashing
 
-`cargo xtask` has a UPDI programmer built in. It runs on macOS and Linux, and sets up the serial port with `stty`.
+`cargo xtask` has a UPDI programmer built in. It runs on macOS and Linux, and sets up the serial port with `stty`. Nobody has used it on a KR1K yet, and nobody has found this torch's pads, so everything below about the torch is a plan.
 
 ## Only the plain adapter goes on this torch
 
-Only a non-high-voltage UPDI adapter ever goes on the TS26's pads. Adafruit's High Voltage UPDI Friend never does, and that includes trying to recover a torch that's stopped talking. There's no exception for a torch that's already dead. If UPDI's gone, the torch is gone.
+Only a non-high-voltage UPDI adapter ever goes on the KR1K's pads, and only at the 4.5 V the JLHawaii808 kit supplies. Adafruit's High Voltage UPDI Friend never does, nor any other 12 V programmer, and that includes trying to recover a torch that's stopped talking. There's no exception for a torch that's already dead. If UPDI's gone, the torch is gone.
 
-An earlier torch was lost on 2026-11-06 after the Friend was hand-held on its pads. It then measured about 2.5 Ω between all three pads. The likely cause is 12 V or a slipped probe, but neither is proven.
+On this chip there's no reason to reach for one anyway. The UPDI pad (`R`, if the layout is the usual one) is PF7, which is rated to VDD + 0.3 V like any ordinary pin (DS40002413B table 38-1). The high-voltage override goes on the RESET pin, PF6, which the three-pad layout doesn't bring out, and wants 7.5 to 8.5 V there, against a 9 V absolute maximum (§36.3.2.1.2, table 38-29). The Friend's 12 V on PF7 is far outside its rating, and wouldn't do the job if it weren't.
 
-The Friend puts a 12 V pulse on the UPDI line on every falling edge of RTS, which probably means every time a tool opens the port, and nothing turns that off. The chip's RESET pin is rated for that, but nobody knows what else sits on these pads. Keep it for a breakout. [breakout.md](breakout.md#the-high-voltage-updi-friends-12-v-pulse) has the detail.
+An earlier torch, a Wurkkos TS26, was lost on 2026-11-06 after the Friend was hand-held on its pads, and it then measured about 2.5 Ω between all three. The likely cause is 12 V or a slipped probe, and neither is proven. It's the reason this rule exists, and it's not evidence about this board.
 
 Both adapters are CH340s and show up as USB ID `1a86:7523`, with the same kind of port name, so nothing on the computer tells you which one you've plugged in. Look at the one in your hand, and keep the Friend unplugged and off the bench whenever the torch is open.
 
+## Never write fuses
+
+Nothing in this repo writes fuses, and nothing should. `SYSCFG0.UPDIPINCFG` set to GPIO turns PF7 into an ordinary pin at start-up (DS40002413B §8.8.2.4), and the only way back is the high-voltage pulse on PF6 above, which this torch never gets. The programmer writes flash and EEPROM, and never fuses, the user row or a locked chip.
+
 ## What you need
 
-A serial UPDI adapter and some way to hold it on three tiny pads.
+[JLHawaii808's kit](https://jlhawaii808.com/products/updi-programmer-driver-reflashling-kit), the 4.5 V version, with its pogo probe. It's a CH340 serial UPDI adapter with USB-C, and it's what the owner has. thefreeman says 3.3 V programmers aren't very reliable on AVR32DD20 boost drivers, and his 4.5 V programmer has extra capacitance for inrush ([BLF thread](https://budgetlightforum.com/t/wts-usb-updi-programmers-for-attiny1616-avr32dd20-drivers-sofirn-wurkkos-fireflylite-emisar/71459)). Don't use the kit's 3.3 V version here.
 
-The easy option is a ready-made USB UPDI programmer. [JLHawaii808's kit](https://jlhawaii808.com/products/updi-programmer-driver-reflashling-kit) is a CH340 serial UPDI adapter with USB-C, in 3.3 V and 4.5 V versions, and either works for Wurkkos lights (the 4.5 V one is listed for Sofirn, Wurkkos and Emisar). thefreeman sells one on BLF ([thread](https://budgetlightforum.com/t/wts-usb-updi-programmers-for-attiny1616-avr32dd20-drivers-sofirn-wurkkos-fireflylite-emisar/71459)) that comes with loose pogo-pin leads as well as the fixed probe.
-
-The cheap option is a USB-serial adapter (CH340, CP2102, FT232) wired as a serial UPDI programmer, with TX and RX joined and that joined line going to the UPDI pad. [pymcuprog's README](https://github.com/microchip-pic-avr-tools/pymcuprog) suggests a series resistor of about 1 kΩ between TX and UPDI, and an adapter running at the same voltage as the MCU. The CH340 module in [pingle.org's guide](https://www.pingle.org/2022/08/07/flashing-a-3-pin-t1616-flashlight-with-new-firmware) worked wired straight through. Add pogo pins or a steady hand.
-
-Watch the pad spacing before you rely on a fixed probe. gchart's standard three-pad layout is `+ - R` at 1.27 mm pitch, and that's what most probes expect. Some Wurkkos and Sofirn boards use 2.54 mm instead (thefreeman ships loose leads for exactly that reason), and some put the pads in a different order. That earlier torch's pads turned out to be about 1.75 mm apart, not the 1.27 mm that had been written down, and that's neither of those. So measure the pitch on your own board before trusting any probe. One that nearly fits sits on the edges of the pads, which is how it slips. Loose pogo leads work whatever the layout. Use a short USB cable too; JLHawaii808 notes failures with 1 m ones.
+Watch the pad spacing before you rely on the fixed probe. The common three-pad layout is `+ - R` at 1.27 mm pitch, which is what the probe expects, and the reflash reference puts Hank's AVR32DD20 Lume X1 in that family. But nobody has published a KR1K's pads, some boards use another pitch or another order, and the TS26 that was lost had pads about 1.75 mm apart against a written-down 1.27 mm. So measure the pitch on this board before trusting the probe. One that nearly fits sits on the edges of the pads, which is how it slips. Loose pogo leads work whatever the layout. Use a short USB cable too; JLHawaii808 notes failures with 1 m ones.
 
 ## The pads
 
-Where the TS26's pads are, which is which and their pitch are in [hardware.md](hardware.md#the-flashing-pads), with how sure anyone is about each. Check there before you buy a fixed probe.
+Where the KR1K's pads are, and what's likely about them, is in [hardware.md](hardware.md#the-flashing-pads). In short, nothing is known about this board, and `+ - R` at 1.27 mm is the best guess.
 
-Whatever the layout, take the cell out, since the programmer powers the MCU through its supply pad (anything from 3.3 V to 5 V depending on the programmer, and the MCU's rated to 5.5 V). Nobody's reported what else that supply reaches on a TS26, the boost converter included, so make the first contact in the dark, watching the emitters, as row 1.7 of [breakout.md](breakout.md#what-the-adapter-powers) has it. Before anything touches the UPDI pad, check with a multimeter that the pad you think is ground connects to the battery negative contact. Pad order isn't the same on every light, and a probe the wrong way round puts the supply on UPDI. Finding ground only names one pad of three, so tell the supply pad from the UPDI pad as well before the probe goes on. Rows 1.5 and 1.6 of [breakout.md](breakout.md#stage-1-the-pads-and-stock) do that from how each reads against ground with the cell out, and row 0.16 names the probe's own three pins first.
+Take the cell out first, every time. VDD on this driver is the cell, so the programmer's supply on `+` powers the MCU directly, and very likely the boost converter's input and the AW2016 too, since they all hang off the cell rail (reasoning, unmeasured). With a cell in, the programmer and the cell would fight over the same rail. Don't touch the switch while the probe's on.
 
-Measure the ohms between each pair of pads before the first contact and write them down, so you've got something to compare with if it stops talking. Nobody knows what a good TS26 reads. About 2.5 Ω between all three is what the dead one read.
+Then name all three pads with a multimeter before anything touches them.
 
-If you can manage it, hold the probe with something that can't slip rather than your hand.
+1. Continuity from each pad to the battery negative contact. Exactly one should be ground. If none is, stop.
+2. Ohms from each of the other two to ground, watching how the reading moves. The supply pad has the board's capacitors on it, so it should start low and climb as the meter charges them. The UPDI pad has only PF7 on it, whose pull-up is inside the chip and only works powered (DS40002413B §8.8.2.4), so it should read very high from the start. That's a prediction from the datasheet. If the two don't differ clearly, stop.
+3. Ohms between each pair of pads, both ways round, written down as the baseline. A few ohms between all three is a short, and that means stop.
+
+Pad order isn't the same on every light, and a probe the wrong way round puts the adapter's 4.5 V on PF7 with the chip unpowered, which is outside its rating. If any naming is in doubt, stop.
+
+Make the first contact in a dark room, watching the emitter, with a finger on the adapter. The stock firmware starts when the programmer powers the chip, and it might light the emitter as it does. Light that stays on, or warmth in the adapter, is a stop. Hold the probe with something that can't slip rather than your hand, if you can.
 
 ## Find the port
 
@@ -42,41 +48,27 @@ Run `ls /dev/cu.*` before and after plugging the adapter in. On macOS it's somet
 cargo xtask ping /dev/cu.usbserial-XXXX
 ```
 
-This reads the chip's System Information Block and writes no memory, but don't count on it leaving a running chip alone. `ping` finishes by setting UPDIDIS to turn UPDI off, and DS40002204A §33.3.2.2.2 says that's when "the UPDI will issue a System Reset". So expect the firmware to restart as `ping` ends, which loses the remembered level and clears a cap left by a watchdog reset. The datasheet doesn't say whether turning UPDI on disturbs running code (§33.3.2.1.1 doesn't mention a reset), and the reset in §33.3.2.1.3 is UPDI's own, from the 12 V pulse. Nobody's seen any of this on a real chip. Row 0.8 of [breakout.md](breakout.md#stage-0-the-breakout) finds out. Another ATtiny1616 board said `found tinyAVR P:0D:0-3`, so expect something like that. If you don't, see [If it doesn't talk](#if-it-doesnt-talk).
+This reads the chip's System Information Block and writes no memory, but don't count on it leaving a running chip alone. `ping` finishes by writing UPDIDIS, "upon which the UPDI will issue a System Reset" (DS40002413B §36.3.2.2.2). So expect the firmware to restart as `ping` ends. Nobody has seen what an AVR32DD20 says to `ping`. pymcuprog calls its NVM version P:2, so expect something with `P:2` in it. If you don't get an answer, see [If it doesn't talk](#if-it-doesnt-talk).
 
 ## Back up the factory firmware first
 
-Do this before you flash anything. It's the only copy of Wurkkos's build and its calibration that you'll have.
+Do this before you flash anything. It's the only copy of Hank's build and its fuses that you'll have.
 
 ```sh
 cargo xtask backup /dev/cu.usbserial-XXXX backup/torch
 ```
 
-That puts the chip in programming mode, checks it's an ATtiny1616, and saves `flash.hex` (all 16 KB), `eeprom.hex`, `fuses.hex` and `serial.hex` into the directory you name. The fuses are there for reference only. The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy with this firmware.
+That puts the chip in programming mode, checks its signature, and saves `flash.hex`, `eeprom.hex`, `fuses.hex` and `serial.hex` into the directory you name. The fuses are there for reference only, and they're the first evidence of what Hank's factory programming wrote ([hardware.md](hardware.md#fuses)). The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy.
 
 If it warns that the serial number can't tell one chip from another (all FF or all 00), the backup is saved all the same, but `restore` will refuse it. Stop there, before anything goes over the factory firmware.
 
-The directory holds one chip's backup. Give each chip its own, such as `backup/torch` here and `backup/breakout` for a spare. The path is used as given, so run the command from the repo root for it to land in the repo's `backup/`, which is git-ignored. Copy it somewhere safe too. There's no default. Leave the directory off and you get the usage text.
+The directory holds one chip's backup. The path is used as given, so run the command from the repo root for it to land in the repo's `backup/`, which is git-ignored. Copy it somewhere safe too.
 
-## The first flash is T0
+## The first flash is a first-light image
 
-The first thing that goes on a torch is T0, the first-light build, and nothing else. It's the firmware as of commit `9d3b7dc`, which the branch `build-t0` points at. The commands below use the commit, which can't move the way a branch can. It's a 628-byte image that clicks on and off at one dim level. It has no watchdog, no sleep and no interrupts, so there's very little in it to hang, and a light that works shows the pads, the programmer, the boost enable and the PWM all do what this repo thinks they do.
+The first thing that goes on the KR1K is a first-light image built for the AVR32DD20, and nothing else. It doesn't exist yet. It'll be the smallest firmware that turns the light on and off at one low level through PC1 and the DAC, with as little as possible in it to hang, so a light that works shows the pads, the programmer, the enable, the DAC and a path all do what this repo thinks they do. The full firmware only goes on once that's proven on the light, which is stage 3 of [breakout.md](breakout.md#stage-3-first-light-on-the-torch).
 
-Build it in a second worktree and flash it from main, so the image is `9d3b7dc`'s and the programmer is main's.
-
-```sh
-git worktree add --detach ../ts26-t0 9d3b7dc
-(cd ../ts26-t0 && cargo xtask hex)
-cargo xtask flash /dev/cu.usbserial-XXXX ../ts26-t0/target/wurkkos-ts26-0721.hex
-```
-
-`cargo xtask hex` in that worktree should report 628 bytes of flash, and it did when built on 2026-11-09 and again on 2026-11-14. Checking out `9d3b7dc` and running `cargo xtask flash` there would flash the same image with that commit's programmer, which is older than main's and doesn't have its later fixes or its clearer errors.
-
-Main's `flash` takes the file because its name has `ts26` in it. It then warns that the image isn't the full 16,384 bytes with a CRC, and that a build of this firmware like that caps itself at level 50. Expect the warning and carry on. T0 has no CRC check, so nothing in it does any capping. Keep the worktree until stage 3 has passed, since a torch that goes dark later gets T0 again.
-
-The full firmware only goes on once that's proven on the light, which is stage 3 of [breakout.md](breakout.md#stage-3-t0-on-the-light). The earlier torch went dark straight after a flash that verified, of a firmware with far more going on at start-up, and a firmware hang wasn't ruled out. Starting small means a dark torch here has a short list of causes.
-
-T0 has no low-voltage protection and doesn't sleep, so don't leave a cell in it.
+The repo's history has a first-light image for the TS26 at commit `9d3b7dc`. It's built for the ATtiny1616, and it must never go on this torch.
 
 ## Flash this firmware
 
@@ -86,65 +78,47 @@ cargo xtask flash /dev/cu.usbserial-XXXX
 
 That builds the firmware, refuses it if the simulator finds a mistake, and then
 
-1. puts the chip in programming mode and checks its signature (1E 94 21)
-2. chip-erases it, which wipes flash and, unless the EESAVE fuse is set (Microchip ships it unset), EEPROM
-3. writes the image a 64-byte page at a time, skipping blank pages (the erase already left them blank). The image is padded to all 16 KB, with a 16-byte stamp of the commit (`ts26 <hash>`, and a `+` if the tree was dirty) just before a CRC in the last two bytes, which the firmware checks at power-on, so the last page always gets written. `flash` prints the stamp it's about to write, and `backup` the one it found
-4. reads all 16 KB back and compares
+1. puts the chip in programming mode and checks its signature (`1E 95 3A`)
+2. chip-erases it, which wipes flash and, unless the EESAVE fuse is set, EEPROM
+3. writes the image, which ends in a stamp of the commit and a CRC the firmware checks at power-on
+4. reads it all back and compares
 5. resets the chip and turns UPDI off, so the new firmware starts
 
-If a write or the compare fails, step 5 still runs, so the chip isn't left in programming mode. Whatever was half-written then runs, but with the cell out it's powered by the programmer alone. Run the command again. The same goes for step 1, for a `backup` whose read fails and for a `restore` that's refused, because the programmer resets the chip and turns UPDI off before it reports the error.
+If a write or the compare fails, step 5 still runs, so the chip isn't left in programming mode. Run the command again.
 
-Step 1 is the only check on the chip before the erase, and the signature only says it's an ATtiny1616. Any other ATtiny1616 board passes it, so does a chip whose fuses this firmware can't live with, and `flash` never looks at the fuses. Read `backup/torch/fuses.hex` yourself first, and make sure you're in the right repo for the torch on the bench. `flash` with a file refuses a name without `ts26` or `0721` in it, but that's the name and nothing more. It also refuses a full 16 KB image whose CRC doesn't check, since that would cap itself at level 50, and warns about a shorter one, which is right for the stock firmware and for T0, and wrong for a build of the full firmware. Step 4 only says the bytes arrived, and says nothing about whether they run.
+Step 1 is the only check on the chip before the erase, and the signature only says it's an AVR32DD20. `flash` never looks at the fuses, so read `backup/torch/fuses.hex` yourself first. `flash` with a file refuses a name without `kr1k` or `0283` in it, but that's the name and nothing more. Step 4 only says the bytes arrived, and nothing about whether they run.
 
-A flash doesn't power-cycle the chip, so take the probe off with the cell out and leave it a few seconds, so VCC really collapses, before putting the cell in. Otherwise what the old firmware left in the reset flags could look like a hang.
+A flash doesn't power-cycle the chip, so take the probe off and leave it a few seconds before putting the cell in, so VDD really collapses.
 
-If the light goes dark after a flash that verified, run `cargo xtask peek /dev/cu.usbserial-XXXX` before anything else. It reads the running chip's registers and SRAM, which shows how far the firmware got. It finishes the same way as `ping`, with what's most likely a reset, so only the first run shows what the firmware had been doing, and a `ping` before it would spoil that. If it talks, flash T0 again. A light that comes back points at the firmware, and one that doesn't points at the board. If it doesn't talk, see [below](#if-it-doesnt-talk), and stop there.
-
-## If it won't come on
-
-The firmware keeps the light off if a check at power-on fails (flash doesn't match its CRC, the fuses aren't what it expects, or the watchdog reset the chip). The aux shows white for three seconds after power-on and after each press, and dark otherwise. It doesn't say which check failed. None of the three has met a real TS26, so suspect the checks before the torch, in this order.
-
-1. **A watchdog reset.** Take the cell out, wait a few seconds, and put it back. That's the only one this clears, so if it lights now, something bit. It might be a real hang, or the reset flags left over from before a flash, and if it comes back after use, it's the firmware or the watchdog's window, which nobody's seen on a real chip.
-2. **The CRC.** A dark torch straight after a flash that verified points at the sum in `xtask/src/crc.rs`, which has never been checked by real hardware. After an interrupted flash, run `cargo xtask flash` again.
-3. **The fuses.** Compare `backup/torch/fuses.hex` with `selftest::Fuses::ok` in `src/selftest.rs`, which has never seen a real TS26's bytes. Nothing here writes fuses, and on this torch that's not something to start doing to clear a fault. A dark torch with a white aux is a chip that's running and says so.
-
-A watchdog fault only lasts for the boot that saw the watchdog's flag, so a later reset of another kind clears it too, and that probably includes the one at the end of `ping` or `peek`.
-
-One more thing is a fault, and it isn't a check at power-on. It's a cell voltage the firmware can't believe, under 1.00 V or over 4.40 V by its own sums, which is also what a dead ADC reads as. It's the only cause that lets the light come on, for about a second, before fading it out. So a light that fades out right after 1C and then shows white is this and not dead firmware. On a torch it points at the divider on PA1 or the 1094 calibration, and neither has met a real TS26.
-
-Yellow on the aux after a press, with the light dark, is a flat cell, not a fault. Charge it, and the next click lights it.
+If the light goes dark after a flash that verified, run `cargo xtask peek /dev/cu.usbserial-XXXX` before anything else. It reads the running chip's registers and SRAM, which shows how far the firmware got, and finishes with the same reset as `ping`, so only the first run shows anything. If it talks, flash the first-light image again. A light that comes back points at the firmware, and one that doesn't points at the board.
 
 ## Going back
 
-`restore` puts a backup's flash and EEPROM back, and only onto the chip they were read from. Before it erases anything it reads the chip's serial number and compares it with the backup's `serial.hex`, and it refuses on a mismatch, a missing `serial.hex` or a serial number that's blank. The datasheet calls the number unique to each device (DS40002204A §6.10.2.2), and nobody here has compared two chips'. It writes every EEPROM page, blank ones included, since with EESAVE set the old contents survive the erase.
+`restore` puts a backup's flash and EEPROM back, and only onto the chip they were read from. Before it erases anything it reads the chip's serial number and compares it with the backup's `serial.hex`, and it refuses on a mismatch, a missing `serial.hex` or a serial number that's blank.
 
 ```sh
 cargo xtask restore /dev/cu.usbserial-XXXX backup/torch
 ```
 
-The check says which chip a backup came from and nothing about which build it holds, so a later backup of the same chip passes too. Read the directory in the command before you run it. `flash` has no such check, since it has no backup to compare.
+The check says which chip a backup came from and nothing about which build it holds, so read the directory in the command before you run it.
 
-To go back to the stock firmware without a backup, download its latest release zip (the [README](../README.md#acknowledgements) links the project) and pull the TS26 build out of its `hex/` directory. Model 0721 is `wurkkos-ts26`, so it's the file ending in `.wurkkos-ts26.hex`. Flash that.
+To go back to the stock firmware without a backup, download its latest release (the [README](../README.md#acknowledgements) links the project) and take the build for model 0283, Hank's Lume X1-C, saved under a name with `0283` in it so `flash` takes it, or 0284 if the board's PCB code says it's the 32 W version ([hardware.md](hardware.md#which-kr1k-this-is)). The KR1K has no build of its own, so check the PCB code before picking. This project hasn't flashed one onto a KR1K.
 
 ```sh
-cargo xtask flash /dev/cu.usbserial-XXXX path/to/release.wurkkos-ts26.hex
+cargo xtask flash /dev/cu.usbserial-XXXX path/to/stock-0283.hex
 ```
-
-The TS26 has a build of its own, so there's no guessing which one to pick. This project hasn't flashed one onto a TS26.
 
 ## If it doesn't talk
 
-- "no reply from the chip" means the adapter heard itself and the chip said nothing, which usually means poor contact or the wrong pad on UPDI. It's also what you get with the probe in the air. Reseat the probe or check the pads again, and don't lean on it. The tool already retries once with a UPDI double break.
-- "nothing echoed back" with the probe in the air means the adapter isn't joining TX and RX, so it isn't a serial UPDI adapter (or the joining wire's come off).
-- "nothing echoed back" with the probe on the pads, from an adapter that says "no reply" in the air, is the bad one. Something's pulling the UPDI line down so hard the adapter can't hear its own bytes, which means the probe's on the ground pad or there's a short on the board. Better contact won't fix that. Take the probe off, check the pad order, and measure the ohms against the numbers you wrote down. That's a lesson from the dead torch, and the Friend still stays off.
-- If a DIY adapter never works with TX and RX tied directly, add the 1 kΩ resistor.
-- thefreeman's older 3.3 V programmers had trouble with some lights, which is why the current one supplies 4.5 V. If yours is 3.3 V and flaky, that might be it.
-- The anduril.click [UPDI guide](https://anduril.click/drivers/updi.html) and the [reflash reference](https://budgetlightforum.com/t/anduril-flashlight-reflash-reference-updated-for-2024/216942) cover more adapters and their quirks.
+- "no reply from the chip" means the adapter heard itself and the chip said nothing, which usually means poor contact or the wrong pad on UPDI. It's also what you get with the probe in the air. Reseat the probe or check the pads again, and don't lean on it.
+- "nothing echoed back" with the probe in the air means the adapter isn't joining TX and RX, so it isn't a serial UPDI adapter.
+- "nothing echoed back" with the probe on the pads, from an adapter that says "no reply" in the air, is the bad one. Something's pulling the UPDI line down so hard the adapter can't hear its own bytes, which means the probe's on the ground pad or there's a short on the board. Take the probe off, check the pad order, and measure the ohms against the numbers you wrote down. The Friend still stays off.
+- The anduril.click [UPDI guide](https://anduril.click/drivers/updi.html) and the [reflash reference](https://budgetlightforum.com/t/anduril-flashlight-reflash-reference-updated-for-2024/216942) cover more adapters and their quirks. Their AVR32DD20 commands use `avrdude -p avr32dd20 -c serialupdi`, which is a second opinion if `xtask` and the chip disagree. Don't use any of their fuse commands.
 
 ## How it works
 
-The programmer writes flash and EEPROM, and only those. That's all a TS26 needs, and it keeps fuses out of reach, since a bad fuse write can turn off UPDI, and the only way back from that is 12 V on the pads, which this torch never gets.
+The programmer writes flash and EEPROM, and only those. That's all this torch needs, and it keeps fuses out of reach.
 
-`xtask/src/updi.rs` is the protocol, covering link set-up, the NVM programming key, reset, page-buffer writes through the NVM controller and reads in 256-byte blocks. The sequences follow Microchip's pymcuprog, and the registers come from the ATDF. The wait for programming mode is 500 ms on the clock. `xtask/src/serial.rs` opens the port, configures it with `stty` (115200 baud, 8 data bits, even parity, 2 stop bits) and swallows the echo that a one-wire adapter sends back. It drains the port on open and after a double break, so a stale byte from the probe landing can't fail the first instruction.
+`xtask/src/updi.rs` is the protocol, covering link set-up, the NVM programming key, reset, flash writes through the NVM controller and reads in blocks. The AVR DD's controller writes flash a word at a time with no page buffer and erases it in 512-byte pages, and UPDI reaches flash at 0x800000 with 24-bit addresses (DS40002413B chapters 11 and 36). Microchip publishes no separate UPDI programming specification for the AVR DD, so the sequences follow pymcuprog, and the registers come from the ATDF. `xtask/src/serial.rs` opens the port, configures it with `stty` (115200 baud, 8 data bits, even parity, 2 stop bits) and swallows the echo that a one-wire adapter sends back.
 
-The tests run all of it against a pretend ATtiny1616 in `updi.rs`. That catches slips in framing and sequencing, but it was written from the same reading of the datasheet as the programmer, so the first run against a real chip is the real test. Start with `ping`, then `backup`.
+The tests run all of it against a pretend chip in `updi.rs`. That catches slips in framing and sequencing, but it was written from the same reading of the datasheet as the programmer, so the first run against a real chip is the real test. Start with `ping`, then `backup`.
