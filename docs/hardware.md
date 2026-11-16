@@ -100,9 +100,36 @@ The tick is the RTC's PIT at `CYC512` from the internal 32.768 kHz oscillator, 6
 
 The aux LEDs are on an Awinic AW2016, an I²C three-channel LED driver, on TWI0 (PA2 and PA3). Confirmed as what the stock firmware drives. Its comments call its PWM 250 Hz and "obnoxiously slow", so a dim aux visibly strobes, give the lowest current settings as 5, 10, 15 or 30 mA globally with 0 to 15 of 15 per channel, and put aux low at about 0.3 mA. It maps red to the chip's channel 1, green to 0 and blue to 2. Confirmed as what the source says. Awinic's product page lists the same four global currents.
 
-After power-up the AW2016's outputs are off, and Awinic's product page says it runs a pattern of its own when its CHRG pin is pulled high with I²C halted. What CHRG is wired to here, nobody knows. The AW2016 sits on the cell rail (likely, since there's nothing else to power it), so its standby current is drawn whatever the MCU does, and nobody has measured it on this board.
+The AW2016 sits on the cell rail (likely, since there's nothing else to power it), so its standby current is drawn whatever the MCU does, and nobody has measured it on this board.
 
-This firmware leaves the AW2016 alone for now and never addresses it, so the aux stays dark. Driving it needs a TWI host driver, which is new work.
+### What its datasheet says
+
+From the AW2016 datasheet, V1.3 (Awinic, October 2023), which V1.1 (2017) agrees with on all of this. Confirmed for the chip. Awinic lists a V1.4 from April 2026 that nobody here has read. The datasheet is Awinic's, marked confidential, and its disclaimer allows reproduction only unaltered and complete, so it isn't in this repo.
+
+- **I²C.** A fixed 7-bit address of 0x64, with no address pins. Up to 400 kHz, SCL low at least 1.3 µs. A write's register address goes up by one after each byte, so one transfer fills a run of registers. It wants external pull-ups of 1 to 10 kΩ, and its pins take up to 6 V, with fixed input levels (VIL 0.4 V, VIH 1.3 V).
+- **Supply.** VBAT 2.5 to 5.5 V. Under-voltage lockout at 2.0 V typical clears CHIPEN. V1.3 adds that VBAT has to rise from 0 in under 1 ms, with no steps, for its configuration to load, which a cell going in likely does and a programmer's supply may not.
+- **Modes.** Standby, its state after power-up, with every register at its reset value and the oscillator off, where only RSTR (0x00) and GCR1 (0x01) take a write. Active, with GCR1.CHIPEN set, or with CHRG high and GCR1.CHGDIS clear. Shutdown, which only holding SCL low for over 130 ms with CHRG low gets to, and which resets every register.
+- **Current, at 3.8 V and 25 °C.** Shutdown 2 µA at most. Standby 2 µA typical, 10 µA at most, with SCL and SDA at 1.8 V. Active with every output off, 100 µA typical, 150 µA at most.
+- **No wait** after CHIPEN or a software reset is given. A PebbleOS driver for it found writes in the first millisecond after CHIPEN acknowledged and dropped, measured rather than from the datasheet, and the Linux driver waits 2 ms after CHIPEN and 5 ms after a reset. Likely, from those two.
+- **Registers this firmware writes.** RSTR, where 0x55 resets every register (it reads 0x09, the chip ID). GCR1, with CHIPEN in bit 0 and CHGDIS in bit 1. GCR2 (0x04), with IMAX in bits 1:0, where 0 is 15 mA, 1 is 30 mA, 2 is 5 mA and 3 is 10 mA, and the rest under-voltage and over-temperature protection. LCTR (0x30), with an enable per output in bits 2:0, plus EXP (bit 3) and FREQ (bit 5, 250 Hz or 125 Hz). LCFG1 to LCFG3 (0x31 to 0x33), the current setting CUR in bits 3:0, with pattern mode, fades and sync above it. PWM1 to PWM3 (0x34 to 0x36), an 8-bit code each. Pattern timing is at 0x37 to 0x3F, and this firmware leaves it alone.
+- **Output current** is `Imax × CUR / 15` at a PWM code of 255, within 3 %. The PWM runs at 250 Hz, off a 1.024 MHz oscillator, and its code-to-duty curve is called exponential, with no formula, so what a given code's duty is isn't known. EXP is described as the transition's curve, not the steady one's.
+- **CHRG.** With CHRG high and CHGDIS clear the chip wakes by itself and breathes LED1 (4.5 s, up to 6 mA), and the datasheet says to set CHGDIS once a host drives it. What CHRG is wired to here, nobody knows.
+
+### How the stock firmware drives it
+
+Confirmed from source. It talks to it at 7-bit address 0x64, with every write a (register, value) pair of its own, and reads before writing a field. At set-up it writes 0x55 to RSTR, waits 2 ms, sets CHIPEN with GCR1 = 0x01, sets its colour balance, IMAX at 5 mA and manual mode, then puts the chip back in standby with GCR1 = 0x00. To show a colour it wakes it with 0x01, zeroes the PWMs, enables all three outputs, then writes the currents and PWMs, with no wait after CHIPEN. To turn the aux off it zeroes the PWMs, disables the outputs, and writes GCR1 = 0x00, which its comment calls "standby mode of 10uA". It never sets CHGDIS. Its low aux run at 5 mA with PWM, its high at 5 mA with none.
+
+Its TWI host runs at a 12 MHz clock with MBAUD 10, which is 400 kHz by section 29.3.2.2.1's equation 1 with no rise time. Its clock is divided by two or four at low levels and with the light off, so it likely talks to the AW2016 at about 100 kHz at rest. It writes nothing to TWI0's CTRLA, uses smart mode, forces the bus idle once at set-up, and waits for WIF with no time-out on writes. It only checks for a NACK, and returns on one without a STOP. It never writes PORTMUX, so the pins are the default PA2 and PA3, and its lines giving PA2 and PA3 internal pull-ups are commented out, so it relies on the board for them. Since its TWI works, the board likely has pull-ups on both lines. Nobody has seen them or measured them.
+
+### How this firmware drives it
+
+`kr1k::aw2016` turns each aux colour into register writes, and `hw::set_aux` sends them on TWI0 at 100 kHz (MBAUD 15 at 4 MHz), with the host on only for an update and every wait counted, so a bus that never answers can't hang the loop (H19 in [safety.md](safety.md)). It leaves PA2 and PA3's PORT settings as reset has them, with no internal pull-ups, as the stock firmware does. It never drives them through PORT, since SCL held low for 130 ms shuts the AW2016 down.
+
+- Off is LCTR = 0, then GCR1 = 0x02 (CHGDIS, CHIPEN clear), standby. From a state it doesn't know, at power-on and after a failed update, it's RSTR = 0x55 alone, which leaves it in standby too.
+- A colour from standby is GCR1 = 0x03 (CHGDIS and CHIPEN) on one tick, and on the next, 15.6 ms later, GCR2 = 0x02 (5 mA), then LCFG1 to PWM3 in one transfer, then LCTR with the colour's outputs. LCTR goes last so nothing lights at a setting it isn't meant to have.
+- Dim colours are a current setting of 1 of 15 on green and blue and 2 on red, with a PWM code of 64, on the 5 mA setting. Bright red is 15 of 15 with a code of 255, 5 mA. These are this firmware's own choices, unmeasured on these LEDs.
+
+That's run on the simulator only, and never on the torch.
 
 ## The switch
 
@@ -157,7 +184,10 @@ This torch's fuses read `00 00 00 FF FF D0 08 00 00`, in the order `WDTCFG`, `BO
 - How do the three paths combine, and what does a path left on with the boost off do?
 - Which PCB code does this board carry? It shipped with the 0284 (32 W) build, so is it the 32 W board, or the 6 V board the listing describes running the other build?
 - What's the pads' pitch in millimetres? Does `+` feed the boost converter and the AW2016 as well as the MCU with the cell out?
-- What's the AW2016's standby current, and what's its CHRG pin wired to?
+- What's the AW2016's standby current on this board, and what's its CHRG pin wired to? Is it on the cell rail? What pull-ups are on PA2 and PA3, and to which rail?
+- Which AW2016 output is each colour on this board? The map is the stock firmware's, untraced.
+- Does the AW2016 take writes straight after CHIPEN, as the stock firmware assumes, or only after about a millisecond, as a PebbleOS driver found? This firmware waits a tick either way.
+- How dim is a PWM code of 64 on the 5 mA setting, and is it visible?
 - How does the tail switch reach PD4, and what does PA4 drive, if anything?
 - Is there a 32 kHz crystal on PA0 and PA1? (Likely not, and the stock build drives PA1 low.) What is PA1 wired to?
 - Which errata letter is avrdude's silicon revision 1.2?

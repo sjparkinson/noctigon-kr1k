@@ -23,6 +23,7 @@ use core::ptr::{
     read_volatile, with_exposed_provenance, with_exposed_provenance_mut, write_volatile,
 };
 
+use kr1k::aw2016::{self, Update};
 use kr1k::board::{
     BUTTON_LED, DAC, ENABLE, FET, HELD_LOW, PATHS, POWER_BANK, SWITCH, UNUSED_PC2, UNUSED_PC3,
     UNUSED_PD5,
@@ -31,8 +32,7 @@ use kr1k::ramp::{DAC_MAX, Output, Vref};
 use kr1k::selftest::Fuses;
 use kr1k::sensors::{Channel, Convert};
 use kr1k::temp::Calibration;
-use kr1k::ui::Aux;
-use kr1k::watchdog::{TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
+use kr1k::watchdog::{CLOCK_HZ, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
 
 use crate::regs::{self, addr as reg};
 
@@ -55,6 +55,30 @@ const _: () = assert!(DAC_MAX << DAC_SHIFT == regs::DAC_DATA);
 
 /// TCB0's CCMP, one less than the period, since it counts 0 to CCMP.
 const TIMER_TOP: u16 = TIMER_PERIOD_CLOCKS - 1;
+
+/// TWI0's MBAUD for an SCL of 100 kHz at the 4 MHz main clock. Section
+/// 29.3.2.2.1's equation 1 has SCL at `CLK_PER / (10 + 2 × BAUD + CLK_PER ×
+/// tR)`, so 15 is 100 kHz with no rise time, and slower with one. Its
+/// equation 3.2 puts SCL low at `(BAUD + 6) / CLK_PER − tOF`, 5.0 µs with the
+/// longest fall time table 38-22 allows, over standard mode's 4.7 µs and the
+/// AW2016's 1.3 µs. Standard mode is the slowest, so the bus has the most
+/// margin for pull-ups nobody's measured. The main clock is forty times SCL,
+/// over the four times that BUSERR needs (section 29.5.6).
+const TWI_BAUD: u8 = 15;
+const _: () = assert!(CLOCK_HZ == (10 + 2 * 15) * 100_000);
+
+/// The most times [`set_aux`] reads TWI0.MSTATUS in one update, across
+/// every wait.
+///
+/// The longest update, a colour's three transfers, is 14 bytes and three
+/// STOPs, about 135 SCL periods, 5,400 main clocks. Each poll is about ten
+/// instructions as compiled (`cargo xtask hex`'s loop figure with SCL held
+/// low), and so at least ten clocks, so this is at least 9,000 clocks, over
+/// one and a half times the longest update, and more on the chip, where
+/// `lds` alone takes three. A bus that never answers then costs about 60 % of
+/// the simulator's budget for a pass, which takes every instruction at four
+/// clocks, and about a seventh of a real tick.
+const TWI_POLLS: u16 = 900;
 
 // The window `start_watchdog` sets is the one `kr1k::watchdog` counts on.
 // WDT.CTRLA's fields count 8 << (n - 1) WDT clocks, and these are n = 3.
@@ -233,6 +257,11 @@ pub fn init() {
     write(reg::TCB0_CTRLB, regs::TCB_CNTMODE_INT);
     write16(reg::TCB0_CCMP, TIMER_TOP);
 
+    // TWI0's baud rate, which only takes a write with the host off (section
+    // 29.5.7), as it is from reset. [`set_aux`] turns the host on and off
+    // round each update.
+    write(reg::TWI0_MBAUD, TWI_BAUD);
+
     // ADC0, single 12-bit conversions, four accumulated. 4 MHz / 4 is a
     // 1 MHz ADC clock, inside the 125 kHz to 2 MHz of table 38-25. INITDLY
     // of 32 µs covers the 25 µs the temperature sensor wants after the ADC
@@ -279,8 +308,12 @@ pub fn init_pins() {
     //
     // PA0 (the FET gate, not fitted), PC2, PC3, PD5 and PD7 are unused, so
     // they get a pull-up and nothing floats, as the stock firmware has them.
-    // PA2 and PA3 are the AW2016's TWI lines, which have their own pull-ups
-    // if anything, and nothing here touches them.
+    // PA2 and PA3 are the AW2016's TWI lines, and TWI0 takes them over while
+    // its host is on. Their PORT settings are left as reset has them, inputs
+    // with no pull-up, since the board likely has its own (the stock
+    // firmware's lines for internal ones are commented out, and its TWI
+    // works), and they're never outputs, since SCL held low for 130 ms shuts
+    // the AW2016 down.
     //
     // PA1 goes to something unknown, and the stock build on this torch holds
     // it as an output at 0 (`kr1k::board` has why), so it's that here, with
@@ -462,6 +495,11 @@ pub fn halt() -> ! {
     // barrier, so nothing below can move above it.
     unsafe { asm!("cli", options(nostack)) };
     set_output(Output::OFF);
+    // TWI0's host off, in case an interrupt with no handler caught
+    // [`set_aux`] mid-update. The host stops in every sleep mode (section
+    // 29.3.5), and off it lets go of both lines. The aux stay as the AW2016
+    // has them.
+    write(reg::TWI0_MCTRLA, 0);
     write(reg::RTC_PITINTCTRL, 0);
     pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_INTDISABLE);
     // INTDISABLE stops new edges raising the flag, and doesn't clear one
@@ -645,15 +683,116 @@ pub fn fuses() -> Fuses {
     }
 }
 
-/// What the aux LEDs should show. Nothing yet.
+/// Sends one of `kr1k::aw2016::Aw2016`'s steps to the AW2016 over TWI0, and
+/// says whether every transfer went through. The button LED on PA4 stays an
+/// output at 0, off.
 ///
-/// The RGB aux hang off an AW2016 LED driver on TWI0 (PA2 and PA3), and
-/// there's no TWI driver, so this never addresses it and the AW2016 keeps the
-/// LEDs off, as it comes up. PA2 and PA3 are left as reset has them. The
-/// button LED on PA4 stays an output at 0, off. `colour` and
-/// `colour.bright()` are what a driver for it would show.
-pub const fn set_aux(colour: Aux) {
-    let _ = colour;
+/// TWI0's host is on only for this, polled with no interrupts, and off again
+/// before it returns, whatever happened, so the loop never sleeps with it on.
+/// It stops in every sleep mode (section 29.3.5), and turning it off lets go
+/// of both lines. Turning it on leaves the bus state unknown, so it's forced
+/// idle first (section 29.3.2.1.1).
+///
+/// Each transfer is the AW2016's address with the write bit, then the
+/// register, then the data, then a STOP, and every wait counts down one
+/// budget, [`TWI_POLLS`] reads of MSTATUS for the whole update. A NACK, lost
+/// arbitration, a bus error or the budget running out ends the update there,
+/// with nothing retried. After a NACK the host still owns the bus, so it
+/// sends a STOP, as section 29.3.2.2.3 recommends. After lost arbitration or
+/// a bus error it doesn't own it, and with the budget gone a byte may still
+/// be on the bus, so it turns the host off without one. The AW2016 is left
+/// however far the update got, and `kr1k::aw2016::Aw2016::failed` takes it
+/// from there.
+pub fn set_aux(update: Update) -> bool {
+    write(reg::TWI0_MCTRLA, regs::TWI_ENABLE);
+    write(reg::TWI0_MSTATUS, regs::TWI_BUSSTATE_IDLE);
+    let mut polls = TWI_POLLS;
+    let mut sent = true;
+    for transfer in update {
+        if !twi_transfer(transfer, &mut polls) {
+            sent = false;
+            break;
+        }
+    }
+    write(reg::TWI0_MCTRLA, 0);
+    sent
+}
+
+/// How a byte on the bus ended.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// Acknowledged.
+    Acked,
+    /// Not acknowledged, with the host still owning the bus.
+    Nacked,
+    /// Lost arbitration or a bus error, so the host no longer owns it.
+    Lost,
+    /// The update's budget ran out with no WIF.
+    TimedOut,
+}
+
+/// One transfer, its address, register and data, then a STOP if the host
+/// still owns the bus. True if it all went through.
+fn twi_transfer(transfer: &aw2016::Write, polls: &mut u16) -> bool {
+    write(reg::TWI0_MADDR, aw2016::ADDRESS << 1);
+    let mut sent = twi_wait(polls);
+    if sent == Sent::Acked {
+        sent = twi_send(transfer.register, polls);
+    }
+    for &byte in transfer.data {
+        if sent != Sent::Acked {
+            break;
+        }
+        sent = twi_send(byte, polls);
+    }
+    match sent {
+        Sent::Lost | Sent::TimedOut => false,
+        Sent::Acked | Sent::Nacked => {
+            write(reg::TWI0_MCTRLB, regs::TWI_MCMD_STOP);
+            twi_idle(polls) && sent == Sent::Acked
+        }
+    }
+}
+
+/// Puts `byte` on the bus and waits for it.
+fn twi_send(byte: u8, polls: &mut u16) -> Sent {
+    write(reg::TWI0_MDATA, byte);
+    twi_wait(polls)
+}
+
+/// Waits for WIF, which comes up at the end of an address or a byte however
+/// it went (section 29.5.6), out of what's left of `polls`.
+fn twi_wait(polls: &mut u16) -> Sent {
+    loop {
+        let status = read(reg::TWI0_MSTATUS);
+        if status & regs::TWI_WIF != 0 {
+            return if status & (regs::TWI_ARBLOST | regs::TWI_BUSERR) != 0 {
+                Sent::Lost
+            } else if status & regs::TWI_RXACK != 0 {
+                Sent::Nacked
+            } else {
+                Sent::Acked
+            };
+        }
+        match polls.checked_sub(1) {
+            Some(left) => *polls = left,
+            None => return Sent::TimedOut,
+        }
+    }
+}
+
+/// Waits for the bus to go idle after a STOP, which raises no flag, out of
+/// what's left of `polls`. False if it never does.
+fn twi_idle(polls: &mut u16) -> bool {
+    loop {
+        if read(reg::TWI0_MSTATUS) & regs::TWI_BUSSTATE == regs::TWI_BUSSTATE_IDLE {
+            return true;
+        }
+        match polls.checked_sub(1) {
+            Some(left) => *polls = left,
+            None => return false,
+        }
+    }
 }
 
 /// Whether the switch is down. It pulls PD4 low against the external

@@ -29,9 +29,9 @@ pub enum Mode {
 
 /// What the RGB aux LEDs should be doing.
 ///
-/// On the KR1K they hang off an AW2016 LED driver over TWI, which nothing
-/// drives yet, so `hw::set_aux` ignores this and they stay dark. The library
-/// still says what it wants, colour and [`Aux::bright`], for that driver.
+/// On the KR1K they hang off an AW2016 LED driver over TWI, and
+/// `crate::aw2016` turns the colour and [`Aux::bright`] into its register
+/// writes.
 ///
 /// Every colour is steady, so they never report anything by flashing, and
 /// all but red are dim. Off and lockout, the two states a glance most needs,

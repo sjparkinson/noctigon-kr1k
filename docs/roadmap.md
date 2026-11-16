@@ -49,11 +49,11 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 ## 3. It's nice to use
 
 - [ ] A ramp on the DAC, the paths and the two references, on this firmware's own curve
-- [ ] A TWI host driver for the AW2016, so the aux can show off, lockout and a flat cell
+- [x] A TWI host driver for the AW2016, so the aux can show off, lockout and a flat cell. Polled and bounded, standby whenever the aux are off, and given up on, not retried, when the bus fails. Simulator only, never flashed
 - ~~Remember the level in RAM~~ Struck. Every click on starts at the same level (docs/ui.md)
 - [x] A simpler UI. 1C on and off, 1H ramps each time the other way from the last, 3C lockout that never lights. Library only
 - [x] A quicker switch. Clicks count after about 220 ms rather than 280, and 1C off and the third click of 3C lock count as they're let go. Library only
-- [x] Aux that can't flatten a cell. Lockout's red is bright, for five seconds after a press. Off's dim blue isn't timed, and a check of the cell every five minutes at rest turns it off under 3.30 V and back on at 3.40 V. Library only, since nothing drives the aux on this board until the AW2016 driver lands
+- [x] Aux that can't flatten a cell. Lockout's red is bright, for five seconds after a press. Off's dim blue isn't timed, and a check of the cell every five minutes at rest turns it off under 3.30 V and back on at 3.40 V. Library only when it was ticked. The AW2016 driver above now shows it, on the simulator
 - [x] The simulator ported to a fake AVR32DD20, wired like the Lume X1-C
 - ~~Battery check~~ Struck. No magic flashes, so no 3C voltage blink (docs/ui.md)
 

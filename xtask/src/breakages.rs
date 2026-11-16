@@ -286,8 +286,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "halt-leaves-the-light-on",
         file: HW,
-        find: "    set_output(Output::OFF);\n    write(reg::RTC_PITINTCTRL, 0);\n",
-        replace: "    write(reg::TCB0_INTCTRL, 0);\n    write(reg::RTC_PITINTCTRL, 0);\n",
+        find: "    set_output(Output::OFF);\n    // TWI0's host off,",
+        replace: "    write(reg::TCB0_INTCTRL, 0);\n    // TWI0's host off,",
         stage: Stage::Simulator,
         expect: "sleeps with TCB0 running and PC1 high",
     },

@@ -16,7 +16,7 @@ The first three run on your machine's own target. The second clippy lints the fi
 
 ## The simulator
 
-`xtask/src/sim.rs` puts a fake AVR32DD20 around a CPU in `xtask/src/avr.rs`, wired like the KR1K's Lume X1-C driver, and runs the real firmware on it, from reset, through every example in docs/ui.md, through thousands of ticks of random clicks, and again with a switch bounce and a TCB0 period landing on every instruction the loop reaches. It also starts once with PC1 already high, checks start-up happens in order (reset flags cleared before the watchdog, flash, fuses and VDDIO2 checked before anything else is set up, the PIT on before the watchdog), runs with every tick as slow as the datasheet allows, stops the 32 kHz oscillator with the light on, and runs with VDDIO2 missing. It compares PC1, DAC0, its reference and the three paths with the library's output on every tick.
+`xtask/src/sim.rs` puts a fake AVR32DD20 around a CPU in `xtask/src/avr.rs`, wired like the KR1K's Lume X1-C driver, and runs the real firmware on it, from reset, through every example in docs/ui.md, through thousands of ticks of random clicks, and again with a switch bounce and a TCB0 period landing on every instruction the loop reaches. It also starts once with PC1 already high, checks start-up happens in order (reset flags cleared before the watchdog, flash, fuses and VDDIO2 checked before anything else is set up, the PIT on before the watchdog), runs with every tick as slow as the datasheet allows, stops the 32 kHz oscillator with the light on, runs with VDDIO2 missing, and puts three faults on the AW2016's bus (no answer, SDA held low, SCL held low). It compares PC1, DAC0, its reference and the three paths with the library's output on every tick, and the AW2016's colour and standby with the library's aux.
 
 It turns the rules a real chip enforces quietly into errors, such as a `wdr` in the closed window, a 16-bit register written high byte first, or the errata's lost write (a store under 64 straight after one at 64 or over, DS80001026D §2.2.3). It holds the firmware to the board's rules too, which have no datasheet section. PC1 only rises with DAC0 at 0, its reference at 1.024 V and the paths low, DAC0 only goes above 0 8 ms after that, a reference or path only changes with DAC0 at 0, and only goes up once it's settled, and TCB0 runs exactly while PC1 is high. It refuses any register it doesn't model, so the first `cargo xtask hex` after you touch a new one fails until you teach it.
 
@@ -24,7 +24,7 @@ It's a mistake-finder, not proof. It's one reading of the datasheet, run against
 
 - **Chip resets.** A watchdog bite is a failed run, so a real bite, and the boot after one, never runs anywhere. Neither does anything that happens to the pins during a reset.
 - **Anything analogue.** The boost converter, the amplifier, how fast PD6 really falls when DAC0 goes to 0, the cell, VDD and VDDIO2. The ADC reads scripted numbers, and the DAC's settling time is the datasheet's figure for a load nobody's measured.
-- **The AW2016.** Nothing drives it yet, so the aux LEDs aren't checked at all.
+- **The AW2016's light.** A fake AW2016 sits on TWI0's bus (`xtask/src/twi.rs`) and takes the firmware's writes, so the colour, dim or bright, standby and the bus faults are checked. Nothing about how bright an aux LED looks, what current it draws, or this board's pull-ups and rise times is modelled, and the TWI host is the same one reading of chapter 29 as the rest.
 - **Clocks and time.** It counts instructions, not cycles. A minimum wait is checked as if every instruction took one clock, which a real one never beats, and a budget as if each took four. The oscillators don't drift, apart from the one run that slows every tick to the limit and the one that stops the 32 kHz oscillator outright, and a `wdr` that's lost in power-down can't happen.
 - **The flash itself.** Fuses are scripted, and the CRC runs over the image, so it shows `xtask` and the firmware agree with each other and not that the chip does.
 - **The programmer on the pads.** Nothing here can see a slipped probe, or 12 V.
@@ -68,6 +68,7 @@ src/selftest.rs   what the checks at power-on found
 src/testing.rs    a fake ADC, readings and the docs/ui.md script reader, shared by the tests and the simulator
 src/regs.rs       register addresses and bit values, generated from the ATDF by build.rs
 src/board.rs      the KR1K's pin map, which hw.rs and the simulator both wire up from
+src/aw2016.rs     the AW2016's registers, and the writes that show each aux colour, a step a tick
 src/main.rs       the firmware loop (a stub on the host)
 src/avr/hw.rs     pins, register access and the interrupt handlers (AVR only)
 src/avr/rt.rs     vector table and startup (AVR only)

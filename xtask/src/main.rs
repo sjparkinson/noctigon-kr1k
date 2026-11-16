@@ -22,6 +22,7 @@ mod spec;
 mod stamp;
 mod switching;
 mod terminal;
+mod twi;
 mod updi;
 mod world;
 

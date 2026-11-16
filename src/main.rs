@@ -45,6 +45,7 @@ use kr1k::regs;
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
+    use kr1k::aw2016::Aw2016;
     use kr1k::selftest::{self, Faults};
     use kr1k::torch::{Changes, Torch};
     use kr1k::watchdog::Feeder;
@@ -64,7 +65,7 @@ extern "C" fn main() -> ! {
 
     let mut torch = Torch::new(hw::temperature_calibration(), faults);
     let mut output_changes = Changes::new();
-    let mut aux_changes = Changes::new();
+    let mut aux = Aw2016::new();
     let mut feeder = Feeder::new();
 
     loop {
@@ -83,12 +84,18 @@ extern "C" fn main() -> ! {
             hw::adc_start(convert);
         }
 
-        if let Some(output) = output_changes.update(torch.output()) {
-            hw::set_output(output);
+        // The aux before the output, so they go dark before the light comes
+        // on. They only light a tick after it goes out, since the AW2016
+        // wakes a tick before it takes a colour. A step that fails is given
+        // up on, never tried again until the colour changes.
+        if let Some(update) = aux.step(torch.aux())
+            && !hw::set_aux(update)
+        {
+            aux.failed();
         }
 
-        if let Some(aux) = aux_changes.update(torch.aux()) {
-            hw::set_aux(aux);
+        if let Some(output) = output_changes.update(torch.output()) {
+            hw::set_output(output);
         }
 
         // The only place the running torch feeds the watchdog.

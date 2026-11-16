@@ -15,9 +15,9 @@
 //! ([`Faults::supply`]).
 //!
 //! A failure keeps the light off until the cell comes out
-//! (`limits::Health::Fault`). The aux would show white for a few seconds after
-//! power-on and after each press, so a torch that won't come on still says
-//! why, but on the KR1K the aux stay dark until something drives the AW2016.
+//! (`limits::Health::Fault`). The aux show white for a few seconds after each
+//! press, so a torch that won't come on still says why, through the AW2016
+//! (`aw2016`), which has only met the simulator.
 //!
 //! That's the whole of the safety net. The RAM and register tests, the clock
 //! check and a proof that the watchdog bites are left out on purpose (see

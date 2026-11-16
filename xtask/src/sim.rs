@@ -38,6 +38,9 @@
 //!   firmware sets to 1.024 V or 2.5 V, and its output follows the high
 //!   byte's write (§34.5.2). Its output buffer wants PD6's input buffer off
 //!   (§34.3.1). Power-down turns it off (§34.3.3).
+//! - TWI0's host and the AW2016 on its bus are `twi.rs`'s, which has the
+//!   rules. The host stops in every sleep mode (§29.3.5), so `sleep` with it
+//!   on is refused, idle or power-down.
 //! - TCB0 runs in periodic interrupt mode off the main clock, raising CAPT
 //!   when CNT reaches CCMP and starting again from 0 (§24.3.3.1.1). That's
 //!   taken as CCMP + 1 clocks a period; the datasheet doesn't give the
@@ -119,8 +122,11 @@
 //!   and the three paths never get a pull-up. No pin gets INVEN. PA1's
 //!   `OUT` is never set, since the stock build on this torch holds it as an
 //!   output at 0 and what it connects to is unknown (src/board.rs). PA2 and PA3, the
-//!   AW2016's TWI lines, are never driven and their settings never written,
-//!   and nothing in PORTF (reset and UPDI) is ever written.
+//!   AW2016's TWI lines, are never driven through PORT and their settings
+//!   never written, since TWI0 takes them over, and nothing in PORTF (reset
+//!   and UPDI) is ever written.
+//! - The aux are never lit while PC1 is high. An AW2016 write that lights
+//!   one with PC1 high is refused, and so is PC1 rising with one lit.
 //! - TCB0, the tick deadline's timer, runs exactly while PC1 is high,
 //!   checked at every `sleep`. Power-down wants PC1 low and TCB0 stopped.
 //! - With the light on and no tick, `hw::wait_for_tick` gives up after
@@ -151,7 +157,8 @@
 //!    later, when the light has to be off (`adc_never_answers`). Twenty
 //!    thousand ticks with the switch held down from the first
 //!    (`switch_stuck`). VDDIO2 missing, so the light never comes on
-//!    (`vddio2_missing`).
+//!    (`vddio2_missing`). The AW2016 never answering, SDA held low and SCL
+//!    held low (`bad_bus`).
 //! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
 //! 7. Twenty thousand ticks of random clicks and holds.
 //! 8. Both of those again with a switch bounce, and a TCB0 period ending
@@ -162,8 +169,14 @@
 //! All but the first two drive `kr1k::torch` alongside the firmware and check
 //! PC1, DAC0, its reference and the paths show the library's output on every
 //! tick, the fourth until the oscillator stops. So does the last part of the
-//! second, until the forced interrupt. The aux LEDs hang off the AW2016,
-//! which nothing drives yet, so there's nothing to compare them with.
+//! second, until the forced interrupt. Those runs hold the AW2016 to the
+//! library's `torch.aux()` too, at the end of every pass (`AuxWatch`): the
+//! colour through the board's channel map, dim or bright, never a wrong one,
+//! dark for at most two ticks while it wakes, and in standby whenever the aux
+//! are off. Three more runs put a fault on the bus, the AW2016 never
+//! answering, SDA held low and SCL held low (`bad_bus`), and the firmware has
+//! to give each update up without hanging or retrying while the light still
+//! follows the library.
 //! `probe` separately runs examples/link.rs, which has real statics,
 //! `guards` runs examples/guards.rs, which asks src/avr/hw.rs for power-down
 //! with the light on, and `first_light` runs examples/first_light.rs, the
@@ -181,6 +194,7 @@ use kr1k::ramp::{Output, Vref};
 use kr1k::selftest::Faults;
 use kr1k::sensors::Channel;
 use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
+use kr1k::ui::Aux;
 use kr1k::watchdog::{CLOCK_HZ, FEED_TICKS, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
 
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_two_words, ldi};
@@ -190,6 +204,7 @@ use crate::layout::{self, jmp_target, word};
 use crate::spec;
 use crate::stamp;
 use crate::switching::RandomSwitching;
+use crate::twi::{Fault, Twi};
 use crate::updi::map;
 use crate::world::{CALIBRATION, FUSE_NAMES, World};
 
@@ -464,9 +479,12 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     };
     // The clock, stuck-input and supply faults, every example, then the
     // random switching, each example and the switching with and without
-    // interrupts landing mid-pass. Each is its own chip, so they run side by
-    // side, because the long ones take minutes of simulated time. Errors come
-    // back in this order, whichever thread finishes first.
+    // interrupts landing mid-pass, then the faults on the AW2016's bus. Each
+    // is its own chip, so they run side by side, because the long ones take
+    // minutes of simulated time. Errors come back in this order, whichever
+    // thread finishes first. The bus faults come last since they click
+    // through most of the UI, so they'd catch many a mistake as a wrong output
+    // before the run that names it.
     let faults: [(FaultCheck, &str); 5] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
@@ -474,15 +492,21 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
+    let bus_faults: [(FaultCheck, &str); 3] = [
+        (aw2016_absent, "with the AW2016 never answering"),
+        (sda_held_low, "with SDA held low"),
+        (scl_held_low, "with SCL held low"),
+    ];
     let power_on = &power_on;
     let reports: Vec<Result<Report, String>> = thread::scope(|scope| {
-        let faults = faults.map(|(check, name)| {
+        let spawn = |(check, name): (FaultCheck, &'static str)| {
             scope.spawn(move || {
                 let mut report = Report::default();
                 check(power_on()?, &mut report).map_err(|e| format!("{name}: {e}"))?;
                 Ok(report)
             })
-        });
+        };
+        let faults = faults.map(spawn);
         // Spawning every run before joining any is what runs them in parallel.
         let runs: Vec<_> = examples
             .iter()
@@ -490,9 +514,11 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
             .chain([None])
             .map(|example| scope.spawn(move || both_ways(power_on, example)))
             .collect();
+        let bus_faults = bus_faults.map(spawn);
         faults
             .into_iter()
             .chain(runs)
+            .chain(bus_faults)
             .map(|run| run.join().unwrap_or_else(|_| Err("a run panicked".into())))
             .collect()
     });
@@ -733,6 +759,67 @@ fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
+/// The AW2016 never acknowledges its address.
+fn aw2016_absent(sim: Sim, report: &mut Report) -> Result<(), String> {
+    bad_bus(sim, Fault::Absent, report)
+}
+
+/// SDA held low, so every address loses arbitration with a bus error.
+fn sda_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
+    bad_bus(sim, Fault::SdaLow, report)
+}
+
+/// SCL held low, so no byte ever finishes and no flag ever comes up, which
+/// only the update's budget of polls gets the firmware out of.
+fn scl_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
+    bad_bus(sim, Fault::SclLow, report)
+}
+
+/// The light on and off, lockout and a press in it, then on, ramped and off
+/// again, all with `fault` on the bus. Every update fails, and the firmware
+/// has to give each up without hanging or retrying (`AuxWatch`), every pass
+/// inside the budget (`Sim::tick`), and the light has to follow the library
+/// all the way, ending off.
+fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String> {
+    sim.chip.twi.fault = fault;
+    let second = TICKS_PER_SECOND;
+    let script = [
+        Action::Clicks(1),
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Wait(second),
+        Action::Clicks(3),
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Wait(6 * second),
+        Action::Clicks(3),
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Hold {
+            clicks: 0,
+            ticks: second,
+        },
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Wait(second),
+    ];
+    let end = in_step(&mut sim, testing::samples(script), report)?;
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    if sim.chip.pc1_rises < 2 {
+        return Err("the light didn't come on twice, so this checked nothing".into());
+    }
+    let twi = &sim.chip.twi;
+    if twi.failures == 0 || twi.failures != twi.sessions {
+        return Err(format!(
+            "{} of {} updates failed, but every one should have",
+            twi.failures, twi.sessions
+        ));
+    }
+    Ok(())
+}
+
 /// Steps `hw::halt` may take from dropping PC1 to its `sleep`, counting
 /// instructions, or waits if it's gone to sleep some other way.
 const HALT_BUDGET: u64 = 100;
@@ -933,6 +1020,7 @@ fn in_step(
     let mut was_resting = false;
     let mut feeder = Feeder::new();
     let mut finished = true;
+    let mut aux = AuxWatch::default();
     for (tick, sample) in samples.enumerate() {
         let at = |e: String| format!("tick {tick}: {e}");
         sim.tick_no = tick as u32;
@@ -960,6 +1048,9 @@ fn in_step(
         }
         rig.tick_in(sample.pressed, &sample.scene);
         sim.chip.shows(rig.torch.output()).map_err(at)?;
+        if !sim.chip.aux_unwired {
+            aux.tick(&sim.chip.twi, rig.torch.aux()).map_err(at)?;
+        }
         was_resting = rig.torch.resting();
         // `main`'s feeder, ticked at the end of each pass as it is there. The
         // sleep that ended this pass was the firmware's answer to the state
@@ -980,6 +1071,92 @@ fn in_step(
     }
     report.take(sim);
     Ok(finished.then(|| rig.level()))
+}
+
+/// Ticks the aux may stay dark after the torch wants a colour. From a state
+/// nobody knows, that's a reset, then a wake, and the colour on the third.
+const AUX_CATCH_UP_TICKS: u8 = 2;
+
+/// Holds the AW2016 to the colour the library wants, at the end of every
+/// pass, and the firmware to giving up on a bus that fails.
+///
+/// With a sound bus, whatever the aux show is the colour the torch wants, at
+/// the brightness `ui::Aux::bright` says, through the board's channel map,
+/// never a wrong one. It can lag dark for `AUX_CATCH_UP_TICKS` while the chip
+/// wakes. When the torch wants them off the AW2016 is in standby by the end
+/// of that pass, since that's what H13 in docs/safety.md counts on. Dark
+/// while the light's on comes from that, and `twi.rs` and `Chip::pc1_moves`
+/// refuse the aux lit with PC1 high on the way.
+///
+/// With a fault on the bus, every update fails, and the firmware may only try
+/// again once the colour it gave up on has changed, never every tick. Each
+/// pass turns the host on once at most.
+#[derive(Default)]
+struct AuxWatch {
+    behind: u8,
+    sessions: u32,
+    failures: u32,
+    gave_up: Option<Aux>,
+}
+
+impl AuxWatch {
+    fn tick(&mut self, twi: &Twi, want: Aux) -> Result<(), String> {
+        let started = twi.sessions - self.sessions;
+        let failed = twi.failures > self.failures;
+        (self.sessions, self.failures) = (twi.sessions, twi.failures);
+        if started > 1 {
+            return Err(format!("turns the TWI host on {started} times in one pass"));
+        }
+        if self.gave_up.is_some_and(|gave_up| gave_up != want) {
+            self.gave_up = None;
+        }
+        if started > 0 && self.gave_up == Some(want) {
+            return Err(format!(
+                "tries the AW2016 again with the torch still wanting {want:?}, after a failed \
+                 update: it gives up until the colour changes"
+            ));
+        }
+        if failed {
+            self.gave_up = Some(want);
+        }
+        if twi.fault != Fault::None {
+            return Ok(());
+        }
+        let shown = twi.aw2016.colour()?;
+        if want == Aux::Off {
+            self.behind = 0;
+            if twi.aw2016.awake() {
+                return Err(
+                    "the torch wants the aux off, but the AW2016 isn't in standby, so it draws \
+                     its active current (H13 in docs/safety.md)"
+                        .into(),
+                );
+            }
+            return Ok(());
+        }
+        let brightness = |bright: bool| if bright { "bright" } else { "dim" };
+        match shown {
+            Some((colour, bright)) if colour == want && bright == want.bright() => {
+                self.behind = 0;
+                Ok(())
+            }
+            Some((colour, bright)) => Err(format!(
+                "the aux show {} {colour:?}, but the torch wants {} {want:?}",
+                brightness(bright),
+                brightness(want.bright())
+            )),
+            None => {
+                self.behind += 1;
+                if self.behind > AUX_CATCH_UP_TICKS {
+                    return Err(format!(
+                        "the aux are still dark {} ticks after the torch wanted {want:?}",
+                        self.behind
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// What examples/link.rs's `main` leaves in `LINK_PROBE_COPY`. That's its
@@ -2051,10 +2228,16 @@ struct Chip {
     register_writes: u32,
     boot: Boot,
     /// Holds the program to the first-light image's promises, no interrupt,
-    /// no sleep, no watchdog and no timer (`first_light`).
+    /// no sleep, no watchdog and no timer (`first_light`), and nothing on
+    /// TWI0, since first light leaves the AW2016 alone.
     bare: bool,
     /// Times PC1 has risen.
     pc1_rises: u32,
+    /// TWI0's host and the AW2016 on its bus (`twi.rs`).
+    twi: Twi,
+    /// A test program that never drives the aux, so `in_step` doesn't hold
+    /// it to them.
+    aux_unwired: bool,
 }
 
 impl Chip {
@@ -2103,6 +2286,8 @@ impl Chip {
             boot: Boot::default(),
             bare: false,
             pc1_rises: 0,
+            twi: Twi::new(),
+            aux_unwired: false,
         }
     }
 
@@ -2704,6 +2889,14 @@ impl Chip {
                     self.paths()
                 ));
             }
+            self.twi.catch_up(self.now, false)?;
+            if self.twi.aw2016.lit() {
+                return Err(
+                    "raises PC1 with the aux lit: they go out before the main LED comes on \
+                     (docs/ui.md)"
+                        .into(),
+                );
+            }
             self.pc1_rose_at = self.now;
             self.pc1_rises += 1;
         }
@@ -2940,8 +3133,19 @@ fn bare_write(a: usize, value: u8) -> Result<(), String> {
         reg::RTC_PITCTRLA if value & RTC_PITEN != 0 => {
             Err("starts the PIT, and first light has no timers".into())
         }
+        // `hw::halt` turns TWI0's host off, which talks to nobody.
+        reg::TWI0_MCTRLA if value == 0 => Ok(()),
+        _ if twi(a) => Err(format!(
+            "writes {}, and first light leaves the AW2016 alone",
+            name(a)
+        )),
         _ => Ok(()),
     }
+}
+
+/// Whether `addr` is one of TWI0's registers.
+fn twi(addr: usize) -> bool {
+    (reg::TWI0_CTRLA..reg::TWI0_CTRLA + 0x10).contains(&addr)
 }
 
 fn pin_ctrl(addr: usize) -> bool {
@@ -3061,6 +3265,13 @@ fn name(addr: usize) -> String {
         (reg::RTC_PITSTATUS, "RTC.PITSTATUS"),
         (reg::RTC_PITINTCTRL, "RTC.PITINTCTRL"),
         (reg::RTC_PITINTFLAGS, "RTC.PITINTFLAGS"),
+        (reg::TWI0_CTRLA, "TWI0.CTRLA"),
+        (reg::TWI0_MCTRLA, "TWI0.MCTRLA"),
+        (reg::TWI0_MCTRLB, "TWI0.MCTRLB"),
+        (reg::TWI0_MSTATUS, "TWI0.MSTATUS"),
+        (reg::TWI0_MBAUD, "TWI0.MBAUD"),
+        (reg::TWI0_MADDR, "TWI0.MADDR"),
+        (reg::TWI0_MDATA, "TWI0.MDATA"),
     ];
     known
         .iter()
@@ -3140,6 +3351,13 @@ impl Bus for Chip {
         }
         if self.powering_down() {
             self.ready_for_power_down()?;
+        }
+        if self.twi.on() {
+            return Err(
+                "sleeps with the TWI host on, which stops in every sleep mode (section 29.3.5), \
+                 so a transfer or a STOP could be left with SCL low"
+                    .into(),
+            );
         }
         if self.tcb_running() != self.enabled_high()
             || self.enabled_high() && self.io[reg::TCB0_INTCTRL] & TCB_CAPT == 0
@@ -3239,6 +3457,10 @@ impl Bus for Chip {
                 Ok(if busy { RTC_CTRLBUSY } else { 0 })
             }
             reg::RTC_PITINTFLAGS => Ok(if self.pit_flag { RTC_PI } else { 0 }),
+            reg::TWI0_MSTATUS => {
+                let pc1_high = self.enabled_high();
+                self.twi.status(self.now, pc1_high)
+            }
             reg::TCB0_INTFLAGS => Ok(if self.tcb.capt { TCB_CAPT } else { 0 }),
             reg::WDT_STATUS => {
                 let busy = self.wdt.busy > 0;
@@ -3356,6 +3578,10 @@ impl Bus for Chip {
                 ));
             }
             _ if pin_ctrl(a) => self.write_pin_ctrl(a, value)?,
+            _ if twi(a) => {
+                let pc1_high = self.enabled_high();
+                self.twi.write(self.now, a, value, pc1_high)?;
+            }
             reg::VREF_DAC0REF => self.write_dac_reference(value)?,
             reg::DAC0_CTRLA => match value {
                 0 if self.enabled_high() => {
@@ -4438,10 +4664,16 @@ mod tests {
     #[test]
     fn a_register_it_doesnt_model_is_an_error() {
         let mut chip = Chip::new(Vec::new());
-        // TWI0.MCTRLA, which a driver for the AW2016 would want first.
-        let twi = reg::TWI0_MCTRLA as u16;
-        assert!(chip.write(twi, 0).unwrap_err().contains("doesn't model"));
-        assert!(chip.read(twi).unwrap_err().contains("doesn't model"));
+        // SPI0.CTRLA, which nothing on this board needs.
+        let spi = reg::SPI0_CTRLA as u16;
+        assert!(chip.write(spi, 0).unwrap_err().contains("doesn't model"));
+        assert!(chip.read(spi).unwrap_err().contains("doesn't model"));
+        // TWI0's client side isn't modelled either, nor its host's MCTRLA
+        // read back.
+        let client = reg::TWI0_CTRLA as u16 + 0x09;
+        assert!(chip.write(client, 0).unwrap_err().contains("doesn't model"));
+        let mctrla = reg::TWI0_MCTRLA as u16;
+        assert!(chip.read(mctrla).unwrap_err().contains("doesn't model"));
         assert!(chip.write(MAPPED, 0).unwrap_err().contains("flash"));
     }
 
@@ -5032,6 +5264,8 @@ mod tests {
         poke(&mut chip, reg::SLPCTRL_CTRLA, SLEEP_IDLE | SLPCTRL_SEN).unwrap();
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_PERIOD_MAX).unwrap();
         chip.flash = std::mem::take(&mut sim.chip.flash);
+        // A few instructions that never drive the aux.
+        chip.aux_unwired = true;
         sim.chip = chip;
         sim
     }
