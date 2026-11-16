@@ -29,7 +29,8 @@
 //!
 //! Which AW2016 output each colour is on comes from the stock firmware (red
 //! on output 2, green on 1 and blue on 3, LED1 being output 1), in
-//! [`crate::board`]. Nobody has traced it on this board.
+//! [`crate::board`]. Blue and red showed right on this torch on 2026-11-16,
+//! and green is likely right too, unseen.
 
 use crate::board::{AUX_BLUE, AUX_GREEN, AUX_RED};
 use crate::ui::Aux;

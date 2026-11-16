@@ -33,7 +33,7 @@ The ramp moves one level per 64 Hz tick, so bottom to top takes about 1.7 second
 
 The top is `ramp::CEILING`, level 120 of 150, and nothing goes above it until thermal regulation has been checked on a real light. On this firmware's curve that's about half the current of level 150, which is the stock firmware's top on this torch's 32 W build, so about half the stock power. The lowest level is 13, the same number as the TS26's, which here is the low power path at a DAC code of 92. The levels under it are only for the low-voltage steps to fade through. There's no PWM on the main LED, so nothing here flickers by design, but nobody's seen the bottom levels on a real light, and none of the levels has been measured in lumens, amps or watts. The path gains behind the curve are estimates too, so expect a small step or dip where it changes path (`src/ramp.rs`).
 
-The aux LEDs on this torch hang off an AW2016 LED driver, which the firmware drives over I²C. Every aux colour on this page has only lit on the simulator's fake AW2016, never on the torch.
+The aux LEDs on this torch hang off an AW2016 LED driver, which the firmware drives over I²C. Every aux colour on this page has lit on the simulator's fake AW2016. On 2026-11-16, with the firmware at `c4f9cd4`, dim blue when off, bright red in lockout and dark while lit all showed as expected on this torch. Yellow and white haven't been seen there.
 
 ## Lockout
 

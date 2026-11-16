@@ -185,7 +185,7 @@ This torch's fuses read `00 00 00 FF FF D0 08 00 00`, in the order `WDTCFG`, `BO
 - Which PCB code does this board carry? It shipped with the 0284 (32 W) build, so is it the 32 W board, or the 6 V board the listing describes running the other build?
 - What's the pads' pitch in millimetres? Does `+` feed the boost converter and the AW2016 as well as the MCU with the cell out?
 - What's the AW2016's standby current on this board, and what's its CHRG pin wired to? Is it on the cell rail? What pull-ups are on PA2 and PA3, and to which rail?
-- Which AW2016 output is each colour on this board? The map is the stock firmware's, untraced.
+- Which AW2016 output is green on this board? Blue and red showed right on this torch with the stock firmware's map (2026-11-16), so it's likely right for green too, unseen.
 - Does the AW2016 take writes straight after CHIPEN, as the stock firmware assumes, or only after about a millisecond, as a PebbleOS driver found? This firmware waits a tick either way.
 - How dim is a PWM code of 64 on the 5 mA setting, and is it visible?
 - How does the tail switch reach PD4, and what does PA4 drive, if anything?

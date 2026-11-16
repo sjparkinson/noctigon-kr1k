@@ -49,7 +49,7 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 ## 3. It's nice to use
 
 - [ ] A ramp on the DAC, the paths and the two references, on this firmware's own curve
-- [x] A TWI host driver for the AW2016, so the aux can show off, lockout and a flat cell. Polled and bounded, standby whenever the aux are off, and given up on, not retried, when the bus fails. Simulator only, never flashed
+- [x] A TWI host driver for the AW2016, so the aux can show off, lockout and a flat cell. Polled and bounded, standby whenever the aux are off, and given up on, not retried, when the bus fails. Flashed on 2026-11-16, and blue, lockout red and dark while lit showed right on the torch
 - ~~Remember the level in RAM~~ Struck. Every click on starts at the same level (docs/ui.md)
 - [x] A simpler UI. 1C on and off, 1H ramps each time the other way from the last, 3C lockout that never lights. Library only
 - [x] A quicker switch. Clicks count after about 220 ms rather than 280, and 1C off and the third click of 3C lock count as they're let go. Library only
