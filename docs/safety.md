@@ -49,7 +49,7 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Status.** Simulator, for the order. With PC1 high, a path or the reference only changes with DAC0 at 0, and only goes up once DAC0 has had 10 µs to get there, table 38-23's settling time, which is a floor and not this board's.
 
-**What's left.** How the paths combine, whether they're FETs at all, and what a path does with the boost off are all unknown ([hardware.md](hardware.md#the-power-paths)). The first-light image should use one path and one low DAC value. The light goes dark for the few microseconds of each change of path, which nobody's seen, and what the amplifier and boost do across that gap is unknown.
+**What's left.** How the paths combine, whether they're FETs at all, and what a path does with the boost off are all unknown ([hardware.md](hardware.md#the-power-paths)). The first-light image uses the low paths (PA7 and PA6 together, as every level in the low range does) at one low DAC value, code 92 against 1.024 V, and only changes them with DAC0 at 0, from none to those two as it turns on and back as it turns off, through the same `hw.rs` output code as the firmware. It has only run on the simulator. The light goes dark for the few microseconds of each change of path, which nobody's seen, and what the amplifier and boost do across that gap is unknown.
 
 ### H4. A hang with the light on
 

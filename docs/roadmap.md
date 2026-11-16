@@ -12,7 +12,7 @@ This repo started as TS26 firmware and is being ported to the KR1K, so the TS26'
 - [x] Pin map for the Lume X1-C, from the stock firmware (PC1 enable, PD6 DAC, PA5 to PA7 paths, PD4 switch)
 - [x] Switch sampling at 64 Hz on PD4, with its external pull-up and no internal one, and the click/hold decoder
 - [x] The UPDI programmer in `xtask` ported to the AVR Dx NVM controller (no page buffer, 24-bit addresses, signature `1E 95 3A`), tested against a fake chip. Its link, key and reads matched avrdude on the real chip on 2026-11-16. Erase and write haven't met a real chip
-- [ ] A first-light image for the AVR32DD20, click on and click off at one low level through PC1, the DAC and one path
+- [x] A first-light image for the AVR32DD20, click on and click off at one low level through PC1, the DAC and the low paths (PA7 and PA6), in `examples/first_light.rs`. Simulator only, never flashed
 - [x] Back up the stock firmware and fuses. avrdude 8.3 through the JLHawaii808 kit on 2026-11-16, cell out, nothing written, two flash reads matching, in `backup/stock/`. The pads are `+ - U`, the build is 0284 and the fuses are factory defaults with the BOD off (docs/hardware.md)
 - [ ] Read the PCB code, measure the pads' pitch, and check the pads' order with a multimeter
 - [ ] Ping, back up and flash the KR1K with `xtask`, with only the plain 4.5 V UPDI kit, and the first-light image first. Ping and back up done on 2026-11-16, matching avrdude's backup. Flash waits for the first-light image

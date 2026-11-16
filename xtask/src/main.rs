@@ -40,7 +40,9 @@ usage: cargo xtask <command>
 commands:
   hex                     build the firmware, run it on the simulator, write
                           target/noctigon-kr1k.hex and print flash, RAM,
-                          stack, loop and handler use
+                          stack, loop and handler use, then write the
+                          first-light image, also simulated, to
+                          target/noctigon-kr1k-first-light.hex
   hex --no-examples       the same, leaving docs/ui.md's examples out of the
                           simulator run, for a breakout test build (T1)
   breakages [name...]     check hex refuses copies of the firmware, each broken on
@@ -68,7 +70,13 @@ const ELF: &str = "target/avr-none/release/kr1k.elf";
 const PROBE: &str = "target/avr-none/release/examples/link.elf";
 /// examples/guards.rs, which `build` builds alongside the firmware too.
 const GUARDS: &str = "target/avr-none/release/examples/guards.elf";
+/// examples/first_light.rs, the first-light image, which `build` builds and
+/// checks too, and `hex` writes as its own hex.
+const FIRST_LIGHT: &str = "target/avr-none/release/examples/first_light.elf";
 const HEX: &str = "target/noctigon-kr1k.hex";
+/// The first-light image's hex. `flash` takes it by name, since it has
+/// `kr1k` in it.
+const FIRST_LIGHT_HEX: &str = "target/noctigon-kr1k-first-light.hex";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -114,8 +122,9 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
-/// Builds the firmware, the link probe and the guards probe, and refuses any
-/// of them if the layout checks or the simulator fail. `examples` is `sim::check`'s.
+/// Builds the firmware, the link probe, the guards probe and the first-light
+/// image, and refuses any of them if the layout checks or the simulator fail.
+/// `examples` is `sim::check`'s.
 fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     run(Command::new(cargo).current_dir(root()).args([
@@ -127,6 +136,8 @@ fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
         "link",
         "--example",
         "guards",
+        "--example",
+        "first_light",
         "--release",
         "--target",
         "avr-none",
@@ -151,7 +162,19 @@ fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     let guards_elf = elf::Elf::parse(&bytes).map_err(at(&guards))?;
     layout::check(&guards_elf).map_err(at(&guards))?;
     sim::guards(&guards_elf).map_err(|e| format!("{}: simulator: {e}", guards.display()))?;
+
+    let light = first_light()?;
+    sim::first_light(&light).map_err(|e| format!("{}: simulator: {e}", FIRST_LIGHT))?;
     Ok((elf, report))
+}
+
+/// The first-light image's ELF, built and through `layout::check`.
+fn first_light() -> Result<elf::Elf, String> {
+    let path = root().join(FIRST_LIGHT);
+    let bytes = fs::read(&path).map_err(at(&path))?;
+    let light = elf::Elf::parse(&bytes).map_err(at(&path))?;
+    layout::check(&light).map_err(at(&path))?;
+    Ok(light)
 }
 
 /// The link probe is only worth checking if it really has something in each
@@ -175,6 +198,13 @@ fn hex(examples: bool) -> Result<(), String> {
     let image = crc::sign(&firmware, &stamp::current(&root()))?;
     write(&root().join(HEX), &ihex::encode(&image))?;
     eprintln!("wrote {HEX}");
+    // The code alone, with no padding, stamp or CRC, since it checks none.
+    let light = first_light()?.flash_image();
+    write(&root().join(FIRST_LIGHT_HEX), &ihex::encode(&light))?;
+    eprintln!(
+        "wrote {FIRST_LIGHT_HEX}, {} bytes, which has only run on the simulator",
+        commas(light.len() as u64)
+    );
     println!("stamp {}", stamp::read(&image).unwrap_or_default());
 
     let flash = firmware.len() as u64;

@@ -4,11 +4,11 @@ Every hardware check the roadmap is waiting on, in the order to do them, for a b
 
 Before this plan was written for the KR1K, the owner read the stock torch with avrdude 8.3 (`-c serialupdi -p avr32dd20`) through the kit on 2026-11-16, with the cell out and nothing written. That answered parts of stage 1 by another route, and the [Results](#results) table has what it found, against the rows it touches. It used avrdude, not `xtask`, so 1.7 and 1.8 still want running with `xtask` before stage 2.
 
-The order is the point of it. **The first flash on the torch is a first-light image built for the AVR32DD20, and the full firmware only goes on after stage 3 has passed.** That image doesn't exist yet. On the TS26 this plan came from, a small first-light image kept firmware faults and board faults apart, and an earlier torch had gone dark straight after a verified flash of a much bigger start-up with nobody able to say which it was.
+The order is the point of it. **The first flash on the torch is a first-light image built for the AVR32DD20, and the full firmware only goes on after stage 3 has passed.** That image is `examples/first_light.rs`, and it has only run on the simulator. On the TS26 this plan came from, a small first-light image kept firmware faults and board faults apart, and an earlier torch had gone dark straight after a verified flash of a much bigger start-up with nobody able to say which it was.
 
 Each check says what it needs.
 
-- **First light** is the smallest image that turns the light on and off at one low level through PC1, the DAC and one path, built for the AVR32DD20. It has no watchdog, no sleep and no interrupts, so there's very little in it to hang. It's not the TS26's first-light image in the history (commit `9d3b7dc`), which is for the ATtiny1616 and never goes on this torch.
+- **First light** is the smallest image that turns the light on and off at one low level through PC1, the DAC and the low paths (PA7 and PA6 together, as every level in the low range has them), built for the AVR32DD20. It's `examples/first_light.rs`, and `cargo xtask hex` writes it to `target/noctigon-kr1k-first-light.hex`. It has no watchdog, no sleep, no timer and no interrupts, so there's very little in it to hang. It ignores the switch until it's read released for about 0.6 s, then each press toggles the light. It has only run on the simulator, and nobody has flashed it. It's not the TS26's first-light image in the history (commit `9d3b7dc`), which is for the ATtiny1616 and never goes on this torch.
 - **Main** is the full firmware on main, once it's ported.
 - **T1** to **T4** are each a [test build](#test-builds).
 
@@ -93,7 +93,7 @@ The first-light image only. The full firmware waits for stage 4.
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
 | 2.1 | | Look at the adapter in your hand. Cell out. Ohms between the pads again | The plain kit, and the same numbers as 1.6 | |
-| 2.2 | | Flash the first-light image ([flashing.md](flashing.md#the-first-flash-is-a-first-light-image)) | `flash` warns about an image short of the full flash, which is expected for first light, then verify passes. A verify only shows the bytes arrived | "Ping, back up and flash", the AVR Dx NVM writes |
+| 2.2 | | Flash the first-light image, `cargo xtask flash <port> target/noctigon-kr1k-first-light.hex` ([flashing.md](flashing.md#the-first-flash-is-a-first-light-image)) | `flash` warns about an image short of the full flash, which is expected for first light, then verify passes. A verify only shows the bytes arrived | "Ping, back up and flash", the AVR Dx NVM writes |
 | 2.3 | | If verify fails | Run it once more. If it fails again, stop there. Nothing has proven the programmer's AVR Dx NVM sequence on a real chip before this, so suspect it as much as the contact | |
 | 2.4 | | `cargo xtask ping <port>`, then probe off | Same answer as 1.7. A chip that talked before the flash and doesn't after it is how the TS26 was lost, so stop and measure | |
 
@@ -103,9 +103,9 @@ The proof that this board does what the repo thinks. In a dark room.
 
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
-| 3.1 | | Put the cell in and do up the head, watching the emitter. Repeat ten times | No flash at all. PC1 floats through reset and `SUT` until the image drives it, so a flash here means nothing's holding it low, or VDDIO2 isn't what anyone thinks | The open question on what holds PC1 low, by eye |
-| 3.2 | | 1C on, 1C off, a few dozen times | Low, steady, and dark again every time. No flash at turn-on, no blip at turn-off | "Does it come on cleanly, with no flash at turn-on?" |
-| 3.3 | | Tail current, on | Write it down. It's the first number for what a DAC value does on one path | Part of "measure what the DAC does" |
+| 3.1 | | Put the cell in and do up the head, watching the emitter. Repeat ten times | No flash at all. PC1 floats through reset and `SUT` until the image drives it, so a flash here means nothing's holding it low, or VDDIO2 isn't what anyone thinks. The image ignores the switch until it's been let go for about 0.6 s, so pressing it while doing up the head shouldn't light it either | The open question on what holds PC1 low, by eye |
+| 3.2 | | Press on, press off, a few dozen times | Low, steady, and dark again every time. It changes as the press lands, about 40 ms in, not on the release, and holding the switch down does nothing more. No flash at turn-on, no blip at turn-off | "Does it come on cleanly, with no flash at turn-on?" |
+| 3.3 | | Tail current, on | Write it down. It's the first number for what a DAC value does on the low paths, code 92 against 1.024 V | Part of "measure what the DAC does" |
 | 3.4 | | Tail current, off | A few mA, since the first-light image doesn't sleep. Much more and something's on that shouldn't be. Write it down | |
 | 3.5 | | Ten minutes on, in sight | Doesn't move, doesn't go out | |
 | 3.6 | | Cell out. Ohms between the pads, then `cargo xtask ping <port>` | Same as 1.6, and the chip still talks | |

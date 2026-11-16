@@ -68,7 +68,23 @@ The directory holds one chip's backup. The path is used as given, so run the com
 
 ## The first flash is a first-light image
 
-The first thing that goes on the KR1K is a first-light image built for the AVR32DD20, and nothing else. It doesn't exist yet. It'll be the smallest firmware that turns the light on and off at one low level through PC1 and the DAC, with as little as possible in it to hang, so a light that works shows the pads, the programmer, the enable, the DAC and a path all do what this repo thinks they do. The full firmware only goes on once that's proven on the light, which is stage 3 of [breakout.md](breakout.md#stage-3-first-light-on-the-torch).
+The first thing that goes on the KR1K is the first-light image, and nothing else. It's `examples/first_light.rs`, and `cargo xtask hex` builds it, runs it on the simulator and writes it to `target/noctigon-kr1k-first-light.hex` beside the firmware. It has only ever run on the simulator, and nobody has flashed it.
+
+It's the smallest firmware that turns the light on and off at one low level, through PC1, the DAC, its reference and the low paths (PA7 and PA6 together), with src/avr/hw.rs's own output code. It has no watchdog, no sleep, no timer and no interrupt, so there's very little in it to hang, and a light that works shows the pads, the programmer, the enable, the DAC and the paths all do what this repo thinks they do. The full firmware only goes on once that's proven on the light, which is stage 3 of [breakout.md](breakout.md#stage-3-first-light-on-the-torch).
+
+Here's what it does from the moment the cell goes in. The times are from the disassembly, and about a quarter longer than the simulator counts them.
+
+- PC1 goes low first, then the pins and DAC0 are set up, which leaves the driver off. Nothing lights at boot.
+- The switch does nothing until it's read released for about 0.6 s without a break, so pressure while the cell goes in and the head's done up can't light it, and nor can a switch held from reset.
+- From then on each press toggles the light, on then off, once it's been held for about 40 ms. Holding the switch down changes nothing more, and it has to be let go for about 40 ms before the next press counts.
+- On is PC1 up with the DAC at 0, about 10 ms for the boost converter (the stock firmware waits 8 ms), then the firmware's floor, ramp level 13, which is the low paths at DAC code 92 against 1.024 V. Off is the DAC to 0, PC1 low and the paths low.
+
+```sh
+cargo xtask hex
+cargo xtask flash /dev/cu.usbserial-XXXX target/noctigon-kr1k-first-light.hex
+```
+
+It's the code alone, a few hundred bytes, with no stamp and no CRC, since it checks neither. So `flash` warns that it isn't a signed build of the full firmware, and goes ahead, which is expected. It has no low-voltage protection, so don't leave a cell in it.
 
 The repo's history has a first-light image for the TS26 at commit `9d3b7dc`. It's built for the ATtiny1616, and it must never go on this torch.
 
