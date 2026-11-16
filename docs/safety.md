@@ -168,7 +168,7 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Status.** Not yet.
 
-**What's left.** Measuring off current on this torch, stock first (from a backup) and then with this firmware. Whether stock leaves the AW2016 in a lower-power state than it powers up in is unknown.
+**What's left.** Measuring off current on this torch, stock first (from a backup) and then with this firmware. Whether stock leaves the AW2016 in a lower-power state than it powers up in is unknown. Once the AW2016 driver lands, the library already limits how long the aux stay lit while off, since nothing reads the cell then. `torch::Torch` darkens off's dim blue a day after power-on or the last press, and shows lockout's bright red for only five seconds after a press (docs/ui.md). Those limits are in the library and its tests, and nothing drives the aux on this board yet.
 
 ### H14. A stray interrupt
 
