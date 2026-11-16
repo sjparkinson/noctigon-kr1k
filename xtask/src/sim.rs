@@ -4784,12 +4784,14 @@ mod tests {
     fn a_failed_run_says_which_it_was_and_whether_interrupts_were_landing() {
         let power_on = || Ok(ticking());
         let failed = "the library says power down, but the firmware idled";
+        // Ticks 0 and 1 read the cell, the check every torch makes on its
+        // first tick, so the library idles too. Tick 2's the first it rests.
         let err = run(&power_on, None, Landing::Watch).err().unwrap();
-        assert_eq!(err, format!("random switching: tick 1: {failed}"));
+        assert_eq!(err, format!("random switching: tick 2: {failed}"));
         let err = run(&power_on, None, Landing::Until(5)).err().unwrap();
         assert_eq!(
             err,
-            format!("with interrupts mid-pass: random switching: tick 1: {failed}")
+            format!("with interrupts mid-pass: random switching: tick 2: {failed}")
         );
 
         let example = spec::examples(spec::UI_MD)

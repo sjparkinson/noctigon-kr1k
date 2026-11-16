@@ -53,7 +53,7 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 - ~~Remember the level in RAM~~ Struck. Every click on starts at the same level (docs/ui.md)
 - [x] A simpler UI. 1C on and off, 1H ramps each time the other way from the last, 3C lockout that never lights. Library only
 - [x] A quicker switch. Clicks count after about 220 ms rather than 280, and 1C off and the third click of 3C lock count as they're let go. Library only
-- [x] Aux that can't flatten a cell nobody's reading. Lockout's red is bright, for five seconds after a press, and off's dim blue goes dark a day after the last press. Library only, since nothing drives the aux on this board until the AW2016 driver lands
+- [x] Aux that can't flatten a cell. Lockout's red is bright, for five seconds after a press. Off's dim blue isn't timed, and a check of the cell every five minutes at rest turns it off under 3.30 V and back on at 3.40 V. Library only, since nothing drives the aux on this board until the AW2016 driver lands
 - [x] The simulator ported to a fake AVR32DD20, wired like the Lume X1-C
 - ~~Battery check~~ Struck. No magic flashes, so no 3C voltage blink (docs/ui.md)
 
