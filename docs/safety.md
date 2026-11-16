@@ -2,7 +2,7 @@
 
 One section for every way identified so far that this torch could hurt someone or itself, what covers it, and what evidence there is that the cover works. It's a log of the current state. A section changes in the same commit as the code it describes, and a hazard nobody has thought of isn't in here, so a short log doesn't mean a short list.
 
-This repo started as firmware for a Wurkkos TS26 (ATtiny1616, MP3432 boost driver, PWM into the current control) and is being ported to the KR1K (AVR32DD20, Lume X1-C, a DAC into a current amplifier, three power paths). Nothing has run on a KR1K, nobody has opened this torch, and much of the cover below is TS26 code that hasn't been ported yet. Where a section names code, it's the code as it stands, and the section says what has to change. Read each Status strictly.
+This repo started as firmware for a Wurkkos TS26 (ATtiny1616, MP3432 boost driver, PWM into the current control) and is being ported to the KR1K (AVR32DD20, Lume X1-C, a DAC into a current amplifier, three power paths). Nothing from this repo has run on a KR1K. The only contact with this torch so far is one avrdude read of its stock firmware and fuses through the pads, cell out, nothing written (2026-11-16, [hardware.md](hardware.md)). Much of the cover below is TS26 code that hasn't been ported yet. Where a section names code, it's the code as it stands, and the section says what has to change. Read each Status strictly.
 
 - **not yet** means the firmware doesn't do this on the AVR32DD20 yet, or does it only as TS26 code that hasn't been ported.
 - **host tests** means the library logic is tested on the host, which is board-independent, but nothing built for the AVR32DD20 has run it, and its constants may still be the TS26's.
@@ -16,9 +16,9 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 ### H1. The boost converter on with nothing controlling it
 
-**Cause.** PC1, the boost and amplifier enable, is a tri-stated input from every reset until firmware drives it (DS40002413B §18.3.1), for at least the 64 ms `SUT` the stock fuses ask for. It's on the VDDIO2 supply, and the MVIO pins tri-state whenever that supply is missing (§5.1, §19.3.2.1), so if VDDIO2 sags or isn't what the board assumes, PC1 lets go mid-run. It could also be left high by a stray jump to the reset vector, or raised with the DAC still holding a current.
+**Cause.** PC1, the boost and amplifier enable, is a tri-stated input from every reset until firmware drives it (DS40002413B §18.3.1), for at least the `SUT` delay (0 ms on this torch's factory fuses, 64 ms in the stock source's). It's on the VDDIO2 supply, and the MVIO pins tri-state whenever that supply is missing (§5.1, §19.3.2.1), so if VDDIO2 sags or isn't what the board assumes, PC1 lets go mid-run. It could also be left high by a stray jump to the reset vector, or raised with the DAC still holding a current.
 
-**Mitigation.** Needed on the AVR32DD20, and not done yet. The first thing `main` does is clear PC1's `OUT` and then set its `DIR`, as `hw::hold_enable_low` does for the TS26's PB2 today. The DAC's data is zero and every path pin is low whenever PC1 rises. `hw::halt` (also the panic handler) drops PC1, zeroes the DAC and drops the paths. PC1 never gets a pull-up. The errata's lost-write problem (DS80001026D §2.2.3) means a VPORT write straight after a store to a higher address needs a `nop` or an `out`, or the write that drops PC1 can vanish.
+**Mitigation.** Needed on the AVR32DD20, and not done yet. The first thing `main` does is clear PC1's `OUT` and then set its `DIR`, as `hw::hold_enable_low` does for the TS26's PB2 today. The DAC's data is zero and every path pin is low whenever PC1 rises. Turning off, and `hw::halt` (also the panic handler), end with PC1 low, the DAC at zero and every path low. The order those happen in is unconfirmed on this board (the stock firmware zeroes the DAC, then drops PC1, then the paths), so don't treat any order as the safe one yet. PC1 never gets a pull-up. The errata's lost-write problem (DS80001026D §2.2.3) means a VPORT write straight after a store to a higher address needs a `nop` or an `out`, or the write that drops PC1 can vanish.
 
 **Evidence.** None on this chip. The TS26 code and its simulator tests cover PB2, a different pin on a different chip.
 
@@ -30,7 +30,7 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** The LED current comes from DAC0 on PD6 into an amplifier, not from TCA0's PWM and delta-sigma as on the TS26. A DAC value left non-zero when the light goes off, a reference switched to 2.5 V when 1.024 V was meant (about 2.4 times the current for the same data), a value written with only the low byte (the output only changes when the high byte lands, §34.5.2), or PD6's input buffer left on.
 
-**Mitigation.** Needed and not done yet. Turning off zeroes the DAC data and sets the reference back to 1.024 V before anything else that matters. The ramp has a ceiling well below full output (`ramp::CEILING` holds the TS26 at level 120 of 150), and this firmware's curve is its own. PD6's input buffer is off, as §34.3.1 asks.
+**Mitigation.** Needed and not done yet. Turning off zeroes the DAC data and sets the reference back to 1.024 V, alongside dropping PC1 and the paths (H1, order unconfirmed). The ramp has a ceiling well below full output (`ramp::CEILING` holds the TS26 at level 120 of 150), and this firmware's curve is its own. PD6's input buffer is off, as §34.3.1 asks.
 
 **Evidence.** None. `src/ramp.rs` still describes PWM and delta-sigma.
 
@@ -76,15 +76,15 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 ### H6. The MCU browning out with the cell
 
-**Cause.** VDD is the cell, through a reverse-polarity FET and no regulator ([hardware.md](hardware.md#power-and-the-battery-reading)). A cell sagging under load pulls the MCU's supply down with it. Below the BOD level (1.8 V to 2.85 V, table 38-16) the chip resets, and with the BOD off it can run below its safe range until POR at about 1.6 V (table 38-4). A reset tri-states PC1 (H1). A reset loop on a sagging cell could pulse the light, and code running out of its voltage range might do anything.
+**Cause.** VDD is the cell, through a reverse-polarity FET and no regulator ([hardware.md](hardware.md#power-and-the-battery-reading)). A cell sagging under load pulls the MCU's supply down with it. With the BOD on, the chip resets below its level (1.9 V to 2.85 V typical, table 38-16). On this torch the BOD is off. Its fuses read factory defaults, `BODCFG` 0 and `SUT` 0 ms (confirmed on this torch, 2026-11-16), and the stock source's BOD-on and 64 ms settings were never programmed. So a sagging cell browns the MCU out with no reset at all, and the CPU can keep running below the voltage its clock needs until POR at about 1.6 V (table 38-4), with PC1 high and the DAC holding a current. Code running out of its voltage range might do anything, including drive PC1. When POR does trip, PC1 tri-states (H1), and a cell that recovers and sags again could pulse the light.
 
-**Mitigation.** None in firmware yet. The stock ELF asks for the BOD on continuously in active mode, which this firmware would read and check, never write. Low-voltage protection (H5) is meant to stop the cell getting that low with the light on.
+**Mitigation.** None in firmware yet. The firmware can't turn the BOD on, since that's a fuse and nothing here writes fuses. The BOD's level and mode can't be changed from software either, so low-voltage protection (H5) is the only cover, and it's meant to stop the cell getting near that low with the light on. Running the clock slower than the stock firmware's 12 MHz would widen the margin, and nobody has worked out by how much.
 
-**Evidence.** None.
+**Evidence.** The fuse read is the evidence that the hazard is live on this torch. Nothing covers it.
 
 **Status.** Not yet.
 
-**What's left.** Nobody knows the board's fuses (a backup's `fuses.hex` says), how far the cell sags at what level, or what the boost converter does as VDD and its input fall together.
+**What's left.** How far the cell sags at what level, what the boost converter does as VDD and its input fall together, and whether a low-voltage threshold well above the brown-out region is enough with a cell that's sagging fast under turbo. The ramp's ceiling should stay low until someone has measured the sag.
 
 ### H7. Overheating
 
@@ -126,25 +126,25 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** A torch whose fuses the firmware's timing or its own protection don't expect.
 
-**Mitigation.** `selftest::Fuses::ok` checks fuse fields, with `hw::fuses` only ever reading them. Nothing in this repo writes a fuse. The fields are the tinyAVR's. The AVR32DD20's are `WDTCFG`, `BODCFG`, `OSCCFG.CLKSEL`, `SYSCFG0` (with `UPDIPINCFG`), `SYSCFG1` (`MVSYSCFG` and `SUT`), `CODESIZE` and `BOOTSIZE` (DS40002413B §8.8), so the check needs rewriting against them and against a real board's bytes.
+**Mitigation.** `selftest::Fuses::ok` checks fuse fields, with `hw::fuses` only ever reading them. Nothing in this repo writes a fuse. The fields are the tinyAVR's. The AVR32DD20's are `WDTCFG`, `BODCFG`, `OSCCFG.CLKSEL`, `SYSCFG0` (with `UPDIPINCFG`), `SYSCFG1` (`MVSYSCFG` and `SUT`), `CODESIZE` and `BOOTSIZE` (DS40002413B §8.8), so the check needs rewriting against them and against a real board's bytes. This torch's read `00 00 00 FF FF D0 08 00 00` (factory defaults, BOD off, `SUT` 0 ms, dual supply), so a check written to the stock source's fuses would fail it.
 
-**Evidence.** None for this chip.
+**Evidence.** The one fuse read from this torch, which nothing has checked against code yet.
 
 **Status.** Not yet.
 
-**What's left.** Nobody has read a KR1K's fuses. A bad fuse is the one permanent thing in this log, which is why nothing here writes one.
+**What's left.** Whether other KR1Ks match this one's factory defaults. A bad fuse is the one permanent thing in this log, which is why nothing here writes one.
 
 ### H11. Losing UPDI or the chip while programming
 
 **Cause.** A `SYSCFG0.UPDIPINCFG` write to GPIO, a high voltage on the UPDI pad, a slipped probe, or a wrong pad order.
 
-**Mitigation.** The programmer never writes fuses, the user row or a locked chip, and refuses a chip with the wrong signature, which for this chip is `1E 95 3A`. No high-voltage programmer ever goes on this torch, recovery included. On the AVR32DD20 that's doubly so. The UPDI pin, PF7, is rated to VDD + 0.3 V (table 38-1), and the high-voltage override goes on PF6, which the three-pad layout doesn't bring out, at 7.5 to 8.5 V against a 9 V maximum (§36.3.2.1.2, table 38-29). The first flash is a first-light image built for the AVR32DD20, which doesn't exist yet, and the full firmware goes on only after that's proven on the light. The TS26's first-light image in the history is for the ATtiny1616 and never goes on this torch. `restore` refuses a backup from another chip.
+**Mitigation.** The programmer never writes fuses, the user row or a locked chip, and refuses a chip with the wrong signature, which for this chip is `1E 95 3A`. No high-voltage programmer ever goes on this torch, recovery included. On the AVR32DD20 that's doubly so. The UPDI pin, PF7, is rated to VDD + 0.3 V (table 38-1), and the high-voltage override goes on PF6, which the three-pad layout doesn't bring out, at VDD + 2 V or more and 8.5 V at most, against a 9 V maximum (§36.3.2.1.2, table 38-29). The first flash is a first-light image built for the AVR32DD20, which doesn't exist yet, and the full firmware goes on only after that's proven on the light. The TS26's first-light image in the history is for the ATtiny1616 and never goes on this torch. `restore` refuses a backup from another chip.
 
-**Evidence.** Host tests in xtask/src/updi.rs and xtask/src/main.rs, against a fake ATtiny1616.
+**Evidence.** Host tests in xtask/src/updi.rs and xtask/src/main.rs, against a fake ATtiny1616. On 2026-11-16 avrdude read this torch through the JLHawaii808 kit on its `+ - U` pads with the cell out, and the chip took the key, answered with `1E 95 3A` and read back the same flash twice. One link attempt failed until the probe was re-seated. That's avrdude, not `xtask`, and nothing was written.
 
 **Status.** Not yet.
 
-**What's left.** Porting the programmer to the AVR Dx NVM controller (no page buffer, 24-bit addresses). Finding the pads, their order and pitch, and naming each with a meter ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
+**What's left.** Porting the programmer to the AVR Dx NVM controller (no page buffer, 24-bit addresses). Measuring the pads' pitch in millimetres and naming each with a meter before `xtask` first touches them ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
 
 ### H12. The programmer feeding the cell rail
 
@@ -152,7 +152,7 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Mitigation.** Procedure only. Cell out before anything touches the pads, the switch left alone, the first contact made in the dark while watching the emitter, and a stop on any light that stays on or an adapter that warms ([flashing.md](flashing.md#the-pads), [breakout.md](breakout.md)).
 
-**Evidence.** None.
+**Evidence.** The 2026-11-16 avrdude read ran with the cell out, as the procedure says, with the chip asleep in the stock firmware. Nothing in that report says what the emitter or the adapter did, so it says nothing either way about the cell rail.
 
 **Status.** Not yet.
 
@@ -234,7 +234,7 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 This is true of every hazard, so it's kept out of the sections above.
 
-- **Nothing has met a KR1K.** Every result in the repo's history is from a TS26 or its breakout, on another chip and another driver.
+- **Nothing from this repo has met a KR1K.** Apart from one avrdude read of the stock torch, every result in the repo's history is from a TS26 or its breakout, on another chip and another driver.
 - **Every threshold is unmeasured.** The cell's cut-offs, the temperature limit, the ramp's ceiling, the 3.60 V that clears a flat cell and the deadlines are from the stock firmware, the datasheet or the project's own judgement.
 - **The simulator's limits** are in [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator). It has no chip resets and models nothing analogue, so the driver, the cell and the head are all scripted, and until it's ported it models the wrong chip.
 - **There's no run-time limit.** A lit light with a good cell and a cool head stays lit, whatever pressed the switch.

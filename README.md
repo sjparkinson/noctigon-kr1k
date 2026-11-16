@@ -17,7 +17,7 @@ See [docs/toolchain.md](docs/toolchain.md) for how it builds and links.
 
 ## Flashing
 
-The KR1K's driver very likely has three UPDI pads, though nobody's published where they are or in what order. Take the cell out, measure the pads, put a plain 4.5 V serial UPDI programmer on them, and `cargo xtask` does the rest. Never a high-voltage programmer, and never write fuses. [docs/flashing.md](docs/flashing.md) has the whole procedure, and the first flash is a first-light image, not this.
+The KR1K's driver has three UPDI pads, labelled `+ - U` on this torch. Take the cell out, check the pads with a meter, put a plain 4.5 V serial UPDI programmer on them, and `cargo xtask` does the rest. Never a high-voltage programmer, and never write fuses. [docs/flashing.md](docs/flashing.md) has the whole procedure, and the first flash is a first-light image, not this.
 
 ```sh
 cargo xtask ping /dev/cu.usbserial-XXXX

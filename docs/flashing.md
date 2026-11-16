@@ -1,12 +1,12 @@
 # Flashing
 
-`cargo xtask` has a UPDI programmer built in. It runs on macOS and Linux, and sets up the serial port with `stty`. Nobody has used it on a KR1K yet, and nobody has found this torch's pads, so everything below about the torch is a plan.
+`cargo xtask` has a UPDI programmer built in. It runs on macOS and Linux, and sets up the serial port with `stty`. Nobody has used it on a KR1K yet. The torch's pads have been found and its stock firmware read with avrdude 8.3 (`-c serialupdi -p avr32dd20`) through the JLHawaii808 kit, with the cell out and nothing written (2026-11-16, [hardware.md](hardware.md#the-flashing-pads)). Everything below about `xtask` on the torch is still a plan.
 
 ## Only the plain adapter goes on this torch
 
 Only a non-high-voltage UPDI adapter ever goes on the KR1K's pads, and only at the 4.5 V the JLHawaii808 kit supplies. Adafruit's High Voltage UPDI Friend never does, nor any other 12 V programmer, and that includes trying to recover a torch that's stopped talking. There's no exception for a torch that's already dead. If UPDI's gone, the torch is gone.
 
-On this chip there's no reason to reach for one anyway. The UPDI pad (`R`, if the layout is the usual one) is PF7, which is rated to VDD + 0.3 V like any ordinary pin (DS40002413B table 38-1). The high-voltage override goes on the RESET pin, PF6, which the three-pad layout doesn't bring out, and wants 7.5 to 8.5 V there, against a 9 V absolute maximum (§36.3.2.1.2, table 38-29). The Friend's 12 V on PF7 is far outside its rating, and wouldn't do the job if it weren't.
+On this chip there's no reason to reach for one anyway. The UPDI pad (`U` on this board) is PF7, which is rated to VDD + 0.3 V like any ordinary pin (DS40002413B table 38-1). The high-voltage override goes on the RESET pin, PF6, which the three-pad layout doesn't bring out, and wants at least VDD + 2 V and at most 8.5 V there, against a 9 V absolute maximum (§36.3.2.1.2, table 38-29). The Friend's 12 V on PF7 is far outside its rating, and wouldn't do the job if it weren't.
 
 An earlier torch, a Wurkkos TS26, was lost on 2026-11-06 after the Friend was hand-held on its pads, and it then measured about 2.5 Ω between all three. The likely cause is 12 V or a slipped probe, and neither is proven. It's the reason this rule exists, and it's not evidence about this board.
 
@@ -20,11 +20,11 @@ Nothing in this repo writes fuses, and nothing should. `SYSCFG0.UPDIPINCFG` set 
 
 [JLHawaii808's kit](https://jlhawaii808.com/products/updi-programmer-driver-reflashling-kit), the 4.5 V version, with its pogo probe. It's a CH340 serial UPDI adapter with USB-C, and it's what the owner has. thefreeman says 3.3 V programmers aren't very reliable on AVR32DD20 boost drivers, and his 4.5 V programmer has extra capacitance for inrush ([BLF thread](https://budgetlightforum.com/t/wts-usb-updi-programmers-for-attiny1616-avr32dd20-drivers-sofirn-wurkkos-fireflylite-emisar/71459)). Don't use the kit's 3.3 V version here.
 
-Watch the pad spacing before you rely on the fixed probe. The common three-pad layout is `+ - R` at 1.27 mm pitch, which is what the probe expects, and the reflash reference puts Hank's AVR32DD20 Lume X1 in that family. But nobody has published a KR1K's pads, some boards use another pitch or another order, and the TS26 that was lost had pads about 1.75 mm apart against a written-down 1.27 mm. So measure the pitch on this board before trusting the probe. One that nearly fits sits on the edges of the pads, which is how it slips. Loose pogo leads work whatever the layout. Use a short USB cable too; JLHawaii808 notes failures with 1 m ones.
+Watch the pad spacing before you rely on the fixed probe. On this torch the kit's pogo probe fits the pads, which are labelled `+ - U` (confirmed on this torch, not measured in millimetres). Another KR1K might not match, some boards use another pitch or another order, and the TS26 that was lost had pads about 1.75 mm apart against a written-down 1.27 mm. So check the fit on any other board before trusting the probe. One that nearly fits sits on the edges of the pads, which is how it slips. Loose pogo leads work whatever the layout. Use a short USB cable too; JLHawaii808 notes failures with 1 m ones.
 
 ## The pads
 
-Where the KR1K's pads are, and what's likely about them, is in [hardware.md](hardware.md#the-flashing-pads). In short, nothing is known about this board, and `+ - R` at 1.27 mm is the best guess.
+Where the KR1K's pads are, and what's likely about them, is in [hardware.md](hardware.md#the-flashing-pads). On this torch they're labelled `+ - U`, the kit's probe fits them, and the chip answered through them. One link attempt failed with "UPDI link initialization failed" and worked after re-seating the probe, so a failure to link is a reason to lift and re-seat, not to push harder.
 
 Take the cell out first, every time. VDD on this driver is the cell, so the programmer's supply on `+` powers the MCU directly, and very likely the boost converter's input and the AW2016 too, since they all hang off the cell rail (reasoning, unmeasured). With a cell in, the programmer and the cell would fight over the same rail. Don't touch the switch while the probe's on.
 
@@ -48,17 +48,19 @@ Run `ls /dev/cu.*` before and after plugging the adapter in. On macOS it's somet
 cargo xtask ping /dev/cu.usbserial-XXXX
 ```
 
-This reads the chip's System Information Block and writes no memory, but don't count on it leaving a running chip alone. `ping` finishes by writing UPDIDIS, "upon which the UPDI will issue a System Reset" (DS40002413B §36.3.2.2.2). So expect the firmware to restart as `ping` ends. Nobody has seen what an AVR32DD20 says to `ping`. pymcuprog calls its NVM version P:2, so expect something with `P:2` in it. If you don't get an answer, see [If it doesn't talk](#if-it-doesnt-talk).
+This reads the chip's System Information Block and writes no memory, but don't count on it leaving a running chip alone. `ping` finishes by writing UPDIDIS, "upon which the UPDI will issue a System Reset" (DS40002413B §36.3.2.2.2). So expect the firmware to restart as `ping` ends. Nobody has seen what this torch says to `xtask`'s `ping`. avrdude read signature `1E 95 3A`, silicon revision 1.2 and "NVM type 2" from it, and pymcuprog calls that NVM version P:2, so expect something with `P:2` in it. If you don't get an answer, see [If it doesn't talk](#if-it-doesnt-talk).
 
 ## Back up the factory firmware first
 
 Do this before you flash anything. It's the only copy of Hank's build and its fuses that you'll have.
 
+This torch already has one. avrdude read it on 2026-11-16 into `backup/stock/` (gitignored), and a second read of flash matched the first byte for byte. It holds the stock firmware's 0284 build, and the fuses are factory defaults with the BOD off ([hardware.md](hardware.md#fuses)). Keep it somewhere safe as well. An `xtask` backup into `backup/torch` is still worth taking before the first flash, since it adds the `serial.hex` that `restore` checks.
+
 ```sh
 cargo xtask backup /dev/cu.usbserial-XXXX backup/torch
 ```
 
-That puts the chip in programming mode, checks its signature, and saves `flash.hex`, `eeprom.hex`, `fuses.hex` and `serial.hex` into the directory you name. The fuses are there for reference only, and they're the first evidence of what Hank's factory programming wrote ([hardware.md](hardware.md#fuses)). The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy.
+That puts the chip in programming mode, checks its signature, and saves `flash.hex`, `eeprom.hex`, `fuses.hex` and `serial.hex` into the directory you name. The fuses are there for reference only. The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy.
 
 If it warns that the serial number can't tell one chip from another (all FF or all 00), the backup is saved all the same, but `restore` will refuse it. Stop there, before anything goes over the factory firmware.
 
@@ -102,10 +104,10 @@ cargo xtask restore /dev/cu.usbserial-XXXX backup/torch
 
 The check says which chip a backup came from and nothing about which build it holds, so read the directory in the command before you run it.
 
-To go back to the stock firmware without a backup, download its latest release (the [README](../README.md#acknowledgements) links the project) and take the build for model 0283, Hank's Lume X1-C, saved under a name with `0283` in it so `flash` takes it, or 0284 if the board's PCB code says it's the 32 W version ([hardware.md](hardware.md#which-kr1k-this-is)). The KR1K has no build of its own, so check the PCB code before picking. This project hasn't flashed one onto a KR1K.
+To go back to the stock firmware without a backup, download its latest release (the [README](../README.md#acknowledgements) links the project) and take the Lume X1-C build for model 0284, which is what this torch shipped with (its flash holds `0284.0.653607d`, [hardware.md](hardware.md#which-kr1k-this-is)). Save it under a name with `kr1k` or `0283` in it, since `flash` refuses any other name. The KR1K has no build of its own, and the backup in `backup/stock/` is the better way back. This project hasn't flashed one onto a KR1K.
 
 ```sh
-cargo xtask flash /dev/cu.usbserial-XXXX path/to/stock-0283.hex
+cargo xtask flash /dev/cu.usbserial-XXXX path/to/stock-kr1k-0284.hex
 ```
 
 ## If it doesn't talk
@@ -119,6 +121,6 @@ cargo xtask flash /dev/cu.usbserial-XXXX path/to/stock-0283.hex
 
 The programmer writes flash and EEPROM, and only those. That's all this torch needs, and it keeps fuses out of reach.
 
-`xtask/src/updi.rs` is the protocol, covering link set-up, the NVM programming key, reset, flash writes through the NVM controller and reads in blocks. The AVR DD's controller writes flash a word at a time with no page buffer and erases it in 512-byte pages, and UPDI reaches flash at 0x800000 with 24-bit addresses (DS40002413B chapters 11 and 36). Microchip publishes no separate UPDI programming specification for the AVR DD, so the sequences follow pymcuprog, and the registers come from the ATDF. `xtask/src/serial.rs` opens the port, configures it with `stty` (115200 baud, 8 data bits, even parity, 2 stop bits) and swallows the echo that a one-wire adapter sends back.
+`xtask/src/updi.rs` is the protocol, covering link set-up, the NVM programming key, reset, flash writes through the NVM controller and reads in blocks. The AVR DD's controller writes flash a word at a time with no page buffer and erases it in 512-byte pages, and UPDI reaches flash at 0x800000 with 24-bit addresses (DS40002413B chapters 11 and 36). No separate UPDI programming specification for the AVR DD turned up from Microchip, so the sequences follow pymcuprog, and the registers come from the ATDF. `xtask/src/serial.rs` opens the port, configures it with `stty` (115200 baud, 8 data bits, even parity, 2 stop bits) and swallows the echo that a one-wire adapter sends back.
 
 The tests run all of it against a pretend chip in `updi.rs`. That catches slips in framing and sequencing, but it was written from the same reading of the datasheet as the programmer, so the first run against a real chip is the real test. Start with `ping`, then `backup`.

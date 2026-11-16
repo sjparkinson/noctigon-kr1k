@@ -1,6 +1,8 @@
 # Bench plan
 
-Every hardware check the roadmap is waiting on, in the order to do them, for a bench with the KR1K (Lume X1-C, 6 V build, AVR32DD20), a Fluke 107 and [JLHawaii808's 4.5 V UPDI kit](https://jlhawaii808.com/products/updi-programmer-driver-reflashling-kit). None of it has been done. Every Expect below is a prediction, and nobody has opened this torch. [flashing.md](flashing.md) has how to use the programmer.
+Every hardware check the roadmap is waiting on, in the order to do them, for a bench with the KR1K (Lume X1-C, sold as the 6 V build, AVR32DD20), a Fluke 107 and [JLHawaii808's 4.5 V UPDI kit](https://jlhawaii808.com/products/updi-programmer-driver-reflashling-kit). Every Expect below is a prediction until its row has a result. [flashing.md](flashing.md) has how to use the programmer.
+
+Before this plan was written for the KR1K, the owner read the stock torch with avrdude 8.3 (`-c serialupdi -p avr32dd20`) through the kit on 2026-11-16, with the cell out and nothing written. That answered parts of stage 1 by another route, and the [Results](#results) table has what it found, against the rows it touches. It used avrdude, not `xtask`, so 1.7 and 1.8 still want running with `xtask` before stage 2.
 
 The order is the point of it. **The first flash on the torch is a first-light image built for the AVR32DD20, and the full firmware only goes on after stage 3 has passed.** That image doesn't exist yet. On the TS26 this plan came from, a small first-light image kept firmware faults and board faults apart, and an earlier torch had gone dark straight after a verified flash of a much bigger start-up with nobody able to say which it was.
 
@@ -45,7 +47,7 @@ If one is chosen, stage 0 would rehearse `ping`, `backup`, the first-light image
 - **Only the plain 4.5 V adapter on the torch.** No 12 V programmer ever touches it, recovery included. Both kinds of adapter show up as CH340 `1a86:7523`, so look at the one in your hand before every command.
 - **Nothing here writes fuses.** If a fuse looks wrong, stop and decide with the datasheet open. A bad `SYSCFG0` would need a high-voltage pulse on a pin the pads don't reach, and that means the torch is gone.
 - **Cell out before anything touches the pads.** VDD is the cell, so the programmer powers the MCU, and very likely the boost converter's input and the AW2016, through the supply pad. Check the ground pad is continuous with the battery negative first, every time you've had it apart. Don't touch the switch with the probe on.
-- **Name all three pads before anything touches them.** No public source gives a KR1K's pads. Continuity finds ground, and 1.5 tells the supply pad from the UPDI pad by how each reads against it. If any naming is in doubt, stop.
+- **Name all three pads before anything touches them.** This torch labels them `+ - U`, but labels aren't a measurement. Continuity finds ground, and 1.5 tells the supply pad from the UPDI pad by how each reads against it. If any naming is in doubt, stop.
 - **Don't hold the probe by hand if you can avoid it.** Clamp it, or use something else that can't slip. A slip across pads this close together shorts them.
 - **Touch ground before the probe lands.** An ESD pulse on the UPDI pin can be read as a high-voltage override if the board's protection isn't enough (DS40002413B §36.3.2.1.2, note 1). Touch the adapter's USB shell and the torch's battery negative contact before each contact.
 - **Measure before trusting a probe.** The JLHawaii808 probe is made for 1.27 mm pads, and the TS26 that was lost had pads about 1.75 mm apart. If this board's don't fit, use loose leads.
@@ -59,7 +61,7 @@ Any firmware problem below is recoverable while the chip still talks. Flash and 
 
 ## Stage 1, the pads, and stock
 
-The last chance to measure the stock firmware, and the first time anyone here meets this board.
+The last chance to measure the stock firmware, and the first time `xtask` meets this board.
 
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
@@ -71,7 +73,7 @@ The last chance to measure the stock firmware, and the first time anyone here me
 | 1.6 | | Ohms between each pair of pads, both ways round | Write them down as the baseline. A few ohms between all three is a short, and that means stop. If anything here disagrees with 1.5's names, stop | |
 | 1.7 | | `cargo xtask ping <port>`, first with the probe touching nothing, then on the pads, touching ground first. First contact in a dark room, watching the emitter, with a finger on the adapter | In the air, "no reply from the chip". On the pads, an answer naming NVM P:2 (pymcuprog's name for this chip's NVM). The stock firmware starts when the probe lands, so a blink is possible. Light that stays on, or warmth in the adapter, is a stop | First half of "ping, back up and flash" |
 | 1.8 | | The same watch as 1.7, since this is the first time the chip sits in programming mode with PC1 floating. `cargo xtask backup <port> backup/torch`, then copy that directory somewhere safe | `flash.hex`, `eeprom.hex`, `fuses.hex` and `serial.hex`, signature `1E 95 3A`, and dark and cool throughout. Dark is the first hint that something holds PC1 low, and no proof, since the DAC is off too. If `backup` warns that it can't tell one chip from another, stop before flashing anything | Second half |
-| 1.9 | | Read `backup/torch/fuses.hex`. The bytes run `WDTCFG`, `BODCFG`, `OSCCFG`, two reserved, `SYSCFG0`, `SYSCFG1`, `CODESIZE`, `BOOTSIZE` (DS40002413B §8.8.1) | `SYSCFG0.UPDIPINCFG` UPDI. If the stock factory programming wrote the stock ELF's fuses, `BODCFG` has the BOD on in active mode and `SYSCFG1` is dual supply with `SUT` 64 ms. Factory defaults would show `SUT` 0 ms. Write it all down. Don't write any fuse | What fuses a shipped board has |
+| 1.9 | Pass | Read `backup/torch/fuses.hex`. The bytes run `WDTCFG`, `BODCFG`, `OSCCFG`, two reserved, `SYSCFG0`, `SYSCFG1`, `CODESIZE`, `BOOTSIZE` (DS40002413B §8.8.1) | `SYSCFG0.UPDIPINCFG` UPDI. If the stock factory programming wrote the stock ELF's fuses, `BODCFG` has the BOD on in active mode and `SYSCFG1` is dual supply with `SUT` 64 ms. Factory defaults would show `SUT` 0 ms. Write it all down. Don't write any fuse | What fuses a shipped board has |
 | 1.10 | | Cell in. A version check from off (15 or more clicks), counting the blinks | The build date and then 0283 or 0284. That and 1.3's code say which build this board wants | Which build |
 
 If 1.9 shows anything but UPDI on PF7, stop. That's a chip one bad write away from lost.
@@ -187,3 +189,8 @@ Fill this in as you go, with the commit you flashed.
 
 | # | Date | Commit | Result |
 |---|---|---|---|
+| 1.3 | 2026-11-16 | stock | Partly, during the avrdude read. Pads found, labelled `+ - U` on the board, and the kit's pins mapped onto them. The PCB code wasn't read, and no photograph is recorded |
+| 1.4 | 2026-11-16 | stock | Partly. The kit's pogo probe fits the pads. Not measured in millimetres |
+| 1.7, 1.8 | 2026-11-16 | stock, avrdude 8.3 | Not these rows' commands, so neither is passed. avrdude through the kit, cell out, read signature `1E 95 3A`, silicon revision 1.2, "NVM type 2: 24-bit, word oriented write". The chip was asleep in the stock firmware and took the NVM programming key. One attempt failed with "UPDI link initialization failed", likely a shifted probe, and worked after re-seating. Flash read twice, matching byte for byte, used to 0x3B7D (15,230 bytes). Saved in `backup/stock/` (gitignored). Nothing written. What the emitter and the adapter did isn't recorded |
+| 1.9 | 2026-11-16 | stock, avrdude 8.3 | `00 00 00 FF FF D0 08 00 00` (`WDTCFG` to `BOOTSIZE`), the factory defaults. `SYSCFG0` 0xD0, UPDI on PF7. `BODCFG` 0, so the BOD is off, and `SYSCFG1` 0x08, dual supply with `SUT` 0 ms, so the stock source's fuse settings were never programmed (H6 in [safety.md](safety.md)). Lock bits `5C C5 C5 5C`, unlocked. Not written |
+| 1.10 | 2026-11-16 | stock | Answered from the backup rather than a version check. The flash holds `0284.0.653607d`, the stock firmware's 0284 (32 W) build, not 0283 |
