@@ -10,7 +10,7 @@ How Rust gets onto an AVR32DD20 here, and why it's put together this way.
 - Register constants generated from Microchip's ATDF at build time, with zero crate dependencies. (Rebuilding `core` pulls a few crates of its own, see [First build](#first-build).)
 - The UPDI programmer and the simulator live in `xtask`, so rustup is the only thing to install.
 
-`cargo xtask hex` builds `target/avr-none/release/kr1k.elf`, checks its layout, runs it on the simulator, pads the image to the full 32 KB of flash with a stamp of the commit and then a CRC at the end, writes that as Intel HEX at `target/noctigon-kr1k-0283.hex`, and reports flash, RAM, stack and instruction counts. The simulator's a mistake-finder, not proof, and [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator) has what it leaves out.
+`cargo xtask hex` builds `target/avr-none/release/kr1k.elf`, checks its layout, runs it on the simulator, pads the image to the full 32 KB of flash with a stamp of the commit and then a CRC at the end, writes that as Intel HEX at `target/noctigon-kr1k.hex`, and reports flash, RAM, stack and instruction counts. The simulator's a mistake-finder, not proof, and [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator) has what it leaves out.
 
 ## The memory map
 

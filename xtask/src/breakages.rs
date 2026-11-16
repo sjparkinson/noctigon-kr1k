@@ -698,7 +698,7 @@ error: cargo failed (exit status: 101)
         assert_eq!(stage(LAYOUT), Some(Stage::Layout));
         assert_eq!(stage(LINKER), Some(Stage::Build));
         assert_eq!(stage(COMPILER), Some(Stage::Build));
-        assert_eq!(stage("wrote target/noctigon-kr1k-0283.hex\n"), None);
+        assert_eq!(stage("wrote target/noctigon-kr1k.hex\n"), None);
         let (_, line) = verdict(LINKER).unwrap();
         assert_eq!(line, "cargo failed (exit status: 101)");
     }

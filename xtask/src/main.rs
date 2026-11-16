@@ -39,7 +39,7 @@ usage: cargo xtask <command>
 
 commands:
   hex                     build the firmware, run it on the simulator, write
-                          target/noctigon-kr1k-0283.hex and print flash, RAM,
+                          target/noctigon-kr1k.hex and print flash, RAM,
                           stack, loop and handler use
   hex --no-examples       the same, leaving docs/ui.md's examples out of the
                           simulator run, for a breakout test build (T1)
@@ -68,7 +68,7 @@ const ELF: &str = "target/avr-none/release/kr1k.elf";
 const PROBE: &str = "target/avr-none/release/examples/link.elf";
 /// examples/guards.rs, which `build` builds alongside the firmware too.
 const GUARDS: &str = "target/avr-none/release/examples/guards.elf";
-const HEX: &str = "target/noctigon-kr1k-0283.hex";
+const HEX: &str = "target/noctigon-kr1k.hex";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -338,17 +338,21 @@ fn runs(start: u16, bytes: &[u8]) -> Vec<String> {
 /// Refuses a file whose name doesn't say it's for this board. An image has no
 /// model in it, so the name's all there is. It catches picking up another
 /// torch's hex by mistake, not a file that's been renamed.
+///
+/// Only `kr1k` counts. The stock firmware's model numbers don't, because its
+/// 0283 build is the 40 W one and this torch shipped the 32 W 0284, so a
+/// stock hex has to be renamed on purpose (docs/flashing.md).
 fn this_boards_hex(path: &Path) -> Result<(), String> {
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if name.contains("kr1k") || name.contains("0283") {
+    if name.contains("kr1k") {
         return Ok(());
     }
     Err(format!(
-        "{} doesn't say it's for the KR1K (model 0283), so it won't be flashed. Flash the \
-         file `cargo xtask hex` writes, or use `restore <port> <dir>` for a backup",
+        "{} doesn't say it's for the KR1K, so it won't be flashed. Flash the file \
+         `cargo xtask hex` writes, or use `restore <port> <dir>` for a backup",
         path.display()
     ))
 }
@@ -840,9 +844,10 @@ mod tests {
     #[test]
     fn flash_takes_this_boards_hex_and_refuses_another_torchs() {
         for good in [
-            "target/noctigon-kr1k-0283.hex",
+            "target/noctigon-kr1k.hex",
             "release.noctigon-kr1k.hex",
             "NOCTIGON-KR1K.HEX",
+            "stock-kr1k-0284.hex",
         ] {
             assert!(this_boards_hex(Path::new(good)).is_ok(), "{good}");
         }
@@ -850,9 +855,11 @@ mod tests {
             "target/wurkkos-ts26-0721.hex",
             "backup/torch/flash.hex",
             "kr1k/firmware.hex",
+            "anduril.hank-lume-x1-c-hwid0283-2026-10-22.hex",
+            "lume-x1-c-0284.hex",
         ] {
             let err = this_boards_hex(Path::new(bad)).unwrap_err();
-            assert!(err.contains("model 0283"), "{bad}: {err}");
+            assert!(err.contains("for the KR1K"), "{bad}: {err}");
             assert!(err.contains("`restore <port> <dir>`"), "{bad}: {err}");
         }
     }
