@@ -2,9 +2,9 @@
 
 One section for every way identified so far that this torch could hurt someone or itself, what covers it, and what evidence there is that the cover works. It's a log of the current state. A section changes in the same commit as the code it describes, and a hazard nobody has thought of isn't in here, so a short log doesn't mean a short list.
 
-This repo started as firmware for a Wurkkos TS26 (ATtiny1616, MP3432 boost driver, PWM into the current control) and is being ported to the KR1K (AVR32DD20, Lume X1-C, a DAC into a current amplifier, three power paths). Nothing from this repo has run on a KR1K. The only contact with this torch so far is one avrdude read of its stock firmware and fuses through the pads, cell out, nothing written (2026-11-16, [hardware.md](hardware.md)). Much of the cover below is TS26 code that hasn't been ported yet. Where a section names code, it's the code as it stands, and the section says what has to change. Read each Status strictly.
+This repo started as firmware for a Wurkkos TS26 (ATtiny1616, MP3432 boost driver, PWM into the current control) and is being ported to the KR1K (AVR32DD20, Lume X1-C, a DAC into a current amplifier, three power paths). Nothing from this repo has run on a KR1K. The only contact with this torch so far is one avrdude read of its stock firmware and fuses through the pads, cell out, nothing written (2026-11-16, [hardware.md](hardware.md)). The firmware, programmer and simulator have been ported to the AVR32DD20, and none of that code has run on a real chip. Where a section names code, it's the code as it stands. Read each Status strictly.
 
-- **not yet** means the firmware doesn't do this on the AVR32DD20 yet, or does it only as TS26 code that hasn't been ported.
+- **not yet** means nothing in the firmware or the tools covers this on the AVR32DD20 yet, or only procedure does.
 - **code only** means the firmware for the AVR32DD20 does it and builds, and nothing has run it, not even the simulator.
 - **host tests** means the library logic is tested on the host, which is board-independent, but nothing built for the AVR32DD20 has run it, and its constants may still be the TS26's.
 - **simulator** means the firmware built for the AVR32DD20 has run it on the fake chip (`cargo xtask hex`). The simulator is one reading of the datasheet, run against code written from that same reading, so a pass finds mistakes and proves nothing. [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator) lists what it leaves out.
@@ -141,11 +141,11 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Mitigation.** The programmer never writes fuses, the user row or a locked chip, and refuses a chip with the wrong signature, which for this chip is `1E 95 3A`. No high-voltage programmer ever goes on this torch, recovery included. On the AVR32DD20 that's doubly so. The UPDI pin, PF7, is rated to VDD + 0.3 V (table 38-1), and the high-voltage override goes on PF6, which the three-pad layout doesn't bring out, at VDD + 2 V or more and 8.5 V at most, against a 9 V maximum (§36.3.2.1.2, table 38-29). The first flash is a first-light image built for the AVR32DD20, which doesn't exist yet, and the full firmware goes on only after that's proven on the light. The TS26's first-light image in the history is for the ATtiny1616 and never goes on this torch. `restore` refuses a backup from another chip.
 
-**Evidence.** Host tests in xtask/src/updi.rs and xtask/src/main.rs, against a fake ATtiny1616. On 2026-11-16 avrdude read this torch through the JLHawaii808 kit on its `+ - U` pads with the cell out, and the chip took the key, answered with `1E 95 3A` and read back the same flash twice. One link attempt failed until the probe was re-seated. That's avrdude, not `xtask`, and nothing was written.
+**Evidence.** Host tests in xtask/src/updi.rs and xtask/src/main.rs, against a fake AVR32DD20 (`updi::tests::fake::Dd20`), which is one reading of the datasheet and pymcuprog and has never been compared with a real chip. On 2026-11-16 avrdude read this torch through the JLHawaii808 kit on its `+ - U` pads with the cell out, and the chip took the key, answered with `1E 95 3A` and read back the same flash twice. One link attempt failed until the probe was re-seated. That's avrdude, not `xtask`, and nothing was written.
 
 **Status.** Not yet.
 
-**What's left.** Porting the programmer to the AVR Dx NVM controller (no page buffer, 24-bit addresses). Measuring the pads' pitch in millimetres and naming each with a meter before `xtask` first touches them ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
+**What's left.** `xtask` has only ever talked to its fake chip, so its first contact with the torch is stage 1 of [breakout.md](breakout.md#stage-1-the-pads-and-stock). Measuring the pads' pitch in millimetres and naming each with a meter before `xtask` first touches them ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
 
 ### H12. The programmer feeding the cell rail
 
@@ -211,7 +211,7 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Cause.** Dirt, a pressed-in tail cap, or a jammed button.
 
-**Mitigation.** The UI's holds are bounded. From off a hold lights the floor and nothing more, and with the light on a hold ramps up and stops at `ramp::CEILING`, under both ceilings (H5, H7).
+**Mitigation.** The UI's holds are bounded. From off or in lockout a hold does nothing, and so does a 2H anywhere. With the light on, 1H ramps each time the other way from the last and stops at the end it's heading for, `ramp::CEILING` going up and `ui::FLOOR` going down, and never above either of the other ceilings (H5, H7).
 
 **Evidence.** Host tests in src/ui.rs and src/torch.rs, and `switch_stuck` on the simulator.
 
