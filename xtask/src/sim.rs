@@ -1125,7 +1125,8 @@ fn rises(sim: &Sim, n: u32) -> Result<(), String> {
 }
 
 /// Two seconds with the switch left alone. PC1 never rises, and the chip
-/// rests as the stock firmware was seen to (docs/hardware.md), PC1 an output
+/// rests as `peek` saw the stock firmware rest on this torch (docs/breakout.md's
+/// results), PC1 an output
 /// and low, DAC0 driving PD6 at 0 against 1.024 V with PD6's input buffer
 /// off, and the paths outputs and low. PD4 reads with no pull-up and no
 /// sense, and the unused pins have their pull-ups, as board.rs has them.

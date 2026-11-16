@@ -212,7 +212,7 @@ pub fn vddio2_ok() -> bool {
     read(reg::MVIO_STATUS) & regs::MVIO_VDDIO2S != 0
 }
 
-/// Sets the chip up for the firmware loop: [`init_pins`], then PD4's sense,
+/// Sets the chip up for the firmware loop, [`init_pins`] then PD4's sense,
 /// TCB0, the ADC and the PIT, which are the timers and interrupts the loop
 /// runs on.
 pub fn init() {
@@ -780,7 +780,7 @@ pub fn set_output(output: Output) {
     output_level(output);
 }
 
-/// The driver off, in the stock firmware's order: DAC0 to 0, its reference
+/// The driver off, in the stock firmware's order, DAC0 to 0, its reference
 /// to 1.024 V, PC1 low, then the paths low. [`set_output`]'s off.
 pub fn output_off() {
     write16(reg::DAC0_DATA, 0);
@@ -789,7 +789,7 @@ pub fn output_off() {
     out!(reg::VPORTA_OUT, 0);
 }
 
-/// The driver on and asked for nothing: DAC0 to 0 at 1.024 V and the paths
+/// The driver on and asked for nothing, DAC0 to 0 at 1.024 V and the paths
 /// low, then `just_before`, then PC1 high. Call it with PC1 low, and
 /// [`output_level`] no sooner than 8 ms after. [`set_output`] starts TCB0 in
 /// `just_before`; examples/first_light.rs passes nothing.
@@ -801,7 +801,7 @@ pub fn output_start(just_before: impl FnOnce()) {
     out!(reg::VPORTC_OUT, 1 << ENABLE);
 }
 
-/// A level for the driver with PC1 already high: DAC0 to 0 and the waits
+/// A level for the driver with PC1 already high, DAC0 to 0 and the waits
 /// before a change of reference or paths, then the new code (see
 /// [`set_output`]).
 pub fn output_level(output: Output) {
