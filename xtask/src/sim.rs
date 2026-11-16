@@ -176,7 +176,7 @@ use kr1k::ramp::{Output, Vref};
 use kr1k::selftest::Faults;
 use kr1k::sensors::Channel;
 use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
-use kr1k::watchdog::{CLOCK_HZ, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
+use kr1k::watchdog::{CLOCK_HZ, FEED_TICKS, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
 
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_two_words, ldi};
 use crate::crc;
@@ -812,6 +812,8 @@ const VECTOR_UNHANDLED: u8 = regs::VECTOR_TCB1_INT as u8;
 ///
 /// On a real chip the watchdog then resets it, since nothing feeds it. This
 /// chip has no resets, so the run stops one PIT period short of the bite.
+/// The interrupt is forced on the pass after a `wdr`, so that's the most
+/// periods there are to watch, whatever the click timings.
 fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
     if sim.handled & 1 << VECTOR_UNHANDLED != 0 {
         return Err(format!(
@@ -820,6 +822,21 @@ fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
         ));
     }
     lit(&mut sim, TICKS_PER_SECOND / 4, &mut Report::default())?;
+    // A pass that feeds leaves the count lower than the pass before it did.
+    let mut fed = false;
+    for _ in 0..=FEED_TICKS {
+        let before = sim.chip.wdt.ticks;
+        sim.tick(false)?;
+        if sim.chip.wdt.ticks < before {
+            fed = true;
+            break;
+        }
+    }
+    if !fed {
+        return Err(format!(
+            "no wdr within {FEED_TICKS} ticks of the light coming on"
+        ));
+    }
     sim.chip.force_interrupt(VECTOR_UNHANDLED);
     let mut steps = 0;
     while !sim.chip.down {
