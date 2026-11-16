@@ -93,9 +93,9 @@ The first-light image only. The full firmware waits for stage 4.
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
 | 2.1 | | Look at the adapter in your hand. Cell out. Ohms between the pads again | The plain kit, and the same numbers as 1.6 | |
-| 2.2 | | Flash the first-light image, `cargo xtask flash <port> target/noctigon-kr1k-first-light.hex` ([flashing.md](flashing.md#the-first-flash-is-a-first-light-image)) | `flash` warns about an image short of the full flash, which is expected for first light, then verify passes. A verify only shows the bytes arrived | "Ping, back up and flash", the AVR Dx NVM writes |
+| 2.2 | Pass | Flash the first-light image, `cargo xtask flash <port> target/noctigon-kr1k-first-light.hex` ([flashing.md](flashing.md#the-first-flash-is-a-first-light-image)) | `flash` warns about an image short of the full flash, which is expected for first light, then verify passes. A verify only shows the bytes arrived | "Ping, back up and flash", the AVR Dx NVM writes |
 | 2.3 | | If verify fails | Run it once more. If it fails again, stop there. Nothing has proven the programmer's AVR Dx NVM sequence on a real chip before this, so suspect it as much as the contact | |
-| 2.4 | | `cargo xtask ping <port>`, then probe off | Same answer as 1.7. A chip that talked before the flash and doesn't after it is how the TS26 was lost, so stop and measure | |
+| 2.4 | Pass | `cargo xtask ping <port>`, then probe off | Same answer as 1.7. A chip that talked before the flash and doesn't after it is how the TS26 was lost, so stop and measure | |
 
 ## Stage 3, first light on the torch
 
@@ -103,10 +103,10 @@ The proof that this board does what the repo thinks. In a dark room.
 
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
-| 3.1 | | Put the cell in and do up the head, watching the emitter. Repeat ten times | No flash at all. PC1 floats through reset and `SUT` until the image drives it, so a flash here means nothing's holding it low, or VDDIO2 isn't what anyone thinks. The image ignores the switch until it's been let go for about 0.6 s, so pressing it while doing up the head shouldn't light it either | The open question on what holds PC1 low, by eye |
-| 3.2 | | Press on, press off, a few dozen times | Low, steady, and dark again every time. It changes as the press lands, about 40 ms in, not on the release, and holding the switch down does nothing more. No flash at turn-on, no blip at turn-off | "Does it come on cleanly, with no flash at turn-on?" |
-| 3.3 | | Tail current, on | Write it down. It's the first number for what a DAC value does on the low paths, code 92 against 1.024 V | Part of "measure what the DAC does" |
-| 3.4 | | Tail current, off | A few mA, since the first-light image doesn't sleep. Much more and something's on that shouldn't be. Write it down | |
+| 3.1 | Pass | Put the cell in and do up the head, watching the emitter. Repeat ten times | No flash at all. PC1 floats through reset and `SUT` until the image drives it, so a flash here means nothing's holding it low, or VDDIO2 isn't what anyone thinks. The image ignores the switch until it's been let go for about 0.6 s, so pressing it while doing up the head shouldn't light it either | The open question on what holds PC1 low, by eye |
+| 3.2 | Pass | Press on, press off, a few dozen times | Low, steady, and dark again every time. It changes as the press lands, about 40 ms in, not on the release, and holding the switch down does nothing more. No flash at turn-on, no blip at turn-off | "Does it come on cleanly, with no flash at turn-on?" |
+| 3.3 | Skipped | Tail current, on | Write it down. It's the first number for what a DAC value does on the low paths, code 92 against 1.024 V | Part of "measure what the DAC does" |
+| 3.4 | Skipped | Tail current, off | A few mA, since the first-light image doesn't sleep. Much more and something's on that shouldn't be. Write it down | |
 | 3.5 | | Ten minutes on, in sight | Doesn't move, doesn't go out | |
 | 3.6 | | Cell out. Ohms between the pads, then `cargo xtask ping <port>` | Same as 1.6, and the chip still talks | |
 
@@ -197,3 +197,7 @@ Fill this in as you go, with the commit you flashed.
 | 1.7 | 2026-11-16 | `8a601a1` | `cargo xtask ping` on the pads, cell out, answered `AVR     P:2D:1-3`. An earlier attempt with the probe off the pads gave "no reply from the chip", as expected. What the emitter and the adapter did isn't recorded, so the row isn't marked passed |
 | 1.8 | 2026-11-16 | `8a601a1` | `cargo xtask backup` to `backup/torch/` read flash, EEPROM, fuses, lock bits, user row and serial number. Each matches the avrdude backup in `backup/stock/` byte for byte (flash padded to 32 KB, serial against prodsig bytes 0x10 to 0x1F). Nothing written. The emitter watch isn't recorded, so the row isn't marked passed |
 | VDDIO2 | 2026-11-16 | `8a601a1` | `cargo xtask peek`, cell out, on the kit's power. `MVIO.STATUS` 0x01, so VDDIO2 is present. With the stock firmware asleep, PC1 an output held low, the DAC enabled at 0 on the 1.024 V reference, PA1 and PA5 to PA7 outputs, PD4 reading high, the clock at 12 MHz with autotune on, divided by 4. `RSTFR` 0x21 |
+| 2.2 | 2026-11-16 | `a9ef250` | `cargo xtask flash` wrote the 736-byte first-light image (SHA-256 `8f70c80f…e304`), warned it was short as expected, verified and restarted the chip. The first erase and write this programmer has done on a real chip |
+| 2.4 | 2026-11-16 | `a9ef250` | `cargo xtask ping` after the flash answered `AVR     P:2D:1-3`, the same as before it |
+| 3.1, 3.2 | 2026-11-16 | `a9ef250` | First light on the torch. Cell in and head done up, then clicked on and off. Reported as all fine, no flash and a steady low light. The count of cell insertions and clicks wasn't recorded |
+| 3.3, 3.4 | 2026-11-16 | `a9ef250` | Skipped, no tail current measured |

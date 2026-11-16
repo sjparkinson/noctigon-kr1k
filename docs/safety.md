@@ -145,7 +145,7 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Status.** Not yet.
 
-**What's left.** On 2026-11-16 `xtask`'s `ping`, `backup` and `peek` ran on the torch, cell out, and its backup matched avrdude's byte for byte, so the link, the key, programming mode and the reads work on this chip. Its erase and write have still only met the fake chip, and the first flash is the first-light image ([breakout.md](breakout.md#stage-1-the-pads-and-stock)). Measuring the pads' pitch in millimetres and naming each with a meter before `xtask` first touches them ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
+**What's left.** On 2026-11-16 `xtask`'s `ping`, `backup` and `peek` ran on the torch, cell out, and its backup matched avrdude's byte for byte, so the link, the key, programming mode and the reads work on this chip. Its erase and write first met the real chip the same night, flashing the 736-byte first-light image, which verified, and the chip answered `ping` straight after (rows 2.2 and 2.4 of [breakout.md](breakout.md#results)). That's one write of one small image. A full 32 KB write and `restore` haven't been tried on the torch. Measuring the pads' pitch in millimetres and naming each with a meter before `xtask` first touches them ([flashing.md](flashing.md#the-pads)). No test shows that no command path writes a fuse. It's true by reading the code.
 
 ### H12. The programmer feeding the cell rail
 
