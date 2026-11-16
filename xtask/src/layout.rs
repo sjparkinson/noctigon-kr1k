@@ -11,7 +11,7 @@
 //! The opcodes come from Microchip's AVR Instruction Set Manual. Only the
 //! handful the checks look for are decoded.
 
-use ts26::regs::{VECTORS, addr};
+use kr1k::regs::{VECTORS, addr};
 
 use crate::avr::is_two_words;
 use crate::elf::{DATA_SPACE, Elf, RAM, Segment};
@@ -56,7 +56,7 @@ fn no_panics<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Result<(), Strin
     }
     Err(format!(
         "the firmware links panic machinery ({}), so something in it can panic and reach hw::halt. \
-         Find the caller with `llvm-objdump -d target/avr-none/release/ts26.elf` (the llvm tools \
+         Find the caller with `llvm-objdump -d target/avr-none/release/kr1k.elf` (the llvm tools \
          are under ~/.rustup/toolchains/<nightly>/lib/rustlib/*/bin/) or the avr-codegen agent",
         found.join(", ")
     ))
@@ -98,7 +98,7 @@ pub fn memory(elf: &Elf) -> Result<(), String> {
 
 /// What a symbol for `hw::halt` has in its name. It isn't `no_mangle`, so the
 /// name is mangled, but both of Rust's schemes spell each path segment as its
-/// length then its name. The firmware's is `ts26::avr::hw::halt` and the link
+/// length then its name. The firmware's is `kr1k::avr::hw::halt` and the link
 /// probe's `link::hw::halt`.
 const HALT: &str = "2hw4halt";
 
@@ -441,20 +441,20 @@ mod tests {
         let value = |name: &str| name.starts_with("_ZN").then_some(0x1234);
         let firmware = [
             "__reset",
-            "_ZN3ts263avr2hw8set_output17h0123456789abcdefE",
-            "_ZN3ts263avr2hw4halt17h0123456789abcdefE",
+            "_ZN3kr1k3avr2hw8set_output17h0123456789abcdefE",
+            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
         ];
         assert_eq!(halt(firmware, value), Ok(0x1234));
         let probe = ["main", "_ZN4link2hw4halt17h0123456789abcdefE"];
         assert_eq!(halt(probe, value), Ok(0x1234));
-        let v0 = ["_RNvNtNtCs1234_4ts263avr2hw4halt"];
+        let v0 = ["_RNvNtNtCs1234_4kr1k3avr2hw4halt"];
         assert_eq!(halt(v0, |_| Some(0x42)), Ok(0x42));
 
-        let none = ["main", "_ZN3ts263avr2hw8set_output17h0123456789abcdefE"];
+        let none = ["main", "_ZN3kr1k3avr2hw8set_output17h0123456789abcdefE"];
         assert!(halt(none, value).unwrap_err().contains("no `hw::halt`"));
         let two = [
-            "_ZN3ts263avr2hw4halt17h0123456789abcdefE",
-            "_ZN3ts263avr2hw4halt17hfedcba9876543210E",
+            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
+            "_ZN3kr1k3avr2hw4halt17hfedcba9876543210E",
         ];
         assert!(halt(two, value).unwrap_err().contains("more than one"));
     }
@@ -626,8 +626,8 @@ mod tests {
             "__reset",
             "__unhandled_interrupt",
             "main",
-            "_ZN3ts266torch5Torch4tick17h0123456789abcdefE",
-            "_ZN3ts263avr2hw4halt17h0123456789abcdefE",
+            "_ZN3kr1k6torch5Torch4tick17h0123456789abcdefE",
+            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
         ];
         assert_eq!(no_panics(symbols), Ok(()));
     }

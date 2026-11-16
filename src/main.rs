@@ -38,16 +38,16 @@ use avr::hw;
 // The library owns src/regs.rs, since its self-tests check fuse fields with
 // the same masks; hw.rs and rt.rs reach it as `crate::regs`.
 #[cfg(target_arch = "avr")]
-use ts26::regs;
+use kr1k::regs;
 
 // src/avr/rt.rs calls `main` by name once memory is set up.
 #[cfg(target_arch = "avr")]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 extern "C" fn main() -> ! {
-    use ts26::selftest::{self, Faults};
-    use ts26::torch::{Changes, Torch};
-    use ts26::watchdog::Feeder;
+    use kr1k::selftest::{self, Faults};
+    use kr1k::torch::{Changes, Torch};
+    use kr1k::watchdog::Feeder;
 
     // PB2 floats from reset until it's an output.
     hw::hold_enable_low();

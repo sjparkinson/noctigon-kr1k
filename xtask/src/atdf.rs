@@ -7,7 +7,7 @@
 //! tested, because a build script can't have tests of its own. The tests also
 //! check what generating can't, which is what the firmware assumes about the
 //! ATDF's layout, and that `link.x` agrees with it. So nothing outside them
-//! may name `crate::` or `ts26::`, which `build.rs` doesn't have.
+//! may name `crate::` or `kr1k::`, which `build.rs` doesn't have.
 //!
 //! The parser handles what ATDF files contain, which is elements, double- or
 //! single-quoted attributes, comments and the XML declaration. Text content
@@ -368,7 +368,7 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    use ts26::regs::{self, addr, mem};
+    use kr1k::regs::{self, addr, mem};
 
     use super::*;
 

@@ -4,7 +4,7 @@ members = ["xtask"]
 [workspace.package]
 edition = "2024"
 authors = ["Samuel Parkinson <samuel.parkinson@hey.com>"]
-repository = "https://github.com/sjparkinson/wurkkos-ts26"
+repository = "https://github.com/sjparkinson/noctigon-kr1k"
 license = "MIT"
 
 [workspace.lints.rust]
@@ -30,7 +30,7 @@ match_same_arms = "warn"
 multiple_unsafe_ops_per_block = "warn"
 
 [package]
-name = "ts26"
+name = "kr1k"
 description = "Firmware for the Wurkkos TS26 torch."
 readme = "README.md"
 edition.workspace = true
@@ -44,7 +44,7 @@ license.workspace = true
 testing = []
 
 [[bin]]
-name = "ts26"
+name = "kr1k"
 test = false
 bench = false
 

@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Firmware for the Wurkkos TS26 torch (model 0721) (ATtiny1616, MP3432 boost driver), in Rust, with zero crate dependencies, and deliberately small. Read README.md for what it is, CONTRIBUTING.md for the checks and layout, and docs/ for the hardware, toolchain and UI spec.
+Firmware for the Wurkkos TS26 torch (model 0283) (ATtiny1616, MP3432 boost driver), in Rust, with zero crate dependencies, and deliberately small. Read README.md for what it is, CONTRIBUTING.md for the checks and layout, and docs/ for the hardware, toolchain and UI spec.
 
 ## Commands
 
@@ -8,7 +8,7 @@ Firmware for the Wurkkos TS26 torch (model 0721) (ATtiny1616, MP3432 boost drive
 cargo fmt --check                                          # formatting, as CI runs it
 cargo test --workspace --locked -q                         # host tests, run these constantly
 cargo clippy --workspace --all-targets --locked -- -D warnings   # host lints
-cargo clippy --package ts26 --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings   # firmware lints: the only place hw.rs and rt.rs get linted
+cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings   # firmware lints: the only place hw.rs and rt.rs get linted
 cargo xtask hex                                            # firmware ELF and hex, plus flash/RAM use, after any firmware change
 cargo xtask breakages                                      # about a minute: hex refuses each deliberately broken copy, after touching sim.rs, layout.rs or a breakage's lines
 ```

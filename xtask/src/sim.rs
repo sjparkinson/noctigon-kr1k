@@ -135,7 +135,7 @@
 //!    main loop reaches (`Sim::land`), each as far as the first run kept
 //!    reaching new code, and a little past (`both_ways`).
 //!
-//! All but the first two drive `ts26::torch` alongside the firmware and check
+//! All but the first two drive `kr1k::torch` alongside the firmware and check
 //! the pins show the library's output on every tick, the fourth until the
 //! oscillator stops. So does the last part of the second, until the forced
 //! interrupt. `probe` separately runs examples/link.rs, which has real
@@ -146,12 +146,12 @@ use std::iter;
 use std::ops::Range;
 use std::thread;
 
-use ts26::TICKS_PER_SECOND;
-use ts26::board;
-use ts26::ramp::{DSM_BITS, DSM_FLOOR, Output, PWM_TOP};
-use ts26::sensors::Channel;
-use ts26::testing::{self, Action, Example, Rig, Sample, Scene};
-use ts26::watchdog::{CLOCK_HZ, Feeder, TICK_DEADLINE_CYCLES};
+use kr1k::TICKS_PER_SECOND;
+use kr1k::board;
+use kr1k::ramp::{DSM_BITS, DSM_FLOOR, Output, PWM_TOP};
+use kr1k::sensors::Channel;
+use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
+use kr1k::watchdog::{CLOCK_HZ, Feeder, TICK_DEADLINE_CYCLES};
 
 use crate::avr::{Bus, Cpu, I, VECTOR_WORDS, is_two_words, ldi};
 use crate::crc;
@@ -167,7 +167,7 @@ use crate::world::{CALIBRATION, FUSE_NAMES, World};
 // They're generated from the ATDF (src/regs.rs), so they only move when the
 // ATDF does, never with the firmware. Only the ones the ATDF names go here,
 // since anything hand-written in src/regs.rs is the firmware's choice.
-use ts26::regs::{
+use kr1k::regs::{
     self, ADC_ENABLE, ADC_MUXPOS_AIN1, ADC_MUXPOS_TEMPSENSE, ADC_PRESC, ADC_REFSEL,
     ADC_REFSEL_INTREF, ADC_RESRDY, ADC_SAMPCAP, ADC_SAMPLEN, ADC_SAMPNUM, ADC_SAMPNUM_ACC4,
     ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, PORT_INVEN, PORT_ISC, PORT_PULLUPEN,
@@ -247,7 +247,7 @@ const FLASH_SIZE: usize = map::FLASH_SIZE;
 /// fixed pattern makes a byte that should have been written stand out.
 const JUNK: u8 = 0xA5;
 
-// The pins, from `ts26::board`, which src/avr/hw.rs uses too.
+// The pins, from `kr1k::board`, which src/avr/hw.rs uses too.
 const SWITCH: u8 = 1 << board::SWITCH; // PA5, active low
 const PWM: u8 = 1 << board::PWM; // PB0, the brightness
 const ENABLE: u8 = 1 << board::ENABLE; // PB2, the boost converter
@@ -821,7 +821,7 @@ fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
 }
 
 /// Feeds the same switch samples to the firmware, from just after `main`, and
-/// to `ts26::torch`, and checks the pins show the library's output on every
+/// to `kr1k::torch`, and checks the pins show the library's output on every
 /// tick. Returns the level it ends at, or `None` if `Landing::Until` cut it
 /// short.
 fn in_step(
@@ -2945,7 +2945,7 @@ impl Bus for Chip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ts26::ui::Aux;
+    use kr1k::ui::Aux;
 
     /// PORTA.PIN1CTRL, PA1's settings.
     const PA1_CTRL: usize = reg::PORTA_PIN0CTRL + BATTERY_PIN;
@@ -3102,7 +3102,7 @@ mod tests {
     #[test]
     fn fuses_read_back_and_never_take_a_write() {
         let mut chip = Chip::new(Vec::new());
-        let osccfg = ts26::regs::addr::FUSE_OSCCFG as u16;
+        let osccfg = kr1k::regs::addr::FUSE_OSCCFG as u16;
         assert_eq!(chip.read(osccfg), Ok(0x02));
         assert!(
             chip.write(osccfg, 0x01)

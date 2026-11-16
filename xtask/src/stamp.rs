@@ -4,10 +4,10 @@
 //! never reads it. The CRC covers it (`crc.rs`), so a damaged stamp fails the
 //! power-on scan like any other bad byte.
 //!
-//! The stamp reads `ts26 <hash>`, with a `+` after the hash if the tree had
+//! The stamp reads `kr1k <hash>`, with a `+` after the hash if the tree had
 //! uncommitted changes to tracked files, padded to [`STAMP_LEN`] bytes with
 //! 0xFF, which is what erased flash reads as. A build outside a git checkout,
-//! or one where git fails, says `ts26 unknown`.
+//! or one where git fails, says `kr1k unknown`.
 
 use std::path::Path;
 use std::process::Command;
@@ -18,12 +18,12 @@ use crate::crc::STAMP_AT;
 pub const STAMP_LEN: usize = 16;
 
 /// What every stamp starts with, and what `read` looks for.
-const PREFIX: &[u8] = b"ts26 ";
+const PREFIX: &[u8] = b"kr1k ";
 
 /// A fixed stamp for the simulator and the tests, so neither depends on git.
-pub const TEST: [u8; STAMP_LEN] = *b"ts26 test\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
+pub const TEST: [u8; STAMP_LEN] = *b"kr1k test\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
 
-/// `ts26 <hash>`, then `+` if `dirty`, padded with 0xFF. A hash too long to
+/// `kr1k <hash>`, then `+` if `dirty`, padded with 0xFF. A hash too long to
 /// fit is cut short.
 pub fn format(hash: &str, dirty: bool) -> [u8; STAMP_LEN] {
     let mut stamp = [0xFF; STAMP_LEN];
@@ -40,7 +40,7 @@ pub fn format(hash: &str, dirty: bool) -> [u8; STAMP_LEN] {
 }
 
 /// The stamp for the commit checked out in `root`. If git can't say, that's
-/// `ts26 unknown`, since a build shouldn't fail over a label.
+/// `kr1k unknown`, since a build shouldn't fail over a label.
 pub fn current(root: &Path) -> [u8; STAMP_LEN] {
     let git = |args: &[&str]| -> Option<String> {
         let out = Command::new("git")
@@ -61,7 +61,7 @@ pub fn current(root: &Path) -> [u8; STAMP_LEN] {
 /// The stamp for what git said, which is `hash` from `git rev-parse` and
 /// `status` from `git status --porcelain`, each `None` if git failed. A
 /// status with anything in it is a dirty tree. With no hash, an empty one, or
-/// no status, the stamp is `ts26 unknown`.
+/// no status, the stamp is `kr1k unknown`.
 fn from_git(hash: Option<&str>, status: Option<&str>) -> [u8; STAMP_LEN] {
     match (hash.filter(|hash| !hash.is_empty()), status) {
         (Some(hash), Some(status)) => format(hash, !status.is_empty()),
@@ -70,7 +70,7 @@ fn from_git(hash: Option<&str>, status: Option<&str>) -> [u8; STAMP_LEN] {
 }
 
 /// The stamp text found in `flash`, or `None` if the bytes at the stamp's
-/// place don't start with `ts26 `. That's erased flash, the stock firmware,
+/// place don't start with `kr1k `. That's erased flash, the stock firmware,
 /// T0 (first light), or an image too short to reach it.
 pub fn read(flash: &[u8]) -> Option<String> {
     let bytes = flash.get(STAMP_AT..STAMP_AT + STAMP_LEN)?;
@@ -100,18 +100,18 @@ mod tests {
     #[test]
     fn formats_a_clean_and_a_dirty_commit() {
         let clean = format("0123456789", false);
-        assert_eq!(&clean[..15], b"ts26 0123456789");
+        assert_eq!(&clean[..15], b"kr1k 0123456789");
         assert_eq!(clean[15], 0xFF);
 
         let dirty = format("0123456789", true);
-        assert_eq!(&dirty[..16], b"ts26 0123456789+");
+        assert_eq!(&dirty[..16], b"kr1k 0123456789+");
 
         // A long hash is cut to fit, and the plus survives.
         let long = format("0123456789abcdef", true);
-        assert_eq!(&long[..], b"ts26 0123456789+");
+        assert_eq!(&long[..], b"kr1k 0123456789+");
 
         let short = format("abc", false);
-        assert_eq!(&short[..8], b"ts26 abc");
+        assert_eq!(&short[..8], b"kr1k abc");
         assert!(short[8..].iter().all(|&b| b == 0xFF));
     }
 
@@ -125,11 +125,11 @@ mod tests {
     fn a_clean_tree_is_stamped_with_its_hash_and_a_dirty_one_with_a_plus() {
         assert_eq!(
             text(&from_git(Some("abc1234567"), Some(""))),
-            "ts26 abc1234567"
+            "kr1k abc1234567"
         );
         assert_eq!(
             text(&from_git(Some("abc1234567"), Some(" M src/main.rs"))),
-            "ts26 abc1234567+"
+            "kr1k abc1234567+"
         );
     }
 
@@ -146,7 +146,7 @@ mod tests {
         ] {
             assert_eq!(
                 text(&from_git(hash, status)),
-                "ts26 unknown",
+                "kr1k unknown",
                 "{hash:?}, {status:?}"
             );
         }
@@ -159,7 +159,7 @@ mod tests {
 
     impl NotACheckout {
         fn new() -> Self {
-            let name = format!("ts26-xtask-{}-not-a-checkout", std::process::id());
+            let name = format!("kr1k-xtask-{}-not-a-checkout", std::process::id());
             let dir = std::env::temp_dir().join(name);
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -177,9 +177,9 @@ mod tests {
     #[test]
     fn a_build_outside_a_git_checkout_is_stamped_unknown() {
         let dir = NotACheckout::new();
-        assert_eq!(text(&current(&dir.0)), "ts26 unknown");
+        assert_eq!(text(&current(&dir.0)), "kr1k unknown");
         // And so is one in a directory that isn't there to run git in.
-        assert_eq!(text(&current(&dir.0.join("missing"))), "ts26 unknown");
+        assert_eq!(text(&current(&dir.0.join("missing"))), "kr1k unknown");
     }
 
     /// Whatever this checkout's state, or with no checkout at all, the stamp
@@ -188,7 +188,7 @@ mod tests {
     fn the_stamp_for_this_checkout_is_a_hash_or_unknown() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
         let stamp = text(&current(root));
-        let name = stamp.strip_prefix("ts26 ").expect("the prefix");
+        let name = stamp.strip_prefix("kr1k ").expect("the prefix");
         if name != "unknown" {
             let hash = name.strip_suffix('+').unwrap_or(name);
             assert_eq!(hash.len(), 10, "{stamp}");
@@ -199,15 +199,15 @@ mod tests {
     #[test]
     fn reads_back_what_it_writes() {
         for (hash, dirty, want) in [
-            ("abc1234567", false, "ts26 abc1234567"),
-            ("abc1234567", true, "ts26 abc1234567+"),
-            ("unknown", false, "ts26 unknown"),
+            ("abc1234567", false, "kr1k abc1234567"),
+            ("abc1234567", true, "kr1k abc1234567+"),
+            ("unknown", false, "kr1k unknown"),
         ] {
             let flash = crc::sign(&[0x12, 0x34], &format(hash, dirty)).unwrap();
             assert_eq!(read(&flash).as_deref(), Some(want));
         }
         let flash = crc::sign(&[], &TEST).unwrap();
-        assert_eq!(read(&flash).as_deref(), Some("ts26 test"));
+        assert_eq!(read(&flash).as_deref(), Some("kr1k test"));
     }
 
     #[test]

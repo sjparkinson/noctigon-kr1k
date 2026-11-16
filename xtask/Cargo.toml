@@ -11,4 +11,4 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-ts26 = { path = "..", features = ["testing"] }
+kr1k = { path = "..", features = ["testing"] }

@@ -39,7 +39,7 @@ usage: cargo xtask <command>
 
 commands:
   hex                     build the firmware, run it on the simulator, write
-                          target/wurkkos-ts26-0721.hex and print flash, RAM,
+                          target/noctigon-kr1k-0283.hex and print flash, RAM,
                           stack, loop and handler use
   hex --no-examples       the same, leaving docs/ui.md's examples out of the
                           simulator run, for a breakout test build (T1, T5)
@@ -63,12 +63,12 @@ commands:
 or /dev/ttyUSB0 on Linux. <dir> names one chip's backup, e.g. backup/torch.
 ";
 
-const ELF: &str = "target/avr-none/release/ts26.elf";
+const ELF: &str = "target/avr-none/release/kr1k.elf";
 /// examples/link.rs, which `build` builds alongside the firmware.
 const PROBE: &str = "target/avr-none/release/examples/link.elf";
 /// examples/guards.rs, which `build` builds alongside the firmware too.
 const GUARDS: &str = "target/avr-none/release/examples/guards.elf";
-const HEX: &str = "target/wurkkos-ts26-0721.hex";
+const HEX: &str = "target/noctigon-kr1k-0283.hex";
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
@@ -121,7 +121,7 @@ fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     run(Command::new(cargo).current_dir(root()).args([
         "build",
         "--package",
-        "ts26",
+        "kr1k",
         "--bins",
         "--example",
         "link",
@@ -278,7 +278,7 @@ fn ping(port: &str) -> Result<(), String> {
 /// stack pointer, since the firmware never touches it, so that comes from the
 /// simulated CPU's.
 fn peek(port: &str) -> Result<(), String> {
-    use ts26::regs::addr;
+    use kr1k::regs::addr;
     let registers = [
         ("RSTCTRL.RSTFR", addr::RSTCTRL_RSTFR),
         ("CLKCTRL.MCLKCTRLB", addr::CLKCTRL_MCLKCTRLB),
@@ -332,11 +332,11 @@ fn this_boards_hex(path: &Path) -> Result<(), String> {
         .file_name()
         .map(|name| name.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if name.contains("ts26") || name.contains("0721") {
+    if name.contains("kr1k") || name.contains("0283") {
         return Ok(());
     }
     Err(format!(
-        "{} doesn't say it's for the TS26 (model 0721), so it won't be flashed. Flash the \
+        "{} doesn't say it's for the KR1K (model 0283), so it won't be flashed. Flash the \
          file `cargo xtask hex` writes, or use `restore <port> <dir>` for a backup",
         path.display()
     ))
@@ -617,7 +617,7 @@ mod tests {
 
     impl Scratch {
         fn new(test: &str) -> Self {
-            let dir = env::temp_dir().join(format!("ts26-xtask-{}-{test}", std::process::id()));
+            let dir = env::temp_dir().join(format!("kr1k-xtask-{}-{test}", std::process::id()));
             let _ = fs::remove_dir_all(&dir);
             fs::create_dir_all(&dir).unwrap();
             Self(dir)
@@ -791,7 +791,7 @@ mod tests {
         let saved = read_hex(&dir.join("flash.hex")).unwrap();
         assert_eq!(
             stamp::read(&saved).as_deref(),
-            Some("ts26 abc1234567+"),
+            Some("kr1k abc1234567+"),
             "the backup lost the stamp"
         );
     }
@@ -812,19 +812,19 @@ mod tests {
     #[test]
     fn flash_takes_this_boards_hex_and_refuses_another_torchs() {
         for good in [
-            "target/wurkkos-ts26-0721.hex",
-            "release.wurkkos-ts26.hex",
-            "WURKKOS-TS26.HEX",
+            "target/noctigon-kr1k-0283.hex",
+            "release.noctigon-kr1k.hex",
+            "NOCTIGON-KR1K.HEX",
         ] {
             assert!(this_boards_hex(Path::new(good)).is_ok(), "{good}");
         }
         for bad in [
-            "target/wurkkos-ts10.hex",
+            "target/wurkkos-ts26-0721.hex",
             "backup/torch/flash.hex",
-            "ts26/firmware.hex",
+            "kr1k/firmware.hex",
         ] {
             let err = this_boards_hex(Path::new(bad)).unwrap_err();
-            assert!(err.contains("model 0721"), "{bad}: {err}");
+            assert!(err.contains("model 0283"), "{bad}: {err}");
             assert!(err.contains("`restore <port> <dir>`"), "{bad}: {err}");
         }
     }

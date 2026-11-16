@@ -1,6 +1,6 @@
 //! `cargo xtask simulate` runs the UI in `src/ui.rs` on your machine.
 //!
-//! It drives `ts26::torch::Torch`, the same loop body the firmware runs, one
+//! It drives `kr1k::torch::Torch`, the same loop body the firmware runs, one
 //! switch sample per 64 Hz tick. Give it a script in Anduril's notation and
 //! it prints what each click and hold did, like this.
 //!
@@ -8,7 +8,7 @@
 //! cargo xtask simulate 1C 2H:1.5s wait:1s 3C
 //! ```
 //!
-//! `ts26::testing` reads the script, the same reader the library's tests of
+//! `kr1k::testing` reads the script, the same reader the library's tests of
 //! docs/ui.md use, and says what each word means. On the simulated chip,
 //! `fault` is a fuse that fails the read-back.
 //!
@@ -21,12 +21,12 @@ use std::fmt;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ts26::TICKS_PER_SECOND;
-use ts26::button::{Event, HOLD_TICKS};
-use ts26::ramp::{self, LEVELS};
-use ts26::testing::{self, Rig, Scene, clicks};
+use kr1k::TICKS_PER_SECOND;
+use kr1k::button::{Event, HOLD_TICKS};
+use kr1k::ramp::{self, LEVELS};
+use kr1k::testing::{self, Rig, Scene, clicks};
 
-pub use ts26::testing::Action;
+pub use kr1k::testing::Action;
 
 use crate::terminal::{CTRL_C, Terminal};
 
@@ -350,7 +350,7 @@ fn lit(level: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ts26::ui::ON_LEVEL as LEVEL;
+    use kr1k::ui::ON_LEVEL as LEVEL;
 
     fn script(script: &str) -> Run {
         let words: Vec<_> = script.split_whitespace().collect();

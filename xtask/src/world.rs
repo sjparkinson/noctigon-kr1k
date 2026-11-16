@@ -1,17 +1,17 @@
 //! What the simulated chip sees. That's a script's scene, which
-//! `ts26::testing`'s `Rig` sees too, plus the fuse bytes, which only the
+//! `kr1k::testing`'s `Rig` sees too, plus the fuse bytes, which only the
 //! firmware reads.
 
-use ts26::regs::addr as reg;
-use ts26::selftest::{Faults, Fuses};
-use ts26::sensors::Channel;
-use ts26::testing::Scene;
+use kr1k::regs::addr as reg;
+use kr1k::selftest::{Faults, Fuses};
+use kr1k::sensors::Channel;
+use kr1k::testing::Scene;
 
 use crate::updi::map;
 
 /// The temperature sensor calibration the simulated chip has in its signature
 /// row, the same as the library tests'.
-pub use ts26::testing::CALIBRATION;
+pub use kr1k::testing::CALIBRATION;
 
 /// The fuse bytes the simulated chip has, FUSE.WDTCFG to FUSE.BOOTEND.
 pub const FUSE_BYTES: usize = 9;
@@ -106,7 +106,7 @@ impl From<Scene> for World {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ts26::testing::temperature_reading;
+    use kr1k::testing::temperature_reading;
 
     #[test]
     fn factory_fuses_pass_and_a_bad_one_is_a_fault() {
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn a_cell_and_a_temperature_read_as_the_library_expects() {
         let voltage = World::NORMAL.reading(Channel::Voltage);
-        assert!(ts26::battery::centivolts(voltage).abs_diff(380) <= 1);
+        assert!(kr1k::battery::centivolts(voltage).abs_diff(380) <= 1);
         let temperature = World::NORMAL.reading(Channel::Temperature);
         assert_eq!(temperature, temperature_reading(Scene::NORMAL.kelvin));
     }

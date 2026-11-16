@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(STAMP_AT, CHECKSUM_AT - STAMP_LEN);
         let flash = sign(&[0x12, 0x34], &stamp::TEST).unwrap();
         assert_eq!(flash[STAMP_AT..CHECKSUM_AT], stamp::TEST);
-        assert_eq!(stamp::read(&flash).as_deref(), Some("ts26 test"));
+        assert_eq!(stamp::read(&flash).as_deref(), Some("kr1k test"));
     }
 
     #[test]

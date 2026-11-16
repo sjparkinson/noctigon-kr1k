@@ -1,6 +1,6 @@
 # Wurkkos TS26
 
-Rust firmware for the Wurkkos TS26 torch (model 0721).
+Rust firmware for the Wurkkos TS26 torch (model 0283).
 
 ## Building
 

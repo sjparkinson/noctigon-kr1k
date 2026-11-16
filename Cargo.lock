@@ -3,12 +3,12 @@
 version = 4
 
 [[package]]
-name = "ts26"
+name = "kr1k"
 version = "0.0.0"
 
 [[package]]
 name = "xtask"
 version = "0.0.0"
 dependencies = [
- "ts26",
+ "kr1k",
 ]

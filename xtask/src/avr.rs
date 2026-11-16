@@ -44,7 +44,7 @@
 
 use std::ops::Range;
 
-use ts26::regs::addr;
+use kr1k::regs::addr;
 
 /// CPU.SPL, CPU.SPH and CPU.SREG. The CPU keeps these itself rather than
 /// passing them to the bus.

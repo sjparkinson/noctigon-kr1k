@@ -3,7 +3,7 @@
 
 use std::ops::Range;
 
-use ts26::regs::mem;
+use kr1k::regs::mem;
 
 /// AVR ELF files put data space at 0x800000.
 pub const DATA_SPACE: u32 = 0x80_0000;

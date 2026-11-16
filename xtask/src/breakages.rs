@@ -459,7 +459,7 @@ impl Scratch {
     /// Copies `COPIED` from `root` to a fresh directory under the system's
     /// temporary one, named for this process.
     fn of(root: &Path) -> Result<Self, String> {
-        let dir = env::temp_dir().join(format!("ts26-breakages-{}", process::id()));
+        let dir = env::temp_dir().join(format!("kr1k-breakages-{}", process::id()));
         if dir.exists() {
             fs::remove_dir_all(&dir).map_err(at(&dir))?;
         }
@@ -612,23 +612,23 @@ mod tests {
     }
 
     const SIMULATOR: &str = "\
-   Compiling ts26 v0.0.0 (/tmp/copy)
+   Compiling kr1k v0.0.0 (/tmp/copy)
     Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
-error: /tmp/copy/target/avr-none/release/ts26.elf: simulator: startup: 0x0a1c: gives PB2 a pull-up
+error: /tmp/copy/target/avr-none/release/kr1k.elf: simulator: startup: 0x0a1c: gives PB2 a pull-up
 ";
     const LAYOUT: &str = "\
     Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
-error: /tmp/copy/target/avr-none/release/ts26.elf: the CCP unlock at 0x0010 isn't followed by `st Z`
+error: /tmp/copy/target/avr-none/release/kr1k.elf: the CCP unlock at 0x0010 isn't followed by `st Z`
 ";
     const LINKER: &str = "\
 error: linking with `rust-lld` failed: exit status: 1
   = note: rust-lld: error: undefined symbol: __mulsi3
-error: could not compile `ts26` (bin \"ts26\") due to 1 previous error
+error: could not compile `kr1k` (bin \"kr1k\") due to 1 previous error
 error: cargo failed (exit status: 101)
 ";
     const COMPILER: &str = "\
 error[E0425]: cannot find value `x` in this scope
-error: could not compile `ts26` (bin \"ts26\") due to 1 previous error
+error: could not compile `kr1k` (bin \"kr1k\") due to 1 previous error
 error: cargo failed (exit status: 101)
 ";
 
@@ -639,7 +639,7 @@ error: cargo failed (exit status: 101)
         assert_eq!(stage(LAYOUT), Some(Stage::Layout));
         assert_eq!(stage(LINKER), Some(Stage::Build));
         assert_eq!(stage(COMPILER), Some(Stage::Build));
-        assert_eq!(stage("wrote target/wurkkos-ts26-0721.hex\n"), None);
+        assert_eq!(stage("wrote target/noctigon-kr1k-0283.hex\n"), None);
         let (_, line) = verdict(LINKER).unwrap();
         assert_eq!(line, "cargo failed (exit status: 101)");
     }
@@ -669,7 +669,7 @@ error: cargo failed (exit status: 101)
 
     #[test]
     fn a_copy_leaves_out_target_and_git_and_goes_when_its_dropped() {
-        let from = env::temp_dir().join(format!("ts26-breakages-test-{}", process::id()));
+        let from = env::temp_dir().join(format!("kr1k-breakages-test-{}", process::id()));
         let to = from.with_extension("copy");
         for dir in ["src/avr", "target", ".git", "src/target"] {
             fs::create_dir_all(from.join(dir)).unwrap();

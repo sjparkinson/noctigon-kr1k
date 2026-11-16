@@ -31,7 +31,7 @@ def rust(path, dir)
                               "--", "-D", "warnings", chdir: dir)
   return host if host || !(avr_only || AVR_TOO.include?(relative))
 
-  run("cargo", "clippy", "-q", "--package", "ts26", "--lib", "--bins", "--examples",
+  run("cargo", "clippy", "-q", "--package", "kr1k", "--lib", "--bins", "--examples",
       "--release", "--target", "avr-none", "-Zbuild-std=core", "--", "-D", "warnings", chdir: dir)
 end
 

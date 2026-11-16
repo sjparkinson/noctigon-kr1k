@@ -9,7 +9,7 @@
 //! chapter). The sequences here (link set-up, NVM key, reset, page writes)
 //! follow Microchip's pymcuprog, the reference serial UPDI implementation.
 //! Register addresses, the memory map and NVM commands come from the
-//! ATtiny1616 ATDF in `vendor/`, through `ts26::regs`. The UPDI instruction
+//! ATtiny1616 ATDF in `vendor/`, through `kr1k::regs`. The UPDI instruction
 //! set isn't in the ATDF, so those stay hand-written.
 //!
 //! This deliberately can't write fuses, write the user row or unlock a locked
@@ -22,7 +22,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 // NVMCTRL.CTRLA commands and NVMCTRL.STATUS bits.
-use ts26::regs::{
+use kr1k::regs::{
     NVMCTRL_CMD_CHIPERASE as NVM_CHIP_ERASE, NVMCTRL_CMD_PAGEBUFCLR as NVM_PAGE_BUFFER_CLEAR,
     NVMCTRL_CMD_PAGEERASEWRITE as NVM_PAGE_ERASE_WRITE, NVMCTRL_CMD_PAGEWRITE as NVM_PAGE_WRITE,
     NVMCTRL_EEBUSY as NVM_EEBUSY, NVMCTRL_FBUSY as NVM_FBUSY, NVMCTRL_WRERROR as NVM_WRERROR,
@@ -30,7 +30,7 @@ use ts26::regs::{
 
 /// Data-space layout of the ATtiny1616, as UPDI sees it.
 pub mod map {
-    use ts26::regs::{self, addr, mem};
+    use kr1k::regs::{self, addr, mem};
 
     /// Flash, seen through the data-space window. Writes land in the page
     /// buffer until an NVM command commits them.
@@ -618,7 +618,7 @@ pub(crate) mod tests {
     /// checked by review against the datasheet and pymcuprog.
     #[test]
     fn map_assumes_what_the_atdf_says() {
-        use ts26::regs::{addr, mem};
+        use kr1k::regs::{addr, mem};
 
         // SERIAL and SERIAL_SIZE take SERNUM0 and SERNUM9 as the ends of one
         // run of bytes, which starts where the signature stops.

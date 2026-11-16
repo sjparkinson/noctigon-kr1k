@@ -1,7 +1,7 @@
 //! The TS26 driver's pins and the ATtiny1616 registers that drive them.
 //!
 //! No PAC. The register constants are generated from Microchip's ATDF into
-//! `src/regs.rs` at build time. The pin map is `ts26::board`'s.
+//! `src/regs.rs` at build time. The pin map is `kr1k::board`'s.
 
 #![allow(unsafe_code)]
 
@@ -10,13 +10,13 @@ use core::ptr::{
     read_volatile, with_exposed_provenance, with_exposed_provenance_mut, write_volatile,
 };
 
-use ts26::board::{self, AUX_PINS, BATTERY, ENABLE, PWM, SWITCH, UPDI};
-use ts26::ramp::{DSM_BITS, DSM_TOP, Output, PWM_TOP};
-use ts26::selftest::Fuses;
-use ts26::sensors::{Channel, Convert};
-use ts26::temp::Calibration;
-use ts26::ui::Aux;
-use ts26::watchdog::TICK_DEADLINE_CYCLES;
+use kr1k::board::{self, AUX_PINS, BATTERY, ENABLE, PWM, SWITCH, UPDI};
+use kr1k::ramp::{DSM_BITS, DSM_TOP, Output, PWM_TOP};
+use kr1k::selftest::Fuses;
+use kr1k::sensors::{Channel, Convert};
+use kr1k::temp::Calibration;
+use kr1k::ui::Aux;
+use kr1k::watchdog::TICK_DEADLINE_CYCLES;
 
 use crate::regs::{self, addr as reg};
 
@@ -36,10 +36,10 @@ const CTRLB_ON: u8 = regs::TCA_CMP0EN | regs::TCA_WGMODE_DSBOTTOM;
 // the timer.
 const _: () = assert!(ENABLE == 2 && (CTRLB_OFF | CTRLB_ON) & regs::TCA_CMP2EN == 0);
 
-// The window `start_watchdog` sets is the one `ts26::watchdog` counts on.
+// The window `start_watchdog` sets is the one `kr1k::watchdog` counts on.
 // WDT.CTRLA's fields count 8 << (n - 1) WDT clocks, and these are n = 3.
 const _: () = {
-    use ts26::watchdog::{CLOSED_CLOCKS, OPEN_CLOCKS};
+    use kr1k::watchdog::{CLOSED_CLOCKS, OPEN_CLOCKS};
     assert!(8 << ((regs::WDT_WINDOW_32CLK >> 4) - 1) == CLOSED_CLOCKS);
     assert!(8 << (regs::WDT_PERIOD_32CLK - 1) == OPEN_CLOCKS);
 };

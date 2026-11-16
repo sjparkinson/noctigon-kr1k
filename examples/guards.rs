@@ -17,7 +17,7 @@
 
 // hw.rs and rt.rs reach the library's registers as `crate::regs`.
 #[cfg(target_arch = "avr")]
-use ts26::regs;
+use kr1k::regs;
 
 // Most of hw.rs goes unused here.
 #[cfg(target_arch = "avr")]
@@ -31,7 +31,7 @@ mod rt;
 #[cfg(target_arch = "avr")]
 mod guards {
     use crate::hw;
-    use ts26::ramp::Output;
+    use kr1k::ramp::Output;
 
     /// Lit passes asking for power-down. `sim::guards` counts on this.
     const LIT_TICKS: u8 = 4;

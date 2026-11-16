@@ -1,9 +1,9 @@
-//! docs/ui.md's examples, for running on the firmware. `ts26::testing` reads
+//! docs/ui.md's examples, for running on the firmware. `kr1k::testing` reads
 //! them and says how a row has to look; this adds where in the file a row's
 //! wrong. `cargo test` runs them against the library in `src/torch.rs`, and
 //! `cargo xtask hex` against the firmware on the simulated chip (`sim.rs`).
 
-use ts26::testing::{self, Example};
+use kr1k::testing::{self, Example};
 
 /// docs/ui.md, built in so a change to it rebuilds xtask.
 pub const UI_MD: &str = include_str!("../../docs/ui.md");

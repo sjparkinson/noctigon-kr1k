@@ -8,7 +8,7 @@ CI runs these on every pull request, so run them before you push.
 cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
-cargo clippy --package ts26 --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings
+cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings
 cargo xtask hex
 ```
 
@@ -80,7 +80,7 @@ Keep logic in the library, where `cargo test` can reach it. `src/main.rs` should
 
 ## Registers
 
-There's no PAC, and nothing to add when you need a register. `build.rs` generates a constant for every register, bitfield, named value, memory segment and vector in `vendor/ATtiny1616.atdf`, and `src/regs.rs` includes them, so use the one you want, like `regs::addr::RTC_PITCTRLA`, `regs::RTC_PITEN`, `regs::RTC_PERIOD_CYC512`, `regs::mem::EEPROM_START`, `regs::VECTOR_RTC_PIT`. The names are the ATDF's, and the comment at the top of `src/regs.rs` has the rules. `src/avr/hw.rs` uses the constant, not the number. xtask gets the same constants through `ts26::regs`. The firmware pays nothing for the ones it doesn't use.
+There's no PAC, and nothing to add when you need a register. `build.rs` generates a constant for every register, bitfield, named value, memory segment and vector in `vendor/ATtiny1616.atdf`, and `src/regs.rs` includes them, so use the one you want, like `regs::addr::RTC_PITCTRLA`, `regs::RTC_PITEN`, `regs::RTC_PERIOD_CYC512`, `regs::mem::EEPROM_START`, `regs::VECTOR_RTC_PIT`. The names are the ATDF's, and the comment at the top of `src/regs.rs` has the rules. `src/avr/hw.rs` uses the constant, not the number. xtask gets the same constants through `kr1k::regs`. The firmware pays nothing for the ones it doesn't use.
 
 The generator is `generate` in `xtask/src/atdf.rs`, which `build.rs` loads by path, and its tests are in that file. Those also check what generating can't, namely what `src/avr/hw.rs` assumes about the ATDF's layout, and `link.x`. If you need a number that isn't in the ATDF, like `ADC_SAMPLEN_32US`, it goes in `src/regs.rs` by hand, with a comment saying why and a check against whatever the ATDF does say about it. Reset values stay out on purpose, because the ATDF's disagree with the datasheet on `ADC0.CALIB` and the factory `OSCCFG` and `SYSCFG0`.
 

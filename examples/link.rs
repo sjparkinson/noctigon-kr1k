@@ -19,7 +19,7 @@
 
 // rt.rs reaches the library's registers as `crate::regs`.
 #[cfg(target_arch = "avr")]
-use ts26::regs;
+use kr1k::regs;
 #[cfg(target_arch = "avr")]
 #[path = "../src/avr/rt.rs"]
 mod rt;

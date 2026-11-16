@@ -1,9 +1,9 @@
 //! Random switching for tests, kept out of the library because none of it
 //! goes onto the torch. `sim.rs` uses it to check the firmware against the
-//! library, and the tests below use it to check `ts26::button::Clicks`
+//! library, and the tests below use it to check `kr1k::button::Clicks`
 //! against a second description of its rules.
 
-use ts26::button::{HOLD_TICKS, RELEASE_TICKS};
+use kr1k::button::{HOLD_TICKS, RELEASE_TICKS};
 
 /// Endless random switching, as (pressed, ticks) spans that alternate,
 /// starting released. Most lengths sit right at the edges `Clicks` cares
@@ -67,7 +67,7 @@ impl Iterator for RandomSwitching {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ts26::button::{Clicks, Event};
+    use kr1k::button::{Clicks, Event};
 
     /// Spans of the switch, as (pressed, ticks).
     type Runs = [(bool, u32)];

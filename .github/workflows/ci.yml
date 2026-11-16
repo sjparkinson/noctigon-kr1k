@@ -46,15 +46,15 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
-      - run: cargo clippy --package ts26 --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings
+      - run: cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings
       - run: cargo xtask hex
 
       - uses: actions/upload-artifact@v7.0.2
         with:
-          name: wurkkos-ts26-0721
+          name: noctigon-kr1k-0283
           path: |
-            target/wurkkos-ts26-0721.hex
-            target/avr-none/release/ts26.elf
+            target/noctigon-kr1k-0283.hex
+            target/avr-none/release/kr1k.elf
 
   release:
     needs: test
@@ -74,23 +74,23 @@ jobs:
       # upload-artifact strips the paths' common `target/` prefix.
       - uses: actions/download-artifact@v8.0.2
         with:
-          name: wurkkos-ts26-0721
+          name: noctigon-kr1k-0283
           path: dist
 
       - name: version
         run: |
           version="0.1.$(git rev-list --count HEAD)"
           echo "VERSION=$version" >> "$GITHUB_ENV"
-          mv dist/wurkkos-ts26-0721.hex "dist/wurkkos-ts26-0721-$version.hex"
-          mv dist/avr-none/release/ts26.elf "dist/wurkkos-ts26-0721-$version.elf"
+          mv dist/noctigon-kr1k-0283.hex "dist/noctigon-kr1k-0283-$version.hex"
+          mv dist/avr-none/release/kr1k.elf "dist/noctigon-kr1k-0283-$version.elf"
 
       - uses: actions/attest@v4.2.2
         with:
-          subject-path: dist/wurkkos-ts26-0721-*
+          subject-path: dist/noctigon-kr1k-0283-*
 
       - name: gh release
         run: |
-          gh release create "v$VERSION" dist/wurkkos-ts26-0721-* \
+          gh release create "v$VERSION" dist/noctigon-kr1k-0283-* \
             --target "$GITHUB_SHA" \
             --title "$VERSION+$(git rev-parse --short HEAD)" \
             --generate-notes
