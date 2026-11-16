@@ -82,7 +82,25 @@ impl Port {
             .map_err(|e| format!("{path}: {e}"))?;
         let mut port = Self { file };
         port.drain().map_err(|e| format!("{path}: {e}"))?;
+        port.wake().map_err(|e| format!("{path}: {e}"))?;
         Ok(port)
+    }
+
+    /// Sends one 0x00 to wake a UPDI that's disabled, and throws its echo
+    /// away unchecked. The first low edge enables the UPDI, which then holds
+    /// the line low itself for 10 to 200 µs (DS40002413B §36.3.2.1.1,
+    /// table 38-28), longer than a start bit at [`BAUD`], so whatever comes
+    /// back is mangled. Checked like every other echo, it would fail the
+    /// first instruction and blame the wiring. pymcuprog and avrdude both
+    /// send the same lone byte and ignore what comes back. The next frame
+    /// follows straight away, since a UPDI that's woken and sees no SYNCH in
+    /// time turns itself off again (§36.3.2.2.1).
+    fn wake(&mut self) -> io::Result<()> {
+        self.file.write_all(&[0])?;
+        let mut echo = [0];
+        // An empty read is fine. Some adapters lose the mangled byte.
+        let _ = self.file.read(&mut echo)?;
+        Ok(())
     }
 
     fn configure(&self, baud: u32, timeout: u8) -> io::Result<()> {

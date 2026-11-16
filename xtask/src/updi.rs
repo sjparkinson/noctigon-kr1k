@@ -530,7 +530,11 @@ impl<W: Wire> Programmer<W> {
     /// The words go out in one burst with the ACKs turned off, which is safe
     /// only because the controller keeps up. A word write takes 75 µs at
     /// most (tP_WRD, DS table 38-8), and a word is two 12-bit frames, 208 µs
-    /// at 115,200 baud, so each is done before the next arrives. A store
+    /// at 115,200 baud, so each is done before the next arrives. In FLWR mode
+    /// "the ST* instructions write one byte at a time" (§11.3.2.3.1), so if a
+    /// UPDI word store programs as two bytes it's 150 µs, still inside the
+    /// 208 µs. That margin goes at about 160 kbaud, so don't raise the baud
+    /// rate without moving to acknowledged stores. A store
     /// that came early would meet a bus wait, and with RSD set "a loss of
     /// data may occur" (§36.5.3). [`Self::verify`] would catch that.
     fn write_flash_page(&mut self, page: u32, data: &[u8]) -> Result<()> {
