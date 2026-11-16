@@ -22,8 +22,9 @@
 //! three deliberate resets and a marker in `.noinit`. This firmware doesn't,
 //! by choice, because an earlier torch went dark straight after a verified
 //! flash of a stack like that, and a firmware hang wasn't ruled out. So
-//! nobody's seen this watchdog bite on a real chip until docs/breakout.md says
-//! so.
+//! nobody's seen this watchdog bite on a real chip. T3 in docs/breakout.md is
+//! the build that stops feeding it on purpose, and it waits for a spare AVR
+//! DD chip, which there isn't yet.
 //!
 //! The watchdog can't catch its own oscillator stopping, since the tick stops
 //! with it. [`TICK_DEADLINE_PERIODS`] is for that, and only with the light on.

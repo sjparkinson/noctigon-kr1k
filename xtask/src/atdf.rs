@@ -456,15 +456,19 @@ mod tests {
         consts.add("A".into(), 2, "second".into());
     }
 
-    /// `write16` and the ADC result read take these two bytes at a time, the
-    /// simulator times TCA0's from CNT to CMP2BUF, and DAC0.DATA is the
-    /// current setpoint.
+    /// `write16` takes TCB0's CNT and CCMP and DAC0.DATA, the current
+    /// setpoint, two bytes at a time, and so does the ADC result read.
+    /// Nothing uses TCA0, but its 16-bit SINGLE mode registers sit at the
+    /// same addresses as SPLIT mode's 8-bit ones, so they check a width isn't
+    /// lost to that.
     #[test]
     fn the_16_bit_registers_are_16_bits() {
         let xml = atdf();
         let document = parse(&xml);
         let registers = registers(&document);
         for wide in [
+            addr::TCB0_CNT,
+            addr::TCB0_CCMP,
             addr::TCA0_CNT,
             addr::TCA0_PER,
             addr::TCA0_CMP0,

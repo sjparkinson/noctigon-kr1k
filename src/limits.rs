@@ -565,7 +565,7 @@ mod tests {
         assert_eq!(run.offs, 1);
     }
 
-    /// A known gap, docs/safety.md H3 and H12. A reading that's stuck at a
+    /// A known gap, docs/safety.md H5 and H15. A reading that's stuck at a
     /// good-looking 3.8 V is the same to the firmware as a good cell, so
     /// nothing here ever steps the light down. Only a reading that can't be
     /// real gets caught. This pins it down so that if the gap is ever closed,
@@ -584,9 +584,9 @@ mod tests {
         assert_eq!(run.offs, 0);
     }
 
-    /// The same gap for the temperature, docs/safety.md H4. A sensor stuck at
-    /// a comfortable 25 °C never asks for a step down, however long the light
-    /// has really been cooking.
+    /// The same gap for the temperature, docs/safety.md H7 and H15. A sensor
+    /// stuck at a comfortable 25 °C never asks for a step down, however long
+    /// the light has really been cooking.
     #[test]
     fn a_plausible_temperature_that_never_changes_never_steps_down() {
         let mut run = Run::new();

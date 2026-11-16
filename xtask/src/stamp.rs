@@ -71,7 +71,7 @@ fn from_git(hash: Option<&str>, status: Option<&str>) -> [u8; STAMP_LEN] {
 
 /// The stamp text found in `flash`, or `None` if the bytes at the stamp's
 /// place don't start with `kr1k `. That's erased flash, the stock firmware,
-/// T0 (first light), or an image too short to reach it.
+/// or an image too short to reach it.
 pub fn read(flash: &[u8]) -> Option<String> {
     let bytes = flash.get(STAMP_AT..STAMP_AT + STAMP_LEN)?;
     if !bytes.starts_with(PREFIX) {
