@@ -24,7 +24,7 @@ use core::ptr::{
 };
 
 use kr1k::board::{
-    BUTTON_LED, DAC, ENABLE, FET, PATHS, POWER_BANK, SWITCH, UNUSED_PA1, UNUSED_PC2, UNUSED_PC3,
+    BUTTON_LED, DAC, ENABLE, FET, HELD_LOW, PATHS, POWER_BANK, SWITCH, UNUSED_PC2, UNUSED_PC3,
     UNUSED_PD5,
 };
 use kr1k::ramp::{DAC_MAX, Output, Vref};
@@ -36,10 +36,12 @@ use kr1k::watchdog::{TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
 
 use crate::regs::{self, addr as reg};
 
-/// The PORTA pins the firmware drives, the three paths and the button LED.
-/// PA0 (the FET gate, not fitted) and PA2 and PA3 (TWI to the AW2016) are
-/// never outputs.
-const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED;
+/// The PORTA pins the firmware drives, the three paths, the button LED and
+/// PA1, which is only ever held low. PA0 (the FET gate, not fitted) and PA2
+/// and PA3 (TWI to the AW2016) are never outputs.
+const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW;
+// The 0xF2 the stock build on this torch writes to VPORTA.DIR at reset.
+const _: () = assert!(PORTA_OUTPUTS == 0xF2);
 /// The PORTC pins the firmware drives, only PC1.
 const PORTC_OUTPUTS: u8 = 1 << ENABLE;
 /// The PORTD pins the firmware drives, only PD6, which DAC0's buffer takes
@@ -275,10 +277,14 @@ pub fn init_pins() {
 
     // The pins, as `kr1k::board` names them.
     //
-    // PA0 (the FET gate, not fitted), PA1, PC2, PC3, PD5 and PD7 are unused,
-    // so they get a pull-up and nothing floats, as the stock firmware has
-    // them. PA2 and PA3 are the AW2016's TWI lines, which have their own
-    // pull-ups if anything, and nothing here touches them.
+    // PA0 (the FET gate, not fitted), PC2, PC3, PD5 and PD7 are unused, so
+    // they get a pull-up and nothing floats, as the stock firmware has them.
+    // PA2 and PA3 are the AW2016's TWI lines, which have their own pull-ups
+    // if anything, and nothing here touches them.
+    //
+    // PA1 goes to something unknown, and the stock build on this torch holds
+    // it as an output at 0 (`kr1k::board` has why), so it's that here, with
+    // no pull-up. Its PINCTRL is written to 0 in case anything left one.
     //
     // PC1 is the driver's enable, and never gets a pull-up, so it can't creep
     // the driver on before it's an output. Its PINCTRL is written to 0 in
@@ -287,7 +293,7 @@ pub fn init_pins() {
     // PD6 is DAC0's output, and its input buffer is off, as section 34.3.1
     // asks.
     pin_ctrl(reg::PORTA_PIN0CTRL, FET, regs::PORT_PULLUPEN);
-    pin_ctrl(reg::PORTA_PIN0CTRL, UNUSED_PA1, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTA_PIN0CTRL, HELD_LOW, 0);
     pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);
     pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC2, regs::PORT_PULLUPEN);
     pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC3, regs::PORT_PULLUPEN);
@@ -295,9 +301,10 @@ pub fn init_pins() {
     pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);
     pin_ctrl(reg::PORTD_PIN0CTRL, POWER_BANK, regs::PORT_PULLUPEN);
 
-    // Everything the firmware drives comes up low: the paths off, the button
-    // LED off (the stock firmware's off for it is an output at 0), PC1 off,
-    // and PD6 at 0 under DAC0. PD6 is an output as the stock firmware has it,
+    // Everything the firmware drives comes up low, the paths off, the button
+    // LED off (the stock firmware's off for it is an output at 0), PA1 low,
+    // PC1 off, and PD6 at 0 under DAC0. Nothing ever writes PA1's OUT high,
+    // since every later VPORTA.OUT write is 0 or a paths mask. PD6 is an output as the stock firmware has it,
     // so if DAC0's buffer lets go of the pin in power-down (section 34.3.3),
     // PORT holds it low. The datasheet doesn't say which drives the pad then,
     // and it's unconfirmed. OUT before DIR, as for PC1. PORTA's OUT has 0 for

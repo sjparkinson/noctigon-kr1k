@@ -9,7 +9,7 @@
 //! | Pin           | Job                                                    |
 //! |---------------|--------------------------------------------------------|
 //! | PA0           | FET gate (TCA0 WO0), not fitted on this driver, unused |
-//! | PA1           | Unused                                                 |
+//! | PA1           | Unknown, an output held low as the stock build has it  |
 //! | PA2           | TWI0 SDA to the AW2016 aux driver                      |
 //! | PA3           | TWI0 SCL to the AW2016 aux driver                      |
 //! | PA4           | Button LED, plain GPIO                                 |
@@ -29,11 +29,22 @@
 //! lights a colour. `ui::Aux` still says which colour the library wants, and
 //! turning that into AW2016 channel writes is a job for a TWI driver that
 //! doesn't exist yet. Until then the aux stays dark.
+//!
+//! PA1 is the one pin that isn't what the stock board definition says. That
+//! has nothing on it and gives it a pull-up, but the build this torch shipped
+//! with (0284, in the gitignored `backup/stock/flash.hex`) writes 0xF2 to
+//! `VPORTA.DIR` in its reset path and never sets PA1's `OUT`, so PA1 is an
+//! output held low. `cargo xtask peek` on 2026-11-16, with that build asleep,
+//! read `VPORTA.DIR` as 0xE2, PA1 still an output. What PA1 connects to on
+//! the X1-C is unknown (on the plain Lume X1 it's the aux red LED), so the
+//! firmware does what the stock build did and never drives it high.
 
 /// PA0, the FET gate on drivers that have a FET. Unused here.
 pub const FET: u8 = 0;
-/// PA1.
-pub const UNUSED_PA1: u8 = 1;
+/// PA1, connected to nobody knows what, so an output held low as the stock
+/// build on this torch has it (see the module doc). Never high, and no
+/// pull-up.
+pub const HELD_LOW: u8 = 1;
 /// PA2, TWI0 SDA.
 pub const TWI_SDA: u8 = 2;
 /// PA3, TWI0 SCL.
@@ -77,7 +88,7 @@ mod tests {
     #[test]
     fn each_port_uses_each_pin_once() {
         let porta = [
-            FET, UNUSED_PA1, TWI_SDA, TWI_SCL, BUTTON_LED, PATH3, PATH2, PATH1,
+            FET, HELD_LOW, TWI_SDA, TWI_SCL, BUTTON_LED, PATH3, PATH2, PATH1,
         ];
         let portc = [ENABLE, UNUSED_PC2, UNUSED_PC3];
         let portd = [SWITCH, UNUSED_PD5, DAC, POWER_BANK];

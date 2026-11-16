@@ -180,10 +180,32 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "twi-line-driven",
         file: HW,
-        find: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED;\n",
-        replace: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << 2;\n",
+        find: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW;\n\
+               // The 0xF2 the stock build on this torch writes to VPORTA.DIR at reset.\n\
+               const _: () = assert!(PORTA_OUTPUTS == 0xF2);\n",
+        replace: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW | 1 << 2;\n",
         stage: Stage::Simulator,
         expect: "PA2 and PA3 are the AW2016's TWI lines",
+    },
+    // PA1 goes to something unknown, and the stock build on this torch holds
+    // it as an output at 0, so it never gets the stock source's pull-up back.
+    Breakage {
+        name: "pa1-pull-up",
+        file: HW,
+        find: "    pin_ctrl(reg::PORTA_PIN0CTRL, HELD_LOW, 0);\n",
+        replace: "    pin_ctrl(reg::PORTA_PIN0CTRL, HELD_LOW, regs::PORT_PULLUPEN);\n",
+        stage: Stage::Simulator,
+        expect: "gives PA1 a pull-up",
+    },
+    // ... and is never driven high.
+    Breakage {
+        name: "pa1-driven-high",
+        file: HW,
+        find: "    out!(reg::VPORTA_OUT, 0);\n    out!(reg::VPORTA_DIR, PORTA_OUTPUTS);\n",
+        replace: "    out!(reg::VPORTA_OUT, 1 << HELD_LOW);\n    \
+                  out!(reg::VPORTA_DIR, PORTA_OUTPUTS);\n",
+        stage: Stage::Simulator,
+        expect: "setting PA1",
     },
     // Errata 2.2.3: a store under 64 straight after one at 64 or over is
     // lost, so the VPORTs and GPRs take `out`. This is every `out!` as the

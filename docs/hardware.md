@@ -29,16 +29,19 @@ The stock firmware's hardware definition calls the board a "40W Boost Driver wit
 | PA4 | Switch LED | Plain GPIO in the stock build. What it drives on a KR1K is unknown, see [The switch](#the-switch) |
 | PA2, PA3 | TWI0 SDA, SCL | To the AW2016 aux driver |
 | PA0 | A FET path through TCA0 WO0 | Not connected on the Lume X1, per the stock firmware's comment. It gets the pull-up |
-| PA1, PC2, PC3, PD5 | Unused | They get the pull-up |
+| PA1 | Unknown | An output held low, no pull-up, as the stock build on this torch has it, see below |
+| PC2, PC3, PD5 | Unused | They get the pull-up |
 | PD7 | Power-bank enable | Unused here. The stock firmware gives it the pull-up and writes its OUT low |
 | PF6 | nRST | Input only on this chip (DS40002413B §3.1) |
 | PF7 | UPDI | The programming pin |
 | VDD | MCU supply | The cell, through a P-channel FET for reverse polarity |
 | VDDIO2 | Supply for PC1 to PC3 | Present on programmer power (`MVIO.STATUS` reads 1). What feeds it is unknown, see [The boost enable](#the-boost-enable-pc1) |
 
-That table is confirmed as what the stock firmware's hardware definition says, and nothing more. The pins themselves are confirmed by the datasheet's multiplexing table (DS40002413B §3.1), which has DAC0's output on PD6, TWI0's host-capable SDA and SCL on PA2 and PA3, RESET on PF6 and UPDI on PF7.
+That table, PA1's row aside, is confirmed as what the stock firmware's hardware definition says, and nothing more. The pins themselves are confirmed by the datasheet's multiplexing table (DS40002413B §3.1), which has DAC0's output on PD6, TWI0's host-capable SDA and SCL on PA2 and PA3, RESET on PF6 and UPDI on PF7.
 
 The stock firmware's set-up makes PA4 to PA7, PC1 and PD6 outputs with `DIR`, clears PC1's `OUT`, gives PD4 a both-edges pin interrupt, turns PD6's input buffer off, sets the DAC's reference to 1.024 V, enables the DAC and its output buffer with the data at 0, turns TCA0, TCB0, TCB1 and TCD0 off, then sets up the AW2016. Confirmed from source.
+
+PA1 is where the build on this torch parts from the source. The stock source's board definition has nothing on it and gives it the pull-up, but the 0284 build this torch shipped with does neither. A disassembly of its flash (`backup/stock/flash.hex`, gitignored) shows it writing 0xF2 to `VPORTA.DIR` in the reset path, which makes PA1 an output as well as PA4 to PA7, and never sets PA1's `OUT`, so it's held low. `cargo xtask peek` on 2026-11-16, with that build asleep, read `VPORTA.DIR` as 0xE2, PA1 still an output. Confirmed on this torch, from the backup and the peek. What PA1 connects to on the X1-C is unknown (on the plain Lume X1 it's the aux red LED). This firmware does what the stock build did, an output at 0 with `OUT` written before `DIR`, no pull-up, and never high. The other unused pins (PA0, PC2, PC3, PD5 and PD7) get the pull-up, as the stock firmware has them.
 
 ### The boost enable, PC1
 
@@ -89,7 +92,7 @@ The sensor inside the MCU, on the driver. The stock firmware reads it against th
 
 ## The clock
 
-The stock firmware runs the internal high-frequency oscillator at 12 MHz, with the frequency select and `AUTOTUNE` written through the protected-write sequence. Confirmed from source. `AUTOTUNE` tunes the oscillator against an external 32.768 kHz crystal (DS40002413B §12.3.6), and the crystal's pins are PA0 and PA1 (§3.1), which the stock firmware treats as an unused FET path and an unused pin. So the board likely has no crystal, and what `AUTOTUNE` does without one, the datasheet doesn't say. This firmware has no reason to set it.
+The stock firmware runs the internal high-frequency oscillator at 12 MHz, with the frequency select and `AUTOTUNE` written through the protected-write sequence. Confirmed from source. `AUTOTUNE` tunes the oscillator against an external 32.768 kHz crystal (DS40002413B §12.3.6), and the crystal's pins are PA0 and PA1 (§3.1), which the stock firmware treats as an unused FET path and, in the build on this torch, an output held low. So the board likely has no crystal, and what `AUTOTUNE` does without one, the datasheet doesn't say. This firmware has no reason to set it.
 
 The tick is the RTC's PIT at `CYC512` from the internal 32.768 kHz oscillator, 64 Hz, the same tick the TS26 used. Waking from sleep is PD4's pin change. Confirmed from source.
 
@@ -156,6 +159,6 @@ This torch's fuses read `00 00 00 FF FF D0 08 00 00`, in the order `WDTCFG`, `BO
 - What's the pads' pitch in millimetres? Does `+` feed the boost converter and the AW2016 as well as the MCU with the cell out?
 - What's the AW2016's standby current, and what's its CHRG pin wired to?
 - How does the tail switch reach PD4, and what does PA4 drive, if anything?
-- Is there a 32 kHz crystal on PA0 and PA1? (Likely not.)
+- Is there a 32 kHz crystal on PA0 and PA1? (Likely not, and the stock build drives PA1 low.) What is PA1 wired to?
 - Which errata letter is avrdude's silicon revision 1.2?
 - What does the 1014 calibration read against a multimeter, near 3 V and under load?

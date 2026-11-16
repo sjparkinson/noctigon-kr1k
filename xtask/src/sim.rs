@@ -115,8 +115,10 @@
 //!   on what the board pulls it down with. This takes the 10 µs, which is a
 //!   floor, not a promise. A reference lowered or a path removed, as the off
 //!   order does straight after DAC0 goes to 0, isn't held to the wait.
-//! - PC1, PD4 (the switch, with its own pull-up), PD6 (DAC0's pin) and the
-//!   three paths never get a pull-up. No pin gets INVEN. PA2 and PA3, the
+//! - PC1, PD4 (the switch, with its own pull-up), PD6 (DAC0's pin), PA1
+//!   and the three paths never get a pull-up. No pin gets INVEN. PA1's
+//!   `OUT` is never set, since the stock build on this torch holds it as an
+//!   output at 0 and what it connects to is unknown (src/board.rs). PA2 and PA3, the
 //!   AW2016's TWI lines, are never driven and their settings never written,
 //!   and nothing in PORTF (reset and UPDI) is ever written.
 //! - TCB0, the tick deadline's timer, runs exactly while PC1 is high,
@@ -283,6 +285,9 @@ const ENABLE: u8 = 1 << board::ENABLE;
 const PATHS: u8 = board::PATHS;
 /// PA2 and PA3, the AW2016's TWI lines.
 const TWI: u8 = 1 << board::TWI_SDA | 1 << board::TWI_SCL;
+/// PA1, which goes to something unknown and is only ever held low.
+const HELD_LOW: u8 = 1 << board::HELD_LOW;
+const HELD_LOW_CTRL: usize = reg::PORTA_PIN0CTRL + board::HELD_LOW as usize;
 /// PD4, the switch, active low.
 const SWITCH: u8 = 1 << board::SWITCH;
 const SWITCH_PIN: usize = board::SWITCH as usize;
@@ -1128,7 +1133,8 @@ fn rises(sim: &Sim, n: u32) -> Result<(), String> {
 /// rests as `peek` saw the stock firmware rest on this torch (docs/breakout.md's
 /// results), PC1 an output
 /// and low, DAC0 driving PD6 at 0 against 1.024 V with PD6's input buffer
-/// off, and the paths outputs and low. PD4 reads with no pull-up and no
+/// off, and the paths outputs and low. PA1 is an output at 0 with no
+/// pull-up, as the stock build had it. PD4 reads with no pull-up and no
 /// sense, and the unused pins have their pull-ups, as board.rs has them.
 fn at_rest(mut sim: Sim) -> Result<(), String> {
     hold(&mut sim, false, 2000 * MS)?;
@@ -1150,11 +1156,13 @@ fn at_rest(mut sim: Sim) -> Result<(), String> {
             io[reg::VPORTA_DIR] & PATHS == PATHS,
             "the paths aren't outputs",
         ),
+        (io[reg::VPORTA_DIR] & HELD_LOW != 0, "PA1 isn't an output"),
+        (io[reg::VPORTA_OUT] & HELD_LOW == 0, "PA1 isn't low"),
+        (io[HELD_LOW_CTRL] == 0, "PA1 has a pull-up or a sense"),
         (io[SWITCH_CTRL] == 0, "PD4 has a sense or a pull-up"),
         (
             [
                 pin(reg::PORTA_PIN0CTRL, board::FET),
-                pin(reg::PORTA_PIN0CTRL, board::UNUSED_PA1),
                 pin(reg::PORTC_PIN0CTRL, board::UNUSED_PC2),
                 pin(reg::PORTC_PIN0CTRL, board::UNUSED_PC3),
                 pin(reg::PORTD_PIN0CTRL, board::UNUSED_PD5),
@@ -2564,6 +2572,11 @@ impl Chip {
             (SWITCH_CTRL, "PD4", "the switch, which has its own"),
             (DAC_PIN_CTRL, "PD6", "DAC0's output"),
             (
+                HELD_LOW_CTRL,
+                "PA1",
+                "an output held low as the stock build had it, wired to who knows what",
+            ),
+            (
                 pin(reg::PORTA_PIN0CTRL, board::PATH1),
                 "PA7",
                 "a power path",
@@ -2618,6 +2631,12 @@ impl Chip {
                 "writes {value:#04x} to {}: PA2 and PA3 are the AW2016's TWI lines, which \
                  the firmware never drives",
                 name(a)
+            ));
+        }
+        if a == reg::VPORTA_OUT && value & HELD_LOW != 0 {
+            return Err(format!(
+                "writes {value:#04x} to VPORTA.OUT, setting PA1, which the stock build on \
+                 this torch holds low and which goes to something unknown"
             ));
         }
         let (old, before) = (self.io[a], self.paths());
@@ -3610,7 +3629,7 @@ mod tests {
             (DAC_PIN_CTRL, ISC_INPUT_DISABLE),
             (SWITCH_CTRL, ISC_BOTHEDGES),
             (reg::VPORTA_OUT, 0),
-            (reg::VPORTA_DIR, PATHS | 1 << board::BUTTON_LED),
+            (reg::VPORTA_DIR, PATHS | 1 << board::BUTTON_LED | HELD_LOW),
             (reg::VPORTC_OUT, 0),
             (reg::VPORTC_DIR, ENABLE),
             (reg::VPORTD_OUT, 0),
@@ -3920,6 +3939,7 @@ mod tests {
             pin(reg::PORTC_PIN0CTRL, board::ENABLE),
             SWITCH_CTRL,
             DAC_PIN_CTRL,
+            HELD_LOW_CTRL,
             pin(reg::PORTA_PIN0CTRL, board::PATH1),
             pin(reg::PORTA_PIN0CTRL, board::PATH2),
             pin(reg::PORTA_PIN0CTRL, board::PATH3),
@@ -3935,6 +3955,17 @@ mod tests {
             PORT_PULLUPEN,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn pa1_is_an_output_that_never_goes_high() {
+        let mut chip = Chip::new(Vec::new());
+        poke(&mut chip, reg::VPORTA_OUT, 0).unwrap();
+        poke(&mut chip, reg::VPORTA_DIR, HELD_LOW).unwrap();
+        poke(&mut chip, HELD_LOW_CTRL, 0).unwrap();
+        let err = refused(&mut chip, reg::VPORTA_OUT, HELD_LOW);
+        assert!(err.contains("setting PA1"), "{err}");
+        assert_eq!(chip.io[reg::VPORTA_OUT], 0);
     }
 
     #[test]
