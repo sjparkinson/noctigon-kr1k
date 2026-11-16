@@ -2,53 +2,58 @@
 
 Roughly in order. Each step should leave a torch that's no worse than the step before. Tick things off here in the commit that does them. [breakout.md](breakout.md) gathers every check on a real light into one run.
 
+This repo started as TS26 firmware and is being ported to the KR1K, so the TS26's ticks are gone. A box is ticked only for work done for the KR1K and its AVR32DD20, and nothing has met a KR1K yet.
+
 ## 1. It lights up
 
 - [x] Toolchain with nightly `avr-none`, `rust-lld`, own linker script and vector table, no crates
-- [x] Register constants generated from the ATtiny1616 ATDF at build time
-- [x] Pin map for the model 0721 driver, from the stock firmware
-- [x] Switch sampling at 64 Hz and a click/hold decoder
-- [x] Click on, click off, at one dim level through the boost converter
-- [x] The UPDI programmer in `xtask` (ping, backup, flash, restore), tested against a fake chip
-- [x] Find the flashing pads on a real TS26 and check their order with a multimeter
-- [x] Ping, back up and flash a real TS26, with only the plain UPDI adapter, and T0 (commit `9d3b7dc`) first
-- [ ] Disassemble `backup/torch` and check what docs/hardware.md takes from the stock firmware's source against what the stock build really writes to the pins, TCA0 and the ADC
-- [x] Check the boost enable and PWM sequencing on a real light. Does it come on cleanly at duty 10, with no flash at turn-on?
-- [ ] Measure what PWM duty does to output on the MP3432, so the ramp has something to stand on
+- [ ] Register constants generated from the AVR32DD20 ATDF at build time
+- [ ] `link.x` and the start-up code for the AVR32DD20's memory map (32 KB flash, 4 KB SRAM at 0x7000, flash mapped at 0x8000) and its 36 vectors
+- [ ] Pin map for the Lume X1-C, from the stock firmware (PC1 enable, PD6 DAC, PA5 to PA7 paths, PD4 switch)
+- [ ] Switch sampling at 64 Hz on PD4, with its external pull-up and no internal one, and the click/hold decoder
+- [ ] The UPDI programmer in `xtask` ported to the AVR Dx NVM controller (no page buffer, 24-bit addresses, signature `1E 95 3A`), tested against a fake chip
+- [ ] A first-light image for the AVR32DD20, click on and click off at one low level through PC1, the DAC and one path
+- [ ] Find the flashing pads on the KR1K, read the PCB code, and check the pads' order with a multimeter
+- [ ] Ping, back up and flash the KR1K, with only the plain 4.5 V UPDI kit, and the first-light image first
+- [ ] Read `backup/torch/fuses.hex` and disassemble `backup/torch`, and check what docs/hardware.md takes from the stock firmware's source against what the stock build really writes to PC1, the DAC, VREF and the ADC
+- [ ] Find out what VDDIO2 is connected to, since PC1 is on it
+- [ ] Check the enable, DAC and path sequencing on the real light. Does it come on cleanly, with no flash at turn-on?
+- [ ] Measure what DAC value, path and reference do to output, so the ramp has something to stand on
 
 ## 2. It's safe to leave a cell in
 
-A tick here means the firmware does it and it runs on the simulator. Nothing below has met a real light, so none of it means the torch is safe yet. [breakout.md](breakout.md) is what would.
+A tick here means the firmware does it for the AVR32DD20 and it runs on the simulator. That isn't the torch being safe. [breakout.md](breakout.md) is what would show that.
 
-- [x] Sleep when off, in power-down, with PB2 low first. Firmware only. The PIT wakes it every tick and the loop samples PA5. On the tick after a watchdog feed it idles instead, because the datasheet doesn't say a `wdr` finishes syncing with the peripheral clock stopped
-- [ ] Test power-down straight after a feed on a real light (T4 in [breakout.md](breakout.md#test-builds)), then drop that idle if a resting torch doesn't reset. It costs about 0.37 mA at 3 V and about 0.6 mA on a full cell, a third of the datasheet's typical idle current since one tick in three idles, so this isn't fit for a drawer until then
-- [ ] Battery voltage through the divider on PA1 (AIN1), not VCC. The firmware reads it with the stock firmware's slope of 1094. Still needs checking against a multimeter
-- [x] Low-voltage protection. Firmware only, and every threshold's unmeasured. The Wurkkos 21700 is unprotected, so the firmware's the only thing between it and over-discharge. A flat cell keeps the light off until a reading with it off says the cell's charged, and a cell it can't read is a fault
-- [x] Thermal regulation from the internal temperature sensor. Firmware only, and every constant's unmeasured. `ramp::CEILING` holds the light at level 120 until it's been run on a real light
-- [x] A watchdog, so a hang can't leave the boost converter running. Firmware only, with a plain window and no proof at power-on, so it's only been seen to bite on the breakout (docs/breakout.md 0.13), never on a torch. The simulator can't show that either, since it doesn't model resets. The watchdog shares the tick's oscillator, so a tick that stops while the light's on has its own deadline, a count of PWM cycles, which turns the light off and powers down for good
-- [x] Check flash against its CRC, and read the fuses back, at power-on. Firmware only. A failure, or a watchdog reset, keeps the light off until the cell comes out, with the aux white after a press. Neither check has seen a real chip
+- [ ] Sleep when off, in power-down, with PC1 low, the DAC at zero and every path low first. The PIT wakes it every tick and the loop samples PD4
+- [ ] Test power-down straight after a watchdog feed on a real light (T4 in [breakout.md](breakout.md#test-builds)), then drop the idle on the tick after a feed if a resting torch doesn't reset
+- [ ] Battery voltage from VDD through the ADC's VDDDIV10 input against 1.024 V, with the stock firmware's slope of 1014. Then check it against a multimeter
+- [ ] Low-voltage protection on that reading. The cell is unprotected, so the firmware's the only thing between it and over-discharge
+- [ ] Thermal regulation from the internal temperature sensor, with the AVR32DD20's `SIGROW` calibration
+- [ ] A watchdog, so a hang can't leave the boost converter running, with a tick deadline counted off a clock this board has
+- [ ] Check flash against its CRC, and read the AVR32DD20's fuses back, at power-on
 
 ## Safety evidence
 
-What covers each hazard, and how well, is in [safety.md](safety.md). These are the gaps it names that code can close. Like section 2, a tick means the firmware or the tests do it, and none of it is bench evidence.
+What covers each hazard, and how well, is in [safety.md](safety.md). These are the gaps it names that code can close. Like section 2, a tick means the firmware or the tests do it for the AVR32DD20, and none of it is bench evidence.
 
-- [x] No-panic link check. `cargo xtask hex` refuses a firmware image that links any panic path
-- [x] Overflow checks in release builds, so with the no-panic check the firmware can't wrap by accident
+- [ ] No-panic link check on the AVR32DD20 build
+- [ ] Overflow checks in release builds, re-proven on the AVR32DD20 build
 - [x] Restriction lints on the library. Overflow, indexing, casts and unwraps are made explicit, and clippy denies the rest
 - [x] Hold every ADC reading through low-voltage protection and thermal regulation and check where each ends up, plus a randomised property test of `limits::Limits`
-- [x] Fault injection. Frozen plausible readings, a stuck switch, spurious ADC results, and, on the simulator, a dead ADC and a stuck switch
-- [x] Unhandled interrupts go to `hw::halt` instead of `reti`
-- [x] A commit stamp in flash, just before the CRC, shown by `flash` and `backup`
+- [ ] Fault injection on the AVR32DD20 simulator, a dead ADC and a stuck switch
+- [ ] Unhandled interrupts go to `hw::halt` instead of `reti`, across the AVR32DD20's 36 vectors
+- [ ] A commit stamp in flash, just before the CRC, at the end of 32 KB
+- [ ] The errata's lost write (DS80001026D §2.2.3) checked for every VPORT and `SLPCTRL.CTRLA` write, by the layout check or the simulator
 
 ## 3. It's nice to use
 
-- [x] A ramp, using PWM plus delta-sigma on TCA0 for a smooth low end, the way the stock firmware does it on this board. Firmware only, on this firmware's own curve
-- [x] The RGB aux LEDs on PC1 to PC3. Firmware only
-- ~~Remember the level in RAM~~ Struck. Every click on starts at level 52, and there's no turbo (docs/ui.md)
-- [x] A simpler UI. 1C on and off, 1H and 2H ramp, 3C lockout that never lights, and yellow or white on the aux for a flat cell or a fault. Firmware only
-- [x] A simulator. `cargo xtask hex` runs the firmware on a fake chip, and `cargo xtask simulate` runs the UI in a terminal. It finds mistakes and proves nothing
+- [ ] A ramp on the DAC, the paths and the two references, on this firmware's own curve
+- [ ] A TWI host driver for the AW2016, so the aux can show off, lockout and a flat cell
+- ~~Remember the level in RAM~~ Struck. Every click on starts at the same level (docs/ui.md)
+- [x] A simpler UI. 1C on and off, 1H and 2H ramp, 3C lockout that never lights. Library only
+- [ ] The simulator ported to a fake AVR32DD20, wired like the Lume X1-C
 - ~~Battery check~~ Struck. No magic flashes, so no 3C voltage blink (docs/ui.md)
 
 ## Maybe
 
-- Stop TCA0 while the light's off. It runs for good today, because a timer that stops and restarts is new turn-on behaviour nobody's checked, and what it'd save is small next to the idle after a watchdog feed. Worth a look once that idle has gone
+- Drive PD6 low as a port pin while off rather than keeping the DAC enabled at zero, which the stock firmware notes might save power. Only once someone knows what the amplifier does with each
