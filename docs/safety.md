@@ -103,7 +103,7 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Cause.** A press on the tail switch under pressure.
 
-**Mitigation.** The 3C lockout (docs/ui.md). In lockout `ui::Ui` never lights, and answers only to 3C. A hold from off does nothing either.
+**Mitigation.** The 3C lockout (docs/ui.md). In lockout `ui::Ui` never lights, and answers only to 3C. A hold from off does nothing either. Clicks count as they're let go when no more would mean anything (`ui::Ui::most_clicks`), but never in lockout, so four presses there are a 4C, which does nothing, rather than 3C to unlock and 1C to light.
 
 **Evidence.** Host tests in src/ui.rs and src/torch.rs, and the Lockout rows of docs/ui.md, on the host and on the simulator.
 
