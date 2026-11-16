@@ -92,9 +92,9 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "dac-live-before-pc1",
         file: HW,
-        find: "        out!(reg::VPORTC_OUT, 1 << ENABLE);\n        return;\n",
-        replace: "        write16(reg::DAC0_DATA, 1 << DAC_SHIFT);\n        \
-                  out!(reg::VPORTC_OUT, 1 << ENABLE);\n        return;\n",
+        find: "    just_before();\n    out!(reg::VPORTC_OUT, 1 << ENABLE);\n",
+        replace: "    just_before();\n    write16(reg::DAC0_DATA, 1 << DAC_SHIFT);\n    \
+                  out!(reg::VPORTC_OUT, 1 << ENABLE);\n",
         stage: Stage::Simulator,
         expect: "sets DAC0 to 1 with PC1 low",
     },
@@ -102,8 +102,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "pc1-down-with-dac-live",
         file: HW,
-        find: "    if !output.enable {\n        write16(reg::DAC0_DATA, 0);\n",
-        replace: "    if !output.enable {\n",
+        find: "pub fn output_off() {\n    write16(reg::DAC0_DATA, 0);\n",
+        replace: "pub fn output_off() {\n",
         stage: Stage::Simulator,
         expect: "drops PC1 with DAC0 still at",
     },
@@ -134,8 +134,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "paths-off-before-dac",
         file: HW,
-        find: "    if !output.enable {\n        write16(reg::DAC0_DATA, 0);\n",
-        replace: "    if !output.enable {\n        out!(reg::VPORTA_OUT, 0);\n        \
+        find: "pub fn output_off() {\n    write16(reg::DAC0_DATA, 0);\n",
+        replace: "pub fn output_off() {\n    out!(reg::VPORTA_OUT, 0);\n    \
                   write16(reg::DAC0_DATA, 0);\n",
         stage: Stage::Simulator,
         expect: "off with PC1 high and DAC0 at",

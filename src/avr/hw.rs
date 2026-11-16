@@ -713,32 +713,59 @@ const REFERENCE_SETTLES: u8 = 4;
 ///
 /// DAC0's output follows its high byte (section 34.5.2), and [`write16`]
 /// writes that second, so a code changes in one step.
+///
+/// The pin and DAC0 sequencing is in [`output_off`], [`output_start`] and
+/// [`output_level`], which examples/first_light.rs calls without TCB0. This
+/// adds TCB0, started just before PC1 rises and stopped once it's low.
 pub fn set_output(output: Output) {
     if !output.enable {
-        write16(reg::DAC0_DATA, 0);
-        write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
-        out!(reg::VPORTC_OUT, 0);
-        out!(reg::VPORTA_OUT, 0);
+        output_off();
         write(reg::TCB0_CTRLA, 0);
         write(reg::TCB0_INTCTRL, 0);
         return;
     }
 
     if !lit() {
-        write16(reg::DAC0_DATA, 0);
-        write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
-        out!(reg::VPORTA_OUT, 0);
-        // TCB0 from the start of a period, its flag cleared before its
-        // interrupt goes on, and GPR1 cleared of anything stale.
-        out!(reg::GPR_GPR1, 0);
-        write16(reg::TCB0_CNT, 0);
-        write(reg::TCB0_INTFLAGS, regs::TCB_CAPT);
-        write(reg::TCB0_INTCTRL, regs::TCB_CAPT);
-        write(reg::TCB0_CTRLA, regs::TCB_CLKSEL_DIV1 | regs::TCB_ENABLE);
-        out!(reg::VPORTC_OUT, 1 << ENABLE);
+        output_start(|| {
+            // TCB0 from the start of a period, its flag cleared before its
+            // interrupt goes on, and GPR1 cleared of anything stale.
+            out!(reg::GPR_GPR1, 0);
+            write16(reg::TCB0_CNT, 0);
+            write(reg::TCB0_INTFLAGS, regs::TCB_CAPT);
+            write(reg::TCB0_INTCTRL, regs::TCB_CAPT);
+            write(reg::TCB0_CTRLA, regs::TCB_CLKSEL_DIV1 | regs::TCB_ENABLE);
+        });
         return;
     }
 
+    output_level(output);
+}
+
+/// The driver off, in the stock firmware's order: DAC0 to 0, its reference
+/// to 1.024 V, PC1 low, then the paths low. [`set_output`]'s off.
+pub fn output_off() {
+    write16(reg::DAC0_DATA, 0);
+    write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+    out!(reg::VPORTC_OUT, 0);
+    out!(reg::VPORTA_OUT, 0);
+}
+
+/// The driver on and asked for nothing: DAC0 to 0 at 1.024 V and the paths
+/// low, then `just_before`, then PC1 high. Call it with PC1 low, and
+/// [`output_level`] no sooner than 8 ms after. [`set_output`] starts TCB0 in
+/// `just_before`; examples/first_light.rs passes nothing.
+pub fn output_start(just_before: impl FnOnce()) {
+    write16(reg::DAC0_DATA, 0);
+    write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+    out!(reg::VPORTA_OUT, 0);
+    just_before();
+    out!(reg::VPORTC_OUT, 1 << ENABLE);
+}
+
+/// A level for the driver with PC1 already high: DAC0 to 0 and the waits
+/// before a change of reference or paths, then the new code (see
+/// [`set_output`]).
+pub fn output_level(output: Output) {
     let reference = match output.vref {
         Vref::V1024 => regs::VREF_REFSEL_1V024,
         Vref::V2500 => regs::VREF_REFSEL_2V500,
