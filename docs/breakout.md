@@ -132,7 +132,7 @@ Short bursts at high levels, and the meter comes out at 3 A.
 
 | # | Status | Do | Expect | Closes |
 |---|---|---|---|---|
-| 5.1 | | 1C, then down to the bottom of the ramp, in the dark | The floor lights, steadily | That the floor holds on this light |
+| 5.1 | | 1C, then 1H to the top and 1H again to the bottom of the ramp, in the dark | The floor lights, steadily | That the floor holds on this light |
 | 5.2 | | Ramp slowly end to end, and through each change of path and reference | Smooth, no steps that jump, no flash where the path or the reference changes, each direction | That the path and reference changes are clean |
 | 5.3 | | T1 at a handful of DAC values on each path, tail current, stopping at 3 A | A table of current against path and DAC value. That's what this firmware's own curve stands on | "Measure what the DAC does" |
 | 5.4 | | Ear to the head at low and middle levels | Any whine, compared with 1.2 | |
