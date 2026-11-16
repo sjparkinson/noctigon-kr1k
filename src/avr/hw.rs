@@ -212,67 +212,18 @@ pub fn vddio2_ok() -> bool {
     read(reg::MVIO_STATUS) & regs::MVIO_VDDIO2S != 0
 }
 
+/// Sets the chip up for the firmware loop: [`init_pins`], then PD4's sense,
+/// TCB0, the ADC and the PIT, which are the timers and interrupts the loop
+/// runs on.
 pub fn init() {
-    // The internal high-frequency oscillator at 4 MHz, no prescaler, which is
-    // what reset leaves (sections 12.5.7 and 12.5.2). Written anyway, so a
-    // start that wasn't a reset still runs at the clock
-    // `watchdog::CLOCK_HZ` assumes. With no PWM on the main LED, nothing
-    // here needs more, and the main clock is specified to 24 MHz over the
-    // whole supply range (table 38-15), so a lower one buys no voltage
-    // margin, only current. AUTOTUNE stays off, since it tunes against a
-    // 32.768 kHz crystal (section 12.3.6) this board most likely doesn't
-    // have.
-    protected_write(reg::CLKCTRL_OSCHFCTRLA, regs::CLKCTRL_FRQSEL_4M);
-    protected_write(reg::CLKCTRL_MCLKCTRLB, 0);
+    init_pins();
 
-    // The pins, as `kr1k::board` names them.
-    //
-    // PA0 (the FET gate, not fitted), PA1, PC2, PC3, PD5 and PD7 are unused,
-    // so they get a pull-up and nothing floats, as the stock firmware has
-    // them. PA2 and PA3 are the AW2016's TWI lines, which have their own
-    // pull-ups if anything, and nothing here touches them.
-    //
-    // PC1 is the driver's enable, and never gets a pull-up, so it can't creep
-    // the driver on before it's an output. Its PINCTRL is written to 0 in
-    // case anything left one.
-    //
     // PD4 is the switch, which pulls against an external 100k pull-up, so
     // the internal one stays off. Both edges raise PORTD's interrupt, which
     // wakes the chip from power-down, since every pin on this chip senses
     // asynchronously (section 18.3.3.1). The input buffer stays on, so
     // VPORTD.IN still reads the pin.
-    //
-    // PD6 is DAC0's output, and its input buffer is off, as section 34.3.1
-    // asks.
-    pin_ctrl(reg::PORTA_PIN0CTRL, FET, regs::PORT_PULLUPEN);
-    pin_ctrl(reg::PORTA_PIN0CTRL, UNUSED_PA1, regs::PORT_PULLUPEN);
-    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);
-    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC2, regs::PORT_PULLUPEN);
-    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC3, regs::PORT_PULLUPEN);
     pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_BOTHEDGES);
-    pin_ctrl(reg::PORTD_PIN0CTRL, UNUSED_PD5, regs::PORT_PULLUPEN);
-    pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);
-    pin_ctrl(reg::PORTD_PIN0CTRL, POWER_BANK, regs::PORT_PULLUPEN);
-
-    // Everything the firmware drives comes up low: the paths off, the button
-    // LED off (the stock firmware's off for it is an output at 0), PC1 off,
-    // and PD6 at 0 under DAC0. PD6 is an output as the stock firmware has it,
-    // so if DAC0's buffer lets go of the pin in power-down (section 34.3.3),
-    // PORT holds it low. The datasheet doesn't say which drives the pad then,
-    // and it's unconfirmed. OUT before DIR, as for PC1. PORTA's OUT has 0 for
-    // PA0, PA2 and PA3 too, which are inputs and stay so.
-    out!(reg::VPORTA_OUT, 0);
-    out!(reg::VPORTA_DIR, PORTA_OUTPUTS);
-    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);
-    out!(reg::VPORTD_OUT, 0);
-    out!(reg::VPORTD_DIR, PORTD_OUTPUTS);
-
-    // DAC0 on, at 0, against 1.024 V, in section 34.3.1's order. It stays on
-    // from here, at 0 whenever the light's off, and power-down turns it off
-    // by itself.
-    write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
-    write16(reg::DAC0_DATA, 0);
-    write(reg::DAC0_CTRLA, regs::DAC_ENABLE | regs::DAC_OUTEN);
 
     // TCB0 in periodic interrupt mode, its reset mode, off the main clock,
     // for the tick deadline. `set_output` starts and stops it with the light.
@@ -301,6 +252,68 @@ pub fn init() {
     // write finishes syncing with the peripheral clock stopped. If it didn't,
     // there'd be no ticks, so see it through.
     while read(reg::RTC_PITSTATUS) & regs::RTC_CTRLBUSY != 0 {}
+}
+
+/// The clock, the pins and DAC0, with no timer and no interrupt. [`init`]
+/// starts with this, and examples/first_light.rs runs it alone.
+///
+/// PD4, the switch, is left as reset has it, its input buffer on, no
+/// pull-up and no sense, so it reads but raises nothing. [`init`] gives it
+/// its sense.
+pub fn init_pins() {
+    // The internal high-frequency oscillator at 4 MHz, no prescaler, which is
+    // what reset leaves (sections 12.5.7 and 12.5.2). Written anyway, so a
+    // start that wasn't a reset still runs at the clock
+    // `watchdog::CLOCK_HZ` assumes. With no PWM on the main LED, nothing
+    // here needs more, and the main clock is specified to 24 MHz over the
+    // whole supply range (table 38-15), so a lower one buys no voltage
+    // margin, only current. AUTOTUNE stays off, since it tunes against a
+    // 32.768 kHz crystal (section 12.3.6) this board most likely doesn't
+    // have.
+    protected_write(reg::CLKCTRL_OSCHFCTRLA, regs::CLKCTRL_FRQSEL_4M);
+    protected_write(reg::CLKCTRL_MCLKCTRLB, 0);
+
+    // The pins, as `kr1k::board` names them.
+    //
+    // PA0 (the FET gate, not fitted), PA1, PC2, PC3, PD5 and PD7 are unused,
+    // so they get a pull-up and nothing floats, as the stock firmware has
+    // them. PA2 and PA3 are the AW2016's TWI lines, which have their own
+    // pull-ups if anything, and nothing here touches them.
+    //
+    // PC1 is the driver's enable, and never gets a pull-up, so it can't creep
+    // the driver on before it's an output. Its PINCTRL is written to 0 in
+    // case anything left one.
+    //
+    // PD6 is DAC0's output, and its input buffer is off, as section 34.3.1
+    // asks.
+    pin_ctrl(reg::PORTA_PIN0CTRL, FET, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTA_PIN0CTRL, UNUSED_PA1, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);
+    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC2, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC3, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTD_PIN0CTRL, UNUSED_PD5, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);
+    pin_ctrl(reg::PORTD_PIN0CTRL, POWER_BANK, regs::PORT_PULLUPEN);
+
+    // Everything the firmware drives comes up low: the paths off, the button
+    // LED off (the stock firmware's off for it is an output at 0), PC1 off,
+    // and PD6 at 0 under DAC0. PD6 is an output as the stock firmware has it,
+    // so if DAC0's buffer lets go of the pin in power-down (section 34.3.3),
+    // PORT holds it low. The datasheet doesn't say which drives the pad then,
+    // and it's unconfirmed. OUT before DIR, as for PC1. PORTA's OUT has 0 for
+    // PA0, PA2 and PA3 too, which are inputs and stay so.
+    out!(reg::VPORTA_OUT, 0);
+    out!(reg::VPORTA_DIR, PORTA_OUTPUTS);
+    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);
+    out!(reg::VPORTD_OUT, 0);
+    out!(reg::VPORTD_DIR, PORTD_OUTPUTS);
+
+    // DAC0 on, at 0, against 1.024 V, in section 34.3.1's order. It stays on
+    // from here, at 0 whenever the light's off, and power-down turns it off
+    // by itself.
+    write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+    write16(reg::DAC0_DATA, 0);
+    write(reg::DAC0_CTRLA, regs::DAC_ENABLE | regs::DAC_OUTEN);
 }
 
 /// The bit in GPR0 that [`rtc_pit`] sets each tick. The GPRs sit in I/O
