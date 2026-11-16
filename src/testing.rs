@@ -53,27 +53,36 @@ use crate::temp::Calibration;
 use crate::thermal;
 use crate::torch::Torch;
 
-/// The most four accumulated 10-bit conversions can read.
-const FULL_SCALE: u16 = 4 * 1023;
+/// The most four accumulated 12-bit conversions can read.
+pub const FULL_SCALE: u16 = 4 * 4095;
 
 /// A temperature sensor calibration for tests and the simulated chip's
-/// signature row. Made up, but in the range real parts have, at about 0.55 K
-/// a count, so 25 °C reads 531 a conversion, 2124 over four.
+/// signature row.
+///
+/// It's the real one from the backup of this torch's
+/// signature row (backup/stock/prodsig.hex, `TEMPSENSE0` 0x03EE and
+/// `TEMPSENSE1` 0x0D24), at about a quarter of a kelvin a count, so 25 °C
+/// reads about 2151 a conversion, 8603 over four.
 pub const CALIBRATION: Calibration = Calibration {
-    offset: -10,
-    gain: 141,
+    offset: 0x0D24,
+    slope: 0x03EE,
 };
 
-/// The accumulated reading of AIN1 for a cell `battery::centivolts` reports
-/// as `cell`, the closest, saturating at four full-scale conversions.
+/// The accumulated reading of VDD / 10 for a cell `battery::centivolts`
+/// reports as `cell`, the closest, saturating at four full-scale conversions.
 pub fn voltage_reading(cell: u16) -> u16 {
     closest(cell, battery::centivolts)
 }
 
-/// The temperature sensor reading, four accumulated 10-bit conversions,
+/// The temperature sensor reading, four accumulated 12-bit conversions,
 /// closest to `kelvin` with [`CALIBRATION`].
+///
+/// The reading falls as the
+/// temperature rises, so this searches it backwards, and of two readings
+/// that are as close, the higher wins.
 pub fn temperature_reading(kelvin: u16) -> u16 {
-    closest(kelvin.saturating_mul(16), |raw| CALIBRATION.sixteenths(raw))
+    let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE - raw);
+    FULL_SCALE - closest(kelvin.saturating_mul(16), backwards)
 }
 
 /// The smallest raw reading whose `read` is closest to `target`. `read` never
@@ -131,8 +140,8 @@ impl Adc {
     /// 3.8 V and 25 °C with [`CALIBRATION`].
     pub const fn new() -> Self {
         Self {
-            voltage: 3516,
-            temperature: 2124,
+            voltage: 6140,
+            temperature: 8603,
             pending: None,
         }
     }
@@ -801,10 +810,10 @@ mod tests {
         let mut adc = Adc::new();
         assert_eq!(adc.result(), None);
         adc.start(convert(Channel::Temperature));
-        assert_eq!(adc.result(), Some(2124));
+        assert_eq!(adc.result(), Some(8603));
         assert_eq!(adc.result(), None);
         adc.start(convert(Channel::Voltage));
-        assert_eq!(adc.result(), Some(3516));
+        assert_eq!(adc.result(), Some(6140));
         adc.start(None);
         assert_eq!(adc.result(), None);
     }
@@ -814,21 +823,21 @@ mod tests {
         let mut adc = Adc::new();
         adc.start(convert(Channel::Voltage));
         adc.voltage = 7;
-        assert_eq!(adc.result(), Some(3516));
+        assert_eq!(adc.result(), Some(6140));
     }
 
     #[test]
     fn the_defaults_are_a_good_cell_at_room_temperature() {
         assert_eq!(battery::centivolts(Adc::new().voltage), 380);
         let room = crate::thermal::celsius(25);
-        assert_eq!(temperature_reading(room), 2124);
-        assert_eq!(CALIBRATION.sixteenths(2124), room * 16);
+        assert_eq!(temperature_reading(room), 8603);
+        assert_eq!(CALIBRATION.sixteenths(8603), room * 16);
     }
 
     #[test]
     fn a_stuck_adc_is_garbage_to_thermal_regulation() {
         use crate::thermal::plausible;
-        for raw in [0, 1, 7, 1023, FULL_SCALE] {
+        for raw in [0, 1, 7, 4095, FULL_SCALE] {
             assert!(!plausible(CALIBRATION.sixteenths(raw)), "{raw}");
         }
         assert!(plausible(CALIBRATION.sixteenths(Adc::new().temperature)));
@@ -841,7 +850,7 @@ mod tests {
         }
         for kelvin in [273, 298, 323, 343, 373] {
             let got = CALIBRATION.sixteenths(temperature_reading(kelvin));
-            // A count of the sum is a little over two sixteenths.
+            // A count of the sum is about a sixteenth.
             assert!(got.abs_diff(kelvin * 16) <= 2, "{kelvin} K reads as {got}");
         }
     }
@@ -864,11 +873,12 @@ mod tests {
                 "{cell} cV"
             );
         }
-        let sixteenths = |raw| CALIBRATION.sixteenths(raw);
-        for kelvin in 0..=sixteenths(FULL_SCALE) / 16 + 10 {
+        // Searched from the top down, so the highest reading wins a tie.
+        let backwards = |raw| CALIBRATION.sixteenths(FULL_SCALE - raw);
+        for kelvin in 0..=CALIBRATION.sixteenths(0) / 16 + 10 {
             assert_eq!(
                 temperature_reading(kelvin),
-                linear(kelvin * 16, sixteenths),
+                FULL_SCALE - linear(kelvin * 16, backwards),
                 "{kelvin} K"
             );
         }

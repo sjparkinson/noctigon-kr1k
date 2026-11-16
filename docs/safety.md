@@ -5,12 +5,13 @@ One section for every way identified so far that this torch could hurt someone o
 This repo started as firmware for a Wurkkos TS26 (ATtiny1616, MP3432 boost driver, PWM into the current control) and is being ported to the KR1K (AVR32DD20, Lume X1-C, a DAC into a current amplifier, three power paths). Nothing from this repo has run on a KR1K. The only contact with this torch so far is one avrdude read of its stock firmware and fuses through the pads, cell out, nothing written (2026-11-16, [hardware.md](hardware.md)). Much of the cover below is TS26 code that hasn't been ported yet. Where a section names code, it's the code as it stands, and the section says what has to change. Read each Status strictly.
 
 - **not yet** means the firmware doesn't do this on the AVR32DD20 yet, or does it only as TS26 code that hasn't been ported.
+- **code only** means the firmware for the AVR32DD20 does it and builds, and nothing has run it, not even the simulator.
 - **host tests** means the library logic is tested on the host, which is board-independent, but nothing built for the AVR32DD20 has run it, and its constants may still be the TS26's.
 - **simulator** means the firmware built for the AVR32DD20 has run it on the fake chip (`cargo xtask hex`). The simulator is one reading of the datasheet, run against code written from that same reading, so a pass finds mistakes and proves nothing. [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator) lists what it leaves out.
 - **bench** means it's been seen working on a real KR1K.
 - **measured** means a number from a real KR1K backs the constant.
 
-Nothing is past host tests today. Results from the TS26 and its breakout are in the repo's history, and none of them count here.
+Nothing is past the simulator today. Results from the TS26 and its breakout are in the repo's history, and none of them count here.
 
 ## Hazards
 
@@ -18,67 +19,67 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** PC1, the boost and amplifier enable, is a tri-stated input from every reset until firmware drives it (DS40002413B §18.3.1), for at least the `SUT` delay (0 ms on this torch's factory fuses, 64 ms in the stock source's). It's on the VDDIO2 supply, and the MVIO pins tri-state whenever that supply is missing (§5.1, §19.3.2.1), so if VDDIO2 sags or isn't what the board assumes, PC1 lets go mid-run. It could also be left high by a stray jump to the reset vector, or raised with the DAC still holding a current.
 
-**Mitigation.** Needed on the AVR32DD20, and not done yet. The first thing `main` does is clear PC1's `OUT` and then set its `DIR`, as `hw::hold_enable_low` does for the TS26's PB2 today. The DAC's data is zero and every path pin is low whenever PC1 rises. Turning off, and `hw::halt` (also the panic handler), end with PC1 low, the DAC at zero and every path low. The order those happen in is unconfirmed on this board (the stock firmware zeroes the DAC, then drops PC1, then the paths), so don't treat any order as the safe one yet. PC1 never gets a pull-up. The errata's lost-write problem (DS80001026D §2.2.3) means a VPORT write straight after a store to a higher address needs a `nop` or an `out`, or the write that drops PC1 can vanish.
+**Mitigation.** The first thing `main` does is `hw::hold_enable_low`, which clears PC1's `OUT` and then sets its `DIR`. `hw::set_output` only ever raises PC1 with DAC0 at 0 against 1.024 V and every path low, whatever it's asked for, and `torch::Torch` sends `ramp::Output::STARTING` (PC1 high, DAC 0, no path) for the first tick of every light, so the level comes 15.6 ms later. That's the stock firmware's order, PC1 then 8 ms then the current, done as a tick instead of a wait. Turning off, and `hw::halt` (also the panic handler and where an unhandled interrupt goes), follow the stock firmware's off order, DAC0 to 0, its reference to 1.024 V, PC1 low, then the paths low. That order is chosen because it's the only one known to have run on this board, not because anyone has shown it's the safest. PC1 never gets a pull-up, and `hw::init` writes its `PINCTRL` to 0. Every write to a VPORT goes through `out`, so the errata's lost write (DS80001026D §2.2.3) can't drop the write that lowers PC1. `main` reads `MVIO.STATUS.VDDIO2S` at power-on (§19.5.3), and VDDIO2 missing is a fault (`selftest::Faults::supply`), so a torch whose PC1 can't be driven never asks for light. It's only checked at power-on.
 
-**Evidence.** None on this chip. The TS26 code and its simulator tests cover PB2, a different pin on a different chip.
+**Evidence.** Host tests `the_driver_starts_with_the_dac_at_zero_for_a_tick_every_time` and `random_switching_and_readings_never_break_a_promise` (which checks every lit stretch starts with `STARTING`) in src/torch.rs, and `off_and_starting_ask_for_nothing` in src/ramp.rs. On the simulator (xtask/src/sim.rs), `found_lit` starts with PC1 already high, `vddio2_missing` runs with VDDIO2 gone, and every rise of PC1 is held to DAC0 at 0, its reference at 1.024 V and the paths low. The `dac-live-before-pc1`, `dir-before-out`, `pc1-pull-up` and `vddio2-ignored` breakages are refused. Nothing has run `hw.rs` on a real chip.
 
-**Status.** Not yet.
+**Status.** Simulator. It starts once with PC1 already high, and once with VDDIO2 missing, and holds every rise of PC1 to DAC0 at 0, its reference at 1.024 V and the paths low.
 
-**What's left.** Nobody knows what holds the enable low on this board through reset and `SUT`, or whether anything does. The stock firmware's comment says VDDIO2 "isn't connected", while the datasheet puts PC1 on VDDIO2, and both can't be the whole story ([hardware.md](hardware.md#the-boost-enable-pc1)). Until that's measured, how firmly PC1 holds anything is unknown. The stock firmware raises PC1 with the DAC at zero, waits 8 ms, then sets the current, which is the opposite order to the TS26 rule, and nobody has said which is safer here. The DAC can sink only 0.001 mA (DS40002413B table 38-23), so "DAC at zero" is only as low as the board pulls PD6.
+**What's left.** Nobody knows what holds the enable low on this board through reset and `SUT`, or whether anything does. The stock firmware's comment says VDDIO2 "isn't connected", while the datasheet puts PC1 on VDDIO2, and both can't be the whole story ([hardware.md](hardware.md#the-boost-enable-pc1)). Until that's measured, how firmly PC1 holds anything is unknown. The firmware follows the stock firmware's order, PC1 with the DAC at zero, then the current a tick later, which is the opposite of the TS26 rule, and nobody has said which is safer here. VDDIO2 sagging mid-run, after the power-on check, isn't watched. The DAC can sink only 0.001 mA (DS40002413B table 38-23), so "DAC at zero" is only as low as the board pulls PD6.
 
 ### H2. A current setpoint that's wrong or left behind
 
 **Cause.** The LED current comes from DAC0 on PD6 into an amplifier, not from TCA0's PWM and delta-sigma as on the TS26. A DAC value left non-zero when the light goes off, a reference switched to 2.5 V when 1.024 V was meant (about 2.4 times the current for the same data), a value written with only the low byte (the output only changes when the high byte lands, §34.5.2), or PD6's input buffer left on.
 
-**Mitigation.** Needed and not done yet. Turning off zeroes the DAC data and sets the reference back to 1.024 V, alongside dropping PC1 and the paths (H1, order unconfirmed). The ramp has a ceiling well below full output (`ramp::CEILING` holds the TS26 at level 120 of 150), and this firmware's curve is its own. PD6's input buffer is off, as §34.3.1 asks.
+**Mitigation.** Turning off zeroes the DAC data and sets the reference back to 1.024 V, before PC1 drops (H1). `hw::write16` writes the DAC's low byte then its high byte, so a code lands whole. A change of reference or path goes through a DAC code of 0 (H3). The ramp is this firmware's own cubic, from the moon path at code 100 against 1.024 V up to the stock firmware's top on this torch's 32 W build (high path, code 716 against 2.5 V, 70 % of full scale), so nothing in the table can ask for more than stock does. `ramp::CEILING` holds the light at level 120 of 150, about half of that top. PD6's input buffer is off, as §34.3.1 asks.
 
-**Evidence.** None. `src/ramp.rs` still describes PWM and delta-sigma.
+**Evidence.** Host tests in src/ramp.rs, among them `every_level_asks_for_more_current_than_the_last`, `the_ceiling_is_about_half_the_stock_firmwares_top` and `the_top_is_the_stock_firmwares_and_under_full_scale`. They test a model of the current, DAC code times reference times an estimated path gain. The simulator checks DAC0, its reference and the paths against the library's output on every tick, and refuses DAC0 above 0 within 8 ms of PC1 rising and PC1 dropping with DAC0 live (the `dac-before-the-boost-starts` and `pc1-down-with-dac-live` breakages).
 
-**Status.** Not yet.
+**Status.** Simulator, for the order of every change and that the driver shows the library's output on every tick. Nothing about what current comes out.
 
-**What's left.** Nobody knows what current any DAC value gives on this board, on any path, at either reference. The internal references are ±4 % and only specified with VDD at 2.5 V or 2.7 V and up (table 38-18), and VDD is the cell. What the amplifier does with PD6 floating in power-down, where the DAC is off (§34.3.3), is unknown.
+**What's left.** Nobody knows what current any DAC value gives on this board, on any path, at either reference. The path gains (`ramp::LOW_GAIN`, `ramp::HIGH_GAIN`) are estimates from where the stock firmware changes path, and the levels just above a path change sit at DAC codes under 0x030, where the DAC's linearity isn't specified and its ±5-code offset is a big share (table 38-23). The internal references are ±4 % and only specified with VDD at 2.5 V or 2.7 V and up (table 38-18), and VDD is the cell. What the amplifier does with PD6 floating in power-down, where the DAC is off (§34.3.3), is unknown.
 
 ### H3. The power paths
 
 **Cause.** Three path pins, PA7, PA6 and PA5, pick sense resistors, and the stock firmware raises more of them for more current. A path pin left high, a high path raised with a DAC value meant for a low one, or any path high while PC1 is off, with effects nobody knows.
 
-**Mitigation.** Needed and not done yet. Every path is low whenever the light's off, at reset (they're tri-stated, so that depends on the board) and in `hw::halt`. A level sets its path and its DAC value together, and the change between paths goes through zero current, or through an order someone has reasoned through against the datasheet.
+**Mitigation.** Every path is low whenever the light's off, in `hw::halt`, and from `hw::init` on (at reset they're tri-stated, so before that it depends on the board). When a level change moves the path or the reference, `hw::set_output` writes DAC0 to 0 first, then the reference, waits 3 µs for it to settle (2 µs in table 38-18), then the paths, then the new code. It waits about 20 µs after the DAC goes to 0 before touching the reference or the paths, against 7 µs typical settling (table 38-23). A new path, or a higher reference, with the old code still in the DAC could ask for a hundred times the current for a moment, and this order is meant never to ask for more than the old or the new level. That rests on PD6 really reaching 0 in the wait, and the DAC can only sink 0.001 mA, so how fast it falls depends on the board, which nobody's measured. A change within one path and reference only writes the code. PA0, the FET gate that isn't fitted, is an input with a pull-up and is never driven.
 
-**Evidence.** None.
+**Evidence.** Reading of `hw::set_output`, and the simulator, which refuses any change of reference or path with PC1 high and DAC0 live, and a raised reference or added path within 10 µs of DAC0 reaching 0 (the `path-change-with-dac-live`, `paths-off-before-dac` and `dac-fall-not-waited` breakages). Nothing has run it on a real chip.
 
-**Status.** Not yet.
+**Status.** Simulator, for the order. With PC1 high, a path or the reference only changes with DAC0 at 0, and only goes up once DAC0 has had 10 µs to get there, table 38-23's settling time, which is a floor and not this board's.
 
-**What's left.** How the paths combine, whether they're FETs at all, and what a path does with the boost off are all unknown ([hardware.md](hardware.md#the-power-paths)). The first-light image should use one path and one low DAC value.
+**What's left.** How the paths combine, whether they're FETs at all, and what a path does with the boost off are all unknown ([hardware.md](hardware.md#the-power-paths)). The first-light image should use one path and one low DAC value. The light goes dark for the few microseconds of each change of path, which nobody's seen, and what the amplifier and boost do across that gap is unknown.
 
 ### H4. A hang with the light on
 
 **Cause.** The loop stops, so PC1 stays high and the DAC keeps its value.
 
-**Mitigation.** `hw::start_watchdog` sets a 32-clock window and `watchdog::Feeder` says which passes feed it. A tick that stops while the light's on has its own deadline, `watchdog::TICK_DEADLINE_CYCLES`, after which `main` calls `hw::halt`. The next boot after a bite is a fault and won't light (`selftest::hung`). All of it is TS26 code. The deadline counts TCA0's PWM cycles, which the KR1K doesn't have, so it needs another clock to count, and `watchdog::CLOCK_HZ` is the TS26's 10 MHz, not the 12 MHz the stock firmware runs the AVR32DD20 at.
+**Mitigation.** `hw::start_watchdog` sets a 32-clock window and `watchdog::Feeder` says which passes feed it. A tick that stops while the light's on has its own deadline. TCB0 runs off the 4 MHz main clock in periodic interrupt mode while PC1 is high, flagging every 1 ms (`watchdog::TIMER_PERIOD_CLOCKS`), and `hw::wait_for_tick` counts those flags, not wake-ups, so a bouncing switch can't use it up. After `watchdog::TICK_DEADLINE_PERIODS` (104) with no tick, 103 to 104 ms, `main` calls `hw::halt`, which turns the light off and powers down for good. The next boot after a bite is a fault and won't light (`selftest::hung`).
 
-**Evidence.** Host tests in src/watchdog.rs for the feeding pattern and the window.
+**Evidence.** Host tests in src/watchdog.rs for the feeding pattern, the window and the deadline's sums. On the simulator, `oscillator_stops` and `slow_ticks` in xtask/src/sim.rs, and the `no-tick-deadline`, `watchdog-never-fed` and `watchdog-fed-every-tick` breakages.
 
-**Status.** Host tests, for the logic only.
+**Status.** Simulator. It stops the 32 kHz oscillator with the light on, and PC1 has to drop within the deadline and the chip stop in power-down. It also runs every tick as slow as the oscillators' limits allow, which mustn't trip it.
 
-**What's left.** Porting the deadline to a clock this board has, then the simulator, then a bench test. Since a bite is a fault, a spurious one leaves the torch dark until a cell swap.
+**What's left.** A bench test. The sums that let the watchdog bite before the deadline use the ATtiny1616's 30 % for the 32 kHz oscillator, since DS40002413B gives it no accuracy at all, and the main oscillator's 5 % (figure 38-2). Since a bite is a fault, a spurious one leaves the torch dark until a cell swap.
 
 ### H5. Over-discharge of an unprotected 21700 at high current
 
 **Cause.** The cell is unprotected, and the listing asks for one rated at 15 A or more. A 6 V, 6 A boost output from a single cell pulls well over 10 A from it near turbo (arithmetic before losses, so likely), more as the cell falls.
 
-**Mitigation.** `battery::Protection` steps the ceiling down below `battery::STEP_DOWN_BELOW` (3.00 V) and fades it down and off below `battery::OFF_BELOW` (2.90 V). Turning off for a flat cell latches until a reading with the light off is `battery::CHARGED_AT` (3.60 V) or more. A cell it can't read is a fault (H15). The thresholds are board-independent, but the reading isn't. `battery::SLOPE` is the TS26's divider calibration (1094). The KR1K reads VDD itself through the ADC's VDDDIV10 input against 1.024 V (DS40002413B §33.5.7), with the stock firmware's slope of 1014, and nothing in this repo does that yet.
+**Mitigation.** `battery::Protection` steps the ceiling down below `battery::STEP_DOWN_BELOW` (3.00 V) and fades it down and off below `battery::OFF_BELOW` (2.90 V). Turning off for a flat cell latches until a reading with the light off is `battery::CHARGED_AT` (3.60 V) or more. A cell it can't read is a fault (H15). The reading is VDD, which is the cell, through the ADC's VDDDIV10 input against 1.024 V (DS40002413B §33.5.7), four 12-bit conversions accumulated, with the stock firmware's slope of 1014 (`battery::SLOPE`), so a sixteenth of the raw sum less about 1 %. `battery::centivolts` does that with two 16-bit products, no 32-bit multiply.
 
-**Evidence.** Host tests in src/battery.rs, src/limits.rs and src/torch.rs, and the docs/ui.md rows with a cell voltage.
+**Evidence.** Host tests in src/battery.rs, among them `matches_the_formula_for_every_reading_the_adc_can_give`, and in src/limits.rs and src/torch.rs, and the docs/ui.md rows with a cell voltage, which run on the simulator too, with the ADC's VDD / 10 reading scripted.
 
-**Status.** Host tests, for the logic only.
+**Status.** Host tests for the logic, simulator for the reading, which is scripted.
 
-**What's left.** Porting the reading. Every threshold is unmeasured on this torch. The ramp's ceiling stays low until someone knows what the top of it draws.
+**What's left.** Every threshold is unmeasured on this torch. The 1.024 V reference is ±4 % (table 38-18), worth 0.12 V at 3 V, which is more than the 1014 corrects for. Read 4 % low, the light cuts out early. Read 4 % high, it steps down at about 2.9 V real and cuts out at about 2.8. The ramp's ceiling stays low until someone knows what the top of it draws.
 
 ### H6. The MCU browning out with the cell
 
 **Cause.** VDD is the cell, through a reverse-polarity FET and no regulator ([hardware.md](hardware.md#power-and-the-battery-reading)). A cell sagging under load pulls the MCU's supply down with it. With the BOD on, the chip resets below its level (1.9 V to 2.85 V typical, table 38-16). On this torch the BOD is off. Its fuses read factory defaults, `BODCFG` 0 and `SUT` 0 ms (confirmed on this torch, 2026-11-16), and the stock source's BOD-on and 64 ms settings were never programmed. So a sagging cell browns the MCU out with no reset at all, and the CPU can keep running below the voltage its clock needs until POR at about 1.6 V (table 38-4), with PC1 high and the DAC holding a current. Code running out of its voltage range might do anything, including drive PC1. When POR does trip, PC1 tri-states (H1), and a cell that recovers and sags again could pulse the light.
 
-**Mitigation.** None in firmware yet. The firmware can't turn the BOD on, since that's a fuse and nothing here writes fuses. The BOD's level and mode can't be changed from software either, so low-voltage protection (H5) is the only cover, and it's meant to stop the cell getting near that low with the light on. Running the clock slower than the stock firmware's 12 MHz would widen the margin, and nobody has worked out by how much.
+**Mitigation.** None in firmware beyond H5. With the BOD off and VDD being the cell, a sagging cell browns the MCU out with no reset to catch it. The firmware can't turn the BOD on, since that's a fuse and nothing here writes fuses, and `selftest::Fuses::ok` doesn't ask for it, since this torch has it off. The BOD's level and mode can't be changed from software either, so low-voltage protection (H5) is the only cover, and it's meant to stop the cell getting near that low with the light on. The main clock is 4 MHz, a third of the stock firmware's 12, which costs less current. The datasheet specifies the main clock to 24 MHz across the whole 1.8 to 5.5 V range (table 38-15), so the slower clock buys no specified voltage margin, and below 1.8 V nothing is specified at all.
 
 **Evidence.** The fuse read is the evidence that the hazard is live on this torch. Nothing covers it.
 
@@ -90,13 +91,13 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** A lit light in still air, or a head that's covered.
 
-**Mitigation.** `thermal::Thermal` steps the ceiling down towards `thermal::FLOOR` as the temperature passes `thermal::LIMIT` (50 °C at the sensor). `ramp::CEILING` holds the light well below full output until that's been checked on a real head. The sensor's calibration on this chip comes from `SIGROW.TEMPSENSE0` and `TEMPSENSE1`, read against the 2.048 V reference, and the port has to do that.
+**Mitigation.** `thermal::Thermal` steps the ceiling down towards `thermal::FLOOR` as the temperature passes `thermal::LIMIT` (50 °C at the sensor). `ramp::CEILING` holds the light well below full output until that's been checked on a real head. The sensor reads against the 2.048 V reference with its factory calibration from `SIGROW.TEMPSENSE0` and `TEMPSENSE1` (§33.3.3.8). `temp::sixteenths` does the datasheet's formula exactly on four accumulated conversions, building the 32-bit product from 8-by-8 multiplies. This torch's calibration, from the backup, is a slope of 0x03EE and an offset of 0x0D24, and the host tests use those.
 
-**Evidence.** Host tests in src/thermal.rs and src/limits.rs, and docs/ui.md's rows with a temperature.
+**Evidence.** Host tests in src/thermal.rs and src/limits.rs, and docs/ui.md's rows with a temperature, which run on the simulator too, with the sensor's reading scripted.
 
-**Status.** Host tests, for the logic only.
+**Status.** Host tests for the logic, simulator for the reading, which is scripted.
 
-**What's left.** Porting the reading. Every constant is unmeasured on this head, and the levels the floor and ceiling name don't mean the same current on a DAC curve as they did on the TS26.
+**What's left.** Every constant is unmeasured on this head, and the levels the floor and ceiling name don't mean the same current on a DAC curve as they did on the TS26. Thermal's floor, level 50, is about 3.5 % of the ramp's top.
 
 ### H8. Lit in a pocket or a bag
 
@@ -104,9 +105,9 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Mitigation.** The 3C lockout (docs/ui.md). In lockout `ui::Ui` never lights, and answers only to 3C. A hold from off does nothing either.
 
-**Evidence.** Host tests in src/ui.rs and src/torch.rs, and the Lockout rows of docs/ui.md.
+**Evidence.** Host tests in src/ui.rs and src/torch.rs, and the Lockout rows of docs/ui.md, on the host and on the simulator.
 
-**Status.** Host tests.
+**Status.** Simulator.
 
 **What's left.** Nothing limits how long a lit light stays lit. Lockout lives in RAM, so a cell swap drops back to off, unlocked. Nobody has tried this tail switch's feel. The aux that shows lockout on the TS26 is the AW2016 here, which this firmware doesn't drive yet (H13), so a locked torch shows nothing.
 
@@ -114,23 +115,23 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** An interrupted or bad flash, or a bit that's flipped.
 
-**Mitigation.** `hw::flash_ok` runs CRCSCAN over all of flash at power-on, and a failure is a fault. The AVR32DD20 has CRCSCAN (DS40002413B chapter 30) over 32 KB, where the TS26 had 16 KB, so the image size, the CRC's place and `xtask/src/crc.rs` all need porting. `flash` refuses a full image whose CRC doesn't check.
+**Mitigation.** `hw::flash_ok` runs CRCSCAN over all of flash at power-on, and a failure is a fault. The AVR32DD20 has CRCSCAN (DS40002413B chapter 30) over 32 KB, and `cargo xtask hex` signs the full 32 KB image. `flash` refuses a full image whose CRC doesn't check.
 
-**Evidence.** Host tests in xtask/src/crc.rs, for the TS26's image size.
+**Evidence.** Host tests in xtask/src/crc.rs, and the simulator, which runs CRCSCAN over the signed image and docs/ui.md's `flash:corrupt` rows over one with a byte changed.
 
-**Status.** Not yet.
+**Status.** Simulator, which runs CRCSCAN over the signed image and over one with a byte changed.
 
-**What's left.** Porting, then the simulator. The scan has never met a real AVR32DD20.
+**What's left.** The scan has never met a real AVR32DD20.
 
 ### H10. Wrong fuses
 
 **Cause.** A torch whose fuses the firmware's timing or its own protection don't expect.
 
-**Mitigation.** `selftest::Fuses::ok` checks fuse fields, with `hw::fuses` only ever reading them. Nothing in this repo writes a fuse. The fields are the tinyAVR's. The AVR32DD20's are `WDTCFG`, `BODCFG`, `OSCCFG.CLKSEL`, `SYSCFG0` (with `UPDIPINCFG`), `SYSCFG1` (`MVSYSCFG` and `SUT`), `CODESIZE` and `BOOTSIZE` (DS40002413B §8.8), so the check needs rewriting against them and against a real board's bytes. This torch's read `00 00 00 FF FF D0 08 00 00` (factory defaults, BOD off, `SUT` 0 ms, dual supply), so a check written to the stock source's fuses would fail it.
+**Mitigation.** `selftest::Fuses::ok` checks the AVR32DD20's fields (DS40002413B §8.8): `WDTCFG` 0, `OSCCFG.CLKSEL` the internal oscillator, `SYSCFG0.UPDIPINCFG` UPDI and `CRCSEL` CRC-16, `SYSCFG1.MVSYSCFG` dual or single, and `CODESIZE` and `BOOTSIZE` 0. `BODCFG` and `SUT` aren't checked. `hw::fuses` only ever reads them, and nothing in this repo writes a fuse. This torch's read `00 00 00 FF FF D0 08 00 00` (factory defaults, BOD off, `SUT` 0 ms, dual supply), and they pass.
 
-**Evidence.** The one fuse read from this torch, which nothing has checked against code yet.
+**Evidence.** `this_torchs_fuses_pass`, `checks_fields_not_whole_bytes` and `each_wrong_field_fails` in src/selftest.rs, against the bytes from the 2026-11-16 backup, and docs/ui.md's `fault` rows on the simulator, whose fuses are those bytes.
 
-**Status.** Not yet.
+**Status.** Simulator, with this torch's fuses and with one that fails the read-back.
 
 **What's left.** Whether other KR1Ks match this one's factory defaults. A bad fuse is the one permanent thing in this log, which is why nothing here writes one.
 
@@ -174,23 +175,23 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** An interrupt that something enables by mistake, or whose flag was already up, with a vector that does nothing.
 
-**Mitigation.** `__unhandled_interrupt` in src/avr/rt.rs jumps into `hw::halt`, and `cargo xtask hex` checks the vector table (`vectors` in xtask/src/layout.rs). The AVR32DD20 has 36 vectors, with the PIT at 6, so the table and its check need porting.
+**Mitigation.** `__unhandled_interrupt` in src/avr/rt.rs jumps into `hw::halt`, and `cargo xtask hex` checks the vector table (`vectors` in xtask/src/layout.rs). The AVR32DD20's table has 36 vectors, three of them handled, the PIT (6), TCB0 (14) and PORTD (24). Only those three are ever enabled. TCB0's only while PC1 is high, with its flag cleared before its interrupt goes on. `hw::halt` turns all three off.
 
-**Evidence.** Host tests in xtask/src/layout.rs, for the TS26's vector table.
+**Evidence.** The simulator runs all three handlers, with a switch bounce and a TCB0 period landing on every new instruction, and `unhandled_interrupt` in xtask/src/sim.rs forces one with no handler. The `halt-without-cli` and `halt-leaves-the-light-on` breakages are refused.
 
-**Status.** Not yet.
+**Status.** Simulator. A forced interrupt with no handler, with the light on, has to end in `hw::halt` with the light off and the chip asleep in power-down.
 
-**What's left.** Porting. A pending interrupt that can't be taken, and whether it wakes `halt`'s sleep, is as unknown here as it was on the TS26.
+**What's left.** A pending interrupt that can't be taken, and whether it wakes `halt`'s sleep, is as unknown here as it was on the TS26.
 
 ### H15. A dead or garbage ADC
 
 **Cause.** A broken ADC, a reading from a rest, or, here, a VDD reading taken while the boost converter pulls the cell down.
 
-**Mitigation.** `battery::plausible` (1.00 to 4.40 V) and `thermal::plausible` reject readings that can't be real, and a run of garbage voltages is a fault. The logic is board-independent. The reading isn't ported (H5).
+**Mitigation.** `battery::plausible` (1.00 to 4.40 V) and `thermal::plausible` reject readings that can't be real, and a run of garbage voltages is a fault. The logic is board-independent, and the readings are ported (H5, H7). A temperature sum that would mean a die below absolute zero, or one past `u16::MAX` sixteenths, saturates rather than wrapping.
 
-**Evidence.** Host tests in src/battery.rs, src/thermal.rs, src/limits.rs and src/torch.rs.
+**Evidence.** Host tests in src/battery.rs, src/thermal.rs, src/limits.rs and src/torch.rs, and `adc_never_answers` on the simulator.
 
-**Status.** Host tests, for the logic only.
+**Status.** Simulator, with an ADC that never finishes a conversion.
 
 **What's left.** A reading that's plausible and frozen isn't detected. VDDDIV10 against a ±4 % reference (table 38-18) puts 4.40 V well inside the ADC's range, unlike the TS26's divider, but nobody has compared a reading with a multimeter.
 
@@ -200,11 +201,11 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Mitigation.** `hw::halt` is the panic handler, and `cargo xtask hex` refuses an image that links any panic machinery (`no_panics` in xtask/src/layout.rs). That check is about symbol names, not the chip, so it carries over.
 
-**Evidence.** Host tests in xtask/src/layout.rs, and the clippy restriction lints on the library.
+**Evidence.** Host tests in xtask/src/layout.rs, the clippy restriction lints on the library, and the `bounds-check` breakage, refused on the AVR32DD20 build.
 
-**Status.** Host tests.
+**Status.** Simulator. `cargo xtask hex` refuses an AVR32DD20 image with panic machinery linked, and `cargo xtask breakages` shows it does.
 
-**What's left.** Re-proving the check on the AVR32DD20 build and on every nightly bump (CONTRIBUTING.md).
+**What's left.** Re-proving the check on every nightly bump (CONTRIBUTING.md).
 
 ### H17. A stuck switch
 
@@ -212,9 +213,9 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Mitigation.** The UI's holds are bounded. From off a hold lights the floor and nothing more, and with the light on a hold ramps up and stops at `ramp::CEILING`, under both ceilings (H5, H7).
 
-**Evidence.** Host tests in src/ui.rs and src/torch.rs.
+**Evidence.** Host tests in src/ui.rs and src/torch.rs, and `switch_stuck` on the simulator.
 
-**Status.** Host tests.
+**Status.** Simulator, with the switch held from power-on.
 
 **What's left.** A stuck switch keeps the light on at the level it reached. A tail switch on a 100 kΩ external pull-up (PD4) bounces in ways nobody has measured.
 
@@ -222,13 +223,13 @@ Nothing is past host tests today. Results from the TS26 and its breakout are in 
 
 **Cause.** A wrong `OSCCFG.CLKSEL`, or a clock set-up that isn't the one the firmware's sums assume.
 
-**Mitigation.** Not ported. The TS26 code sets a 10 MHz clock from a 20 MHz oscillator. The AVR32DD20's internal oscillator is set by `CLKCTRL.OSCHFCTRLA` behind the protected-write sequence, and the stock firmware runs it at 12 MHz. Its `AUTOTUNE` wants an external 32 kHz crystal (§12.3.6), which this board likely doesn't have, so this firmware has no reason to set it.
+**Mitigation.** `hw::init` writes `CLKCTRL.OSCHFCTRLA` to 4 MHz and `MCLKCTRLB` to no prescaler, both behind the protected-write sequence, which is also what reset leaves (§12.5.7, §12.5.2). `watchdog::CLOCK_HZ` is that clock, and the tick deadline and the ADC's timing start from it. `AUTOTUNE` stays off, since it wants an external 32 kHz crystal (§12.3.6), which this board likely doesn't have. `selftest::Fuses::ok` checks `OSCCFG.CLKSEL` is the internal high-frequency oscillator.
 
-**Evidence.** None.
+**Evidence.** `each_wrong_field_fails` in src/selftest.rs for `CLKSEL`, and `clocked_as_modelled` in xtask/src/sim.rs.
 
-**Status.** Not yet.
+**Status.** Simulator, which refuses any clock but the internal oscillator at 4 MHz, undivided.
 
-**What's left.** Porting, and a fuse check for `CLKSEL`.
+**What's left.** A real chip. The simulator only shows the firmware asks for the clock it models.
 
 ## What's left
 
@@ -236,6 +237,6 @@ This is true of every hazard, so it's kept out of the sections above.
 
 - **Nothing from this repo has met a KR1K.** Apart from one avrdude read of the stock torch, every result in the repo's history is from a TS26 or its breakout, on another chip and another driver.
 - **Every threshold is unmeasured.** The cell's cut-offs, the temperature limit, the ramp's ceiling, the 3.60 V that clears a flat cell and the deadlines are from the stock firmware, the datasheet or the project's own judgement.
-- **The simulator's limits** are in [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator). It has no chip resets and models nothing analogue, so the driver, the cell and the head are all scripted, and until it's ported it models the wrong chip.
+- **The simulator's limits** are in [CONTRIBUTING.md](../CONTRIBUTING.md#the-simulator). It has no chip resets and models nothing analogue, so the driver, the cell and the head are all scripted.
 - **There's no run-time limit.** A lit light with a good cell and a cool head stays lit, whatever pressed the switch.
 - **[breakout.md](breakout.md) is what would move hazards to bench.** Stage 3's first-light run is the gate for H1, H2, H3, H11 and H12. Until a hazard has a result there, it stays where it is.

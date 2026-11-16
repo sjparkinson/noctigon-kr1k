@@ -1,105 +1,110 @@
-//! The TS26 driver's pin map, as bit numbers within each port. docs/hardware.md
-//! has where each one comes from.
+//! The KR1K's Lume X1-C driver pin map, as bit numbers within each port.
+//! It's what the stock firmware's board definition says, and nobody has
+//! traced it on a real board yet.
 //!
 //! These are board facts, not registers. `src/avr/hw.rs` drives the pins
 //! through `src/regs.rs`, and xtask's simulator wires its fake chip up the
 //! same way from here.
 //!
-//! | Pin     | Job                                          |
-//! |---------|----------------------------------------------|
-//! | PA0     | UPDI, left alone                             |
-//! | PA1     | Battery divider (AIN1)                       |
-//! | PA5     | Side switch, active low, pulled up           |
-//! | PB0     | Main LED PWM, TCA0 WO0                       |
-//! | PB2     | Boost converter (MP3432) enable, high is on  |
-//! | PC1-PC3 | Aux LEDs, blue, green, red                   |
+//! | Pin           | Job                                                    |
+//! |---------------|--------------------------------------------------------|
+//! | PA0           | FET gate (TCA0 WO0), not fitted on this driver, unused |
+//! | PA1           | Unused                                                 |
+//! | PA2           | TWI0 SDA to the AW2016 aux driver                      |
+//! | PA3           | TWI0 SCL to the AW2016 aux driver                      |
+//! | PA4           | Button LED, plain GPIO                                 |
+//! | PA5           | Power path 3, high range                               |
+//! | PA6           | Power path 2, low range                                |
+//! | PA7           | Power path 1, moon range                               |
+//! | PC1           | Boost and amplifier enable, high is on                 |
+//! | PC2, PC3      | Unused                                                 |
+//! | PD4           | E-switch, active low, external 100k pull-up            |
+//! | PD5           | Unused                                                 |
+//! | PD6           | DAC0 out, the current setpoint                         |
+//! | PD7           | Power-bank enable on other boards, unused              |
+//! | PF6           | Reset pin, left alone                                  |
+//! | PF7           | UPDI, left alone                                       |
+//!
+//! The RGB aux LEDs hang off the AW2016, an I2C LED driver, so no MCU pin
+//! lights a colour. `ui::Aux` still says which colour the library wants, and
+//! turning that into AW2016 channel writes is a job for a TWI driver that
+//! doesn't exist yet. Until then the aux stays dark.
 
-use crate::ui::Aux;
-
-/// PA0.
-pub const UPDI: u8 = 0;
+/// PA0, the FET gate on drivers that have a FET. Unused here.
+pub const FET: u8 = 0;
 /// PA1.
-pub const BATTERY: u8 = 1;
-/// PA5.
-pub const SWITCH: u8 = 5;
-/// PB0.
-pub const PWM: u8 = 0;
-/// PB2, the dangerous one, which is low whenever the light's off.
-pub const ENABLE: u8 = 2;
-/// PC1.
-pub const AUX_BLUE: u8 = 1;
+pub const UNUSED_PA1: u8 = 1;
+/// PA2, TWI0 SDA.
+pub const TWI_SDA: u8 = 2;
+/// PA3, TWI0 SCL.
+pub const TWI_SCL: u8 = 3;
+/// PA4, the LED behind the switch.
+pub const BUTTON_LED: u8 = 4;
+/// PA5, power path 3, the high range.
+pub const PATH3: u8 = 5;
+/// PA6, power path 2, the low range.
+pub const PATH2: u8 = 6;
+/// PA7, power path 1, the moon range.
+pub const PATH1: u8 = 7;
+/// All three power paths, as a PORTA mask.
+pub const PATHS: u8 = 1 << PATH1 | 1 << PATH2 | 1 << PATH3;
+
+/// PC1, the dangerous one, which is low whenever the light's off.
+pub const ENABLE: u8 = 1;
 /// PC2.
-pub const AUX_GREEN: u8 = 2;
+pub const UNUSED_PC2: u8 = 2;
 /// PC3.
-pub const AUX_RED: u8 = 3;
-/// All three aux pins, as a PORTC mask.
-pub const AUX_PINS: u8 = 1 << AUX_BLUE | 1 << AUX_GREEN | 1 << AUX_RED;
+pub const UNUSED_PC3: u8 = 3;
 
-/// Each aux pin as its PORTC bit number and mask, in blue, green, red order.
-/// `PINnCTRL` is indexed by the bit number, and `DIR` and `OUT` by the mask.
-pub const AUX: [(u8, u8); 3] = [
-    (AUX_BLUE, 1 << AUX_BLUE),
-    (AUX_GREEN, 1 << AUX_GREEN),
-    (AUX_RED, 1 << AUX_RED),
-];
+/// PD4, the e-switch.
+pub const SWITCH: u8 = 4;
+/// PD5.
+pub const UNUSED_PD5: u8 = 5;
+/// PD6, DAC0's output.
+pub const DAC: u8 = 6;
+/// PD7, a power-bank enable on other boards.
+pub const POWER_BANK: u8 = 7;
 
-/// The PORTC pins that light `colour`, as a mask, or 0 for none.
-pub const fn aux_pin(colour: Aux) -> u8 {
-    match colour {
-        Aux::Off => 0,
-        Aux::Blue => 1 << AUX_BLUE,
-        Aux::Red => 1 << AUX_RED,
-        Aux::Yellow => 1 << AUX_RED | 1 << AUX_GREEN,
-        Aux::White => AUX_PINS,
-    }
-}
-
-/// The pins of [`aux_pin`] that `colour` lights brightly, as a mask. The rest
-/// of them glow dimly.
-pub const fn aux_bright(colour: Aux) -> u8 {
-    match colour {
-        Aux::Red => 1 << AUX_RED,
-        Aux::Off | Aux::Blue | Aux::Yellow | Aux::White => 0,
-    }
-}
+/// PF6, the reset pin.
+pub const RESET: u8 = 6;
+/// PF7, UPDI.
+pub const UPDI: u8 = 7;
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn each_colour_lights_the_pins_it_mixes_and_off_none() {
-        assert_eq!(aux_pin(Aux::Off), 0);
-        assert_eq!(aux_pin(Aux::Blue), 1 << AUX_BLUE);
-        assert_eq!(aux_pin(Aux::Red), 1 << AUX_RED);
-        assert_eq!(aux_pin(Aux::Yellow), 1 << AUX_RED | 1 << AUX_GREEN);
-        assert_eq!(aux_pin(Aux::White), AUX_PINS);
-        let colours = [Aux::Off, Aux::Blue, Aux::Red, Aux::Yellow, Aux::White];
-        for (i, &a) in colours.iter().enumerate() {
-            for &b in &colours[i + 1..] {
-                assert_ne!(aux_pin(a), aux_pin(b), "{a:?} and {b:?}");
-            }
+    fn each_port_uses_each_pin_once() {
+        let porta = [
+            FET, UNUSED_PA1, TWI_SDA, TWI_SCL, BUTTON_LED, PATH3, PATH2, PATH1,
+        ];
+        let portc = [ENABLE, UNUSED_PC2, UNUSED_PC3];
+        let portd = [SWITCH, UNUSED_PD5, DAC, POWER_BANK];
+        let portf = [RESET, UPDI];
+        for port in [&porta[..], &portc, &portd, &portf] {
+            let mask = port.iter().fold(0u8, |all, &pin| {
+                assert!(pin < 8, "pin {pin}");
+                assert_eq!(all & 1 << pin, 0, "pin {pin} twice");
+                all | 1 << pin
+            });
+            assert_eq!(mask.count_ones() as usize, port.len());
         }
     }
 
     #[test]
-    fn only_lockout_red_is_bright_and_bright_pins_are_lit_ones() {
-        assert_eq!(aux_bright(Aux::Red), aux_pin(Aux::Red));
-        for colour in [Aux::Off, Aux::Blue, Aux::Yellow, Aux::White] {
-            assert_eq!(aux_bright(colour), 0, "{colour:?}");
-        }
+    fn the_paths_are_pa5_to_pa7() {
+        assert_eq!(PATHS, 0xE0);
+        assert_eq!((PATH1, PATH2, PATH3), (7, 6, 5));
     }
 
     #[test]
-    fn aux_table_matches_aux_pin() {
-        let [blue, green, red] = AUX;
-        assert_eq!(blue, (AUX_BLUE, aux_pin(Aux::Blue)));
-        assert_eq!(red, (AUX_RED, aux_pin(Aux::Red)));
-        assert_eq!(green, (AUX_GREEN, 1 << AUX_GREEN));
-        let masks = AUX.iter().fold(0, |all, &(_, mask)| all | mask);
-        assert_eq!(masks, AUX_PINS);
-        for (pin, mask) in AUX {
-            assert_eq!(mask, 1 << pin);
-        }
+    fn the_pins_stock_names_are_where_it_says() {
+        assert_eq!(ENABLE, 1, "PC1");
+        assert_eq!(DAC, 6, "PD6");
+        assert_eq!(SWITCH, 4, "PD4");
+        assert_eq!(BUTTON_LED, 4, "PA4");
+        assert_eq!((TWI_SDA, TWI_SCL), (2, 3), "PA2, PA3");
+        assert_eq!((RESET, UPDI), (6, 7), "PF6, PF7");
     }
 }

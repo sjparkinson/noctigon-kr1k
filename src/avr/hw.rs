@@ -1,7 +1,20 @@
-//! The TS26 driver's pins and the ATtiny1616 registers that drive them.
+//! The KR1K's Lume X1-C driver pins and the AVR32DD20 registers that drive
+//! them.
 //!
 //! No PAC. The register constants are generated from Microchip's ATDF into
-//! `src/regs.rs` at build time. The pin map is `kr1k::board`'s.
+//! `src/regs.rs` at build time. The pin map is `kr1k::board`'s. Section
+//! numbers are DS40002413B, the AVR32/16DD14/20 datasheet, and the errata is
+//! DS80001026D.
+//!
+//! # Errata 2.2.3
+//!
+//! On every revision of this chip, a store to an address of 64 or more
+//! followed straight away by a store to an address under 64, or to
+//! `SLPCTRL.CTRLA`, loses the second store. The workaround is `out` for the
+//! low addresses and a `nop` before `SLPCTRL.CTRLA`. So every write under 64
+//! here (the VPORTs and the GPRs) goes through [`out!`], never [`write`], and
+//! [`sleep_mode`] is the only write to `SLPCTRL.CTRLA`. That covers the
+//! interrupt handlers too, since a handler's own epilogue only ever `out`s.
 
 #![allow(unsafe_code)]
 
@@ -10,31 +23,36 @@ use core::ptr::{
     read_volatile, with_exposed_provenance, with_exposed_provenance_mut, write_volatile,
 };
 
-use kr1k::board::{self, AUX_PINS, BATTERY, ENABLE, PWM, SWITCH, UPDI};
-use kr1k::ramp::{DSM_BITS, DSM_TOP, Output, PWM_TOP};
+use kr1k::board::{
+    BUTTON_LED, DAC, ENABLE, FET, PATHS, POWER_BANK, SWITCH, UNUSED_PA1, UNUSED_PC2, UNUSED_PC3,
+    UNUSED_PD5,
+};
+use kr1k::ramp::{DAC_MAX, Output, Vref};
 use kr1k::selftest::Fuses;
 use kr1k::sensors::{Channel, Convert};
 use kr1k::temp::Calibration;
 use kr1k::ui::Aux;
-use kr1k::watchdog::TICK_DEADLINE_CYCLES;
+use kr1k::watchdog::{TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
 
 use crate::regs::{self, addr as reg};
 
-/// The PORTB pins the firmware drives. PORTB has PB0 to PB5 on the 20-pin package.
-const PORTB_OUTPUTS: u8 = 1 << PWM | 1 << ENABLE;
-const PORTB_PINS: u8 = 6;
-/// The PORTC pins the firmware drives. PORTC has PC0 to PC3 on the 20-pin package.
-const PORTC_OUTPUTS: u8 = AUX_PINS;
-const PORTC_PINS: u8 = 4;
+/// The PORTA pins the firmware drives, the three paths and the button LED.
+/// PA0 (the FET gate, not fitted) and PA2 and PA3 (TWI to the AW2016) are
+/// never outputs.
+const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED;
+/// The PORTC pins the firmware drives, only PC1.
+const PORTC_OUTPUTS: u8 = 1 << ENABLE;
+/// The PORTD pins the firmware drives, only PD6, which DAC0's buffer takes
+/// over while it's on.
+const PORTD_OUTPUTS: u8 = 1 << DAC;
 
-/// TCA0.CTRLB with the light off, so dual-slope with PB0 left to PORT.
-const CTRLB_OFF: u8 = regs::TCA_WGMODE_DSBOTTOM;
-/// TCA0.CTRLB with the light on, the same but with WO0 driving PB0.
-const CTRLB_ON: u8 = regs::TCA_CMP0EN | regs::TCA_WGMODE_DSBOTTOM;
+/// How far DAC0's 10-bit code sits up `DAC0.DATA`, which is left-aligned
+/// (section 34.5.2).
+const DAC_SHIFT: u32 = regs::DAC_DATA.trailing_zeros();
+const _: () = assert!(DAC_MAX << DAC_SHIFT == regs::DAC_DATA);
 
-// WO2's pad is PB2, so a CTRLB with CMP2EN would hand the boost enable to
-// the timer.
-const _: () = assert!(ENABLE == 2 && (CTRLB_OFF | CTRLB_ON) & regs::TCA_CMP2EN == 0);
+/// TCB0's CCMP, one less than the period, since it counts 0 to CCMP.
+const TIMER_TOP: u16 = TIMER_PERIOD_CLOCKS - 1;
 
 // The window `start_watchdog` sets is the one `kr1k::watchdog` counts on.
 // WDT.CTRLA's fields count 8 << (n - 1) WDT clocks, and these are n = 3.
@@ -46,16 +64,17 @@ const _: () = {
 
 // Every peripheral (the ports, the timers, the clock controller) exposes
 // its settings as bytes at fixed addresses, in the same address space as
-// SRAM. Storing a byte at `VPORTB_DIR` doesn't put it in memory, it flips
-// the direction of PORTB's pins. Loading from `VPORTA_IN` reads the voltage
-// on PORTA's pins right now. These two helpers are the only way the rest of
-// the file does it.
+// SRAM. Storing a byte at `VPORTC_OUT` doesn't put it in memory, it flips
+// PORTC's pins. Loading from `VPORTD_IN` reads the voltage on PORTD's pins
+// right now. These helpers are the only way the rest of the file does it.
 //
 // They're `volatile` because the compiler would otherwise treat these as
 // ordinary memory, and could drop a write nobody reads back or read once
 // and reuse the value in a loop. `read_volatile` and `write_volatile`
 // promise each access happens, in order, exactly as written.
 
+/// Writes a register at 64 or over. Anything lower goes through [`out!`]
+/// (errata 2.2.3).
 fn write(addr: usize, value: u8) {
     // SAFETY: every caller passes one of the `reg` constants, which are
     // memory-mapped I/O registers on this part.
@@ -67,15 +86,31 @@ fn read(addr: usize) -> u8 {
     unsafe { read_volatile(with_exposed_provenance::<u8>(addr)) }
 }
 
+/// Writes `$value` to the I/O register at `$addr` with `out`, which errata
+/// 2.2.3 doesn't touch. `$addr` has to be a constant under 64, which the
+/// build checks.
+macro_rules! out {
+    ($addr:expr, $value:expr) => {{
+        const ADDR: usize = $addr;
+        const _: () = assert!(ADDR < 0x40);
+        let value: u8 = $value;
+        // SAFETY: `out` writes one byte to an I/O register. It touches no
+        // memory Rust knows about and no flags.
+        unsafe {
+            asm!(
+                "out {addr}, {value}",
+                addr = const ADDR,
+                value = in(reg) value,
+                options(nostack, preserves_flags),
+            )
+        }
+    }};
+}
+
 /// 16-bit peripheral registers go through a shared TEMP byte. Write the low
-/// byte first, then the high byte. Spelling it out keeps the order from
-/// depending on the compiler.
-///
-/// The CPU only moves 8 bits at a time, so a 16-bit value takes two
-/// stores. If the timer saw the halves land separately it could briefly
-/// run with a new low byte and an old high byte. Instead, the low-byte
-/// write is parked in TEMP, and the high-byte write copies both into the
-/// register in the same clock cycle.
+/// byte first, then the high byte (section 8.10.3). Spelling it out keeps the
+/// order from depending on the compiler. No interrupt handler here touches a
+/// 16-bit register, so nothing can get between the two.
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "addr is the low byte of a 16-bit register in data space, far under usize::MAX"
@@ -88,7 +123,7 @@ fn write16(addr: usize, value: u16) {
 
 /// Writes a register behind configuration change protection. The CPU only
 /// accepts the write within four instructions of the CCP key, so it has to
-/// be assembly.
+/// be assembly (section 7.4.6).
 ///
 /// Some registers, like the clock settings, could brick a running program
 /// if a stray pointer hit them, so the chip guards them. Writing the magic
@@ -110,13 +145,11 @@ fn protected_write(addr: usize, value: u8) {
     // Touches no memory Rust knows about.
     unsafe {
         asm!(
-            // Unlock. `out` writes a register to an I/O address. CCP sits
-            // at 0x34, low enough for `out` to reach.
+            // Unlock. CCP sits at 0x34, low enough for `out` to reach.
             "out {ccp}, {key}",
             // Write the protected register, the very next instruction.
             // `st Z, r` stores register r at the address held in Z (the
-            // r31:r30 pair). It's used here because `out` only reaches the
-            // first 64 addresses and the clock registers are further up.
+            // r31:r30 pair), since the clock registers are past `out`'s reach.
             "st Z, {value}",
             ccp = const reg::CPU_CCP,
             key = in(reg) regs::CPU_CCP_IOREG,
@@ -129,154 +162,138 @@ fn protected_write(addr: usize, value: u8) {
     }
 }
 
-/// Drives PB0 and PB2 low, the boost converter off. `main` calls this before
-/// anything else, since PB2 is a high-impedance input from reset until it's
-/// an output, and the CRC scan in [`flash_ok`] stalls the CPU for about 7 ms
-/// before [`init`] runs. [`init`] writes DIR again.
+/// `PINnCTRL` for pin `pin` of the port whose `PIN0CTRL` is at `base`.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "base is a PIN0CTRL address and pin is under 8, far under usize::MAX"
+)]
+fn pin_ctrl(base: usize, pin: u8, value: u8) {
+    write(base + usize::from(pin), value);
+}
+
+/// Whether PC1, the driver's enable, is high.
+fn lit() -> bool {
+    read(reg::VPORTC_OUT) & 1 << ENABLE != 0
+}
+
+/// Drives PC1 low, the driver off. `main` calls this before anything else,
+/// since PC1 is a high-impedance input from reset until it's an output, and
+/// the CRC scan in [`flash_ok`] stalls the CPU for about 12 ms before
+/// [`init`] runs. [`init`] writes DIR again.
 ///
 /// OUT goes first, then DIR. A reset leaves OUT at zero, and this doesn't
 /// count on having had one. If the CPU ever got to the reset vector some
-/// other way, by a stray jump or a dip in the supply with the brown-out
-/// detector off, OUT could still have PB2 set from a light that was on, and
-/// DIR alone would hold the boost converter on through the scan and `init`.
-/// Nobody's seen either happen. The simulator checks the order, starting
-/// with PORTB dirty and the rest of the chip clean (`found_lit` in
-/// xtask/src/sim.rs), and that's as far as it's been tested.
+/// other way, by a stray jump, OUT could still have PC1 set from a light that
+/// was on, and DIR alone would hold the driver on through the scan and
+/// `init`. The brown-out detector is off on this torch, so a dip in the cell
+/// doesn't reset the chip at all, which is docs/safety.md's to worry about.
 ///
-/// PB2 isn't all such a start would find stale. What follows is a reading of
-/// the code, and nothing has run it. PB0 stays TCA0's, still carrying the old
-/// PWM into a boost converter that's now off, until [`init`] writes CTRLB and
-/// hands it back to PORT, low. GPIOR1 to 3 and TCA0.INTCTRL keep the lit
-/// torch's level and its overflow interrupt. src/avr/rt.rs clears SREG.I, so
-/// [`tca0_ovf`] waits for [`wait_for_tick`]'s first `sei`, then loads the old
-/// duty into a compare that no pin shows, until the first pass's
-/// [`set_output`] clears the lot (`Changes` always reports its first value).
-/// The watchdog is still running in window mode, and the datasheet doesn't
-/// say whether [`start_watchdog`] writing the same setting again restarts its
-/// windows. If it doesn't, the first pass's feed can land in the closed
-/// window, or come after the open one has run out, and either resets the chip
-/// for real, to come up capped like any hang. Otherwise the torch carries on,
-/// off.
+/// PC1 isn't all such a start would find stale. DAC0, VREF and the paths keep
+/// whatever they held until [`init`] sets them. With PC1 low the driver is
+/// off whatever they say. TCB0 and its interrupt could still be running, so
+/// the first [`wait_for_tick`] could count a period or two that belong to the
+/// old light, which only clears GPR1 with PC1 low. The watchdog is still
+/// running in window mode, and the datasheet doesn't say whether
+/// [`start_watchdog`] writing the same setting again restarts its windows.
+/// If it doesn't, the first pass's feed can land in the closed window and the
+/// chip resets for real. Nobody's seen any of it happen.
 ///
-/// Two more things nothing puts right. SP keeps whatever it held, since only
-/// a reset loads it, so `main` starts a little way down the stack. And if the
-/// jump came from inside a handler, CPUINT still has that handler running
-/// (LVL0EX only clears on `reti`, DS40002204A section 13.5.2), so no tick is
-/// ever taken, and the first wait sits there until the watchdog resets the
-/// chip. PB2 is low through all of it, so there's no code for any of this, and
-/// no software reset at boot.
+/// PC1 is on the VDDIO2 domain (section 5.1, figure 5-1). If VDDIO2 were
+/// missing it would be tri-stated whatever this writes (section 19.3.2.1). `main` checks for
+/// that with [`vddio2_ok`].
 pub fn hold_enable_low() {
-    write(reg::VPORTB_OUT, 0);
-    write(reg::VPORTB_DIR, PORTB_OUTPUTS);
+    out!(reg::VPORTC_OUT, 0);
+    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);
+}
+
+/// Whether MVIO says VDDIO2 is in range, so PORTC's pins, PC1 among them,
+/// follow their PORT registers (section 19.5.3).
+pub fn vddio2_ok() -> bool {
+    read(reg::MVIO_STATUS) & regs::MVIO_VDDIO2S != 0
 }
 
 pub fn init() {
-    // 20 MHz oscillator (the factory OSCCFG fuse) divided by 2. 10 MHz is
-    // specified down to 2.7 V of VCC. VCC here comes from a regulator, not
-    // the cell, and nobody knows yet how it behaves as the cell sags.
-    // `watchdog::CLOCK_HZ` is this clock, typed by hand, and the tick
-    // deadline's sums start from it.
-    protected_write(
-        reg::CLKCTRL_MCLKCTRLB,
-        regs::CLKCTRL_PDIV_2X | regs::CLKCTRL_PEN,
-    );
+    // The internal high-frequency oscillator at 4 MHz, no prescaler, which is
+    // what reset leaves (sections 12.5.7 and 12.5.2). Written anyway, so a
+    // start that wasn't a reset still runs at the clock
+    // `watchdog::CLOCK_HZ` assumes. With no PWM on the main LED, nothing
+    // here needs more, and the main clock is specified to 24 MHz over the
+    // whole supply range (table 38-15), so a lower one buys no voltage
+    // margin, only current. AUTOTUNE stays off, since it tunes against a
+    // 32.768 kHz crystal (section 12.3.6) this board most likely doesn't
+    // have.
+    protected_write(reg::CLKCTRL_OSCHFCTRLA, regs::CLKCTRL_FRQSEL_4M);
+    protected_write(reg::CLKCTRL_MCLKCTRLB, 0);
 
-    // Pull every pin the firmware doesn't drive up, so nothing floats and leaks current.
-    // PA0 is UPDI, and nothing here writes its settings. The outputs get no
-    // pull-up either, so PB2 can't creep the boost converter on before it's
-    // an output.
+    // The pins, as `kr1k::board` names them.
     //
-    // PA1 is the battery divider, an ADC input at about a quarter of the
-    // cell's voltage. It gets its digital input buffer turned off, as the
-    // datasheet asks for a pin the ADC reads (DS40002204A section 30.3.1.1),
-    // and nothing else. Never a pull-up, which would skew the divider. The
-    // ADC still sees the pin, which is the point of the advice. Section
-    // 16.3.2.2 says the same of a pin "used as analog input", and Microchip's
-    // own ADC example turns the buffer off on the pin it converts (TB3209B
-    // section 3). PA1's bit in VPORTA.IN stops following the pin (section
-    // 16.5.11's note), and nothing reads that bit. Nobody's compared readings
-    // on a real TS26 with the buffer on and off.
+    // PA0 (the FET gate, not fitted), PA1, PC2, PC3, PD5 and PD7 are unused,
+    // so they get a pull-up and nothing floats, as the stock firmware has
+    // them. PA2 and PA3 are the AW2016's TWI lines, which have their own
+    // pull-ups if anything, and nothing here touches them.
     //
-    // PA5 is the switch, and its pull-up is what the switch pulls against.
-    // ISC stays at INTDISABLE, its reset value, with no interrupt and the
-    // input buffer on, so VPORTA.IN still reads the pin (sections 16.3.2.1 and
-    // 16.5.11). `wait_for_tick` says why there's no interrupt.
-    for pin in 0..8 {
-        let ctrl = match pin {
-            UPDI => continue,
-            BATTERY => regs::PORT_ISC_INPUT_DISABLE,
-            SWITCH => regs::PORT_PULLUPEN | regs::PORT_ISC_INTDISABLE,
-            _ => regs::PORT_PULLUPEN,
-        };
-        write(reg::PORTA_PIN0CTRL + usize::from(pin), ctrl);
-    }
-    for pin in 0..PORTB_PINS {
-        if PORTB_OUTPUTS & 1 << pin == 0 {
-            write(reg::PORTB_PIN0CTRL + usize::from(pin), regs::PORT_PULLUPEN);
-        }
-    }
-    for pin in 0..PORTC_PINS {
-        if PORTC_OUTPUTS & 1 << pin == 0 {
-            write(reg::PORTC_PIN0CTRL + usize::from(pin), regs::PORT_PULLUPEN);
-        }
-    }
-
-    // PORTB's OUT is zero because `hold_enable_low` cleared it. PORTC's is as
-    // reset left it, zero, and only `set_aux` writes it, later. So these all
-    // come up low, with the boost converter off and the aux LEDs dark.
-    write(reg::VPORTB_DIR, PORTB_OUTPUTS);
-    write(reg::VPORTC_DIR, PORTC_OUTPUTS);
-
-    // TCA0 stays in single mode (CTRLD.SPLITM at its reset value of 0),
-    // which is the only mode PER, CMP0 and CMP0BUF mean anything in.
-    // Dual-slope PWM on WO0, straight off the 10 MHz clock. The BUF
-    // registers apply at the bottom of a cycle, so duty changes never
-    // glitch. PER goes in directly, with the timer stopped, or the first
-    // cycle would run at the reset value of 0xFFFF, 13 ms before the first
-    // UPDATE.
-    write16(reg::TCA0_PER, PWM_TOP);
-    write16(reg::TCA0_CMP0BUF, 0);
-    // The light's off, so PB0 stays PORT's until `set_output` asks for a
-    // level.
-    write(reg::TCA0_CTRLB, CTRLB_OFF);
-    write(reg::TCA0_CTRLA, regs::TCA_CLKSEL_DIV1 | regs::TCA_ENABLE);
-
-    // ADC0 in single-conversion mode, four conversions accumulated. The cell
-    // and the temperature sensor both read against the 1.1 V reference with
-    // the same timing, so only MUXPOS changes between them (`adc_channel`).
-    // Turning it and the reference on waits for that too.
+    // PC1 is the driver's enable, and never gets a pull-up, so it can't creep
+    // the driver on before it's an output. Its PINCTRL is written to 0 in
+    // case anything left one.
     //
-    // The ATDF says CALIB resets to 50% duty, the datasheet says 25%, and 25%
-    // is what it wants at ADC clocks of 1.5 MHz and under (section 30.5.17),
-    // so say so.
-    write(reg::ADC0_CALIB, regs::ADC_DUTYCYC_DUTY25);
+    // PD4 is the switch, which pulls against an external 100k pull-up, so
+    // the internal one stays off. Both edges raise PORTD's interrupt, which
+    // wakes the chip from power-down, since every pin on this chip senses
+    // asynchronously (section 18.3.3.1). The input buffer stays on, so
+    // VPORTD.IN still reads the pin.
+    //
+    // PD6 is DAC0's output, and its input buffer is off, as section 34.3.1
+    // asks.
+    pin_ctrl(reg::PORTA_PIN0CTRL, FET, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTA_PIN0CTRL, UNUSED_PA1, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);
+    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC2, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTC_PIN0CTRL, UNUSED_PC3, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_BOTHEDGES);
+    pin_ctrl(reg::PORTD_PIN0CTRL, UNUSED_PD5, regs::PORT_PULLUPEN);
+    pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);
+    pin_ctrl(reg::PORTD_PIN0CTRL, POWER_BANK, regs::PORT_PULLUPEN);
+
+    // Everything the firmware drives comes up low: the paths off, the button
+    // LED off (the stock firmware's off for it is an output at 0), PC1 off,
+    // and PD6 at 0 under DAC0. PD6 is an output as the stock firmware has it,
+    // so if DAC0's buffer lets go of the pin in power-down (section 34.3.3),
+    // PORT holds it low. The datasheet doesn't say which drives the pad then,
+    // and it's unconfirmed. OUT before DIR, as for PC1. PORTA's OUT has 0 for
+    // PA0, PA2 and PA3 too, which are inputs and stay so.
+    out!(reg::VPORTA_OUT, 0);
+    out!(reg::VPORTA_DIR, PORTA_OUTPUTS);
+    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);
+    out!(reg::VPORTD_OUT, 0);
+    out!(reg::VPORTD_DIR, PORTD_OUTPUTS);
+
+    // DAC0 on, at 0, against 1.024 V, in section 34.3.1's order. It stays on
+    // from here, at 0 whenever the light's off, and power-down turns it off
+    // by itself.
+    write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+    write16(reg::DAC0_DATA, 0);
+    write(reg::DAC0_CTRLA, regs::DAC_ENABLE | regs::DAC_OUTEN);
+
+    // TCB0 in periodic interrupt mode, its reset mode, off the main clock,
+    // for the tick deadline. `set_output` starts and stops it with the light.
+    // CCMP goes in with TCB0 stopped and interrupts still off from reset.
+    write(reg::TCB0_CTRLB, regs::TCB_CNTMODE_INT);
+    write16(reg::TCB0_CCMP, TIMER_TOP);
+
+    // ADC0, single 12-bit conversions, four accumulated. 4 MHz / 4 is a
+    // 1 MHz ADC clock, inside the 125 kHz to 2 MHz of table 38-25. INITDLY
+    // of 32 µs covers the 25 µs the temperature sensor wants after the ADC
+    // starts (section 33.3.3.8), and SAMPLEN its 28 µs of sampling. Both
+    // channels use the same timing, and `adc_channel` sets the reference and
+    // the input for each. The ADC stays off until then.
     write(reg::ADC0_CTRLB, regs::ADC_SAMPNUM_ACC4);
-    // 10 MHz / 16 is 625 kHz, inside the 200 kHz to 1.5 MHz the datasheet
-    // wants for 10 bits (table 36-26). REFSEL stays INTREF, and SAMPCAP is
-    // the smaller sample capacitor, for references of 1 V and up.
-    write(
-        reg::ADC0_CTRLC,
-        regs::ADC_SAMPCAP | regs::ADC_REFSEL_INTREF | regs::ADC_PRESC_DIV16,
-    );
-    // 32 ADC clocks, 51 µs, over the 32 µs the temperature sensor needs
-    // (section 30.3.2.6). This leaves SAMPDLY and ASDV at 0, which SAMPLEN
-    // needs (errata DS80000886C 2.4.1).
+    write(reg::ADC0_CTRLC, regs::ADC_PRESC_DIV4);
     write(reg::ADC0_CTRLD, regs::ADC_INITDLY_DLY32);
-    // 22 ADC clocks of sampling, 35 µs. The temperature sensor needs 32 µs,
-    // and that sets this. PA1 is the other limit. The divider is 25 to 77 kΩ
-    // depending on which story about its resistors is true (docs/hardware.md),
-    // plus the ADC's own 14 kΩ, into 5 pF (table 36-25). At worst that's a
-    // time constant of 0.46 µs, and settling to half a bit of 10 takes under
-    // eight of those, 3.5 µs. The default two clocks would be 3.2 µs, so this
-    // has ten times what it needs, where the default wouldn't.
-    write(reg::ADC0_SAMPCTRL, regs::ADC_SAMPLEN_32US);
+    write(reg::ADC0_SAMPCTRL, regs::ADC_SAMPLEN_32CLK);
 
     // The RTC's periodic interrupt timer, off the internal 32.768 kHz
     // oscillator (RTC.CLKSEL's reset value) divided by 512, which is 64 Hz,
-    // with its interrupt on, in the datasheet's order (section 23.5.1).
-    // RTC.CTRLA stays at its reset value, since any write to it stretches the
-    // PIT's period, and clearing RTCEN stops the PIT (errata DS80000886C 2.6.1
-    // and 2.6.2).
+    // with its interrupt on. RTC.CTRLA stays at its reset value.
     write(reg::RTC_PITINTCTRL, regs::RTC_PI);
     while read(reg::RTC_PITSTATUS) & regs::RTC_CTRLBUSY != 0 {}
     write(reg::RTC_PITCTRLA, regs::RTC_PERIOD_CYC512 | regs::RTC_PITEN);
@@ -286,104 +303,105 @@ pub fn init() {
     while read(reg::RTC_PITSTATUS) & regs::RTC_CTRLBUSY != 0 {}
 }
 
-/// The bit in GPIOR0 that [`rtc_pit`] sets each tick. GPIORs sit in I/O space,
-/// which keeps the flag out of RAM and makes it one cycle to reach (AN2515C
-/// section 4.5).
+/// The bit in GPR0 that [`rtc_pit`] sets each tick. The GPRs sit in I/O
+/// space, which keeps the flag out of RAM and makes it one cycle to reach.
 const TICK: u8 = 1 << 0;
 
-/// The whole steps of PWM duty for [`tca0_ovf`], 0 to 255. Like the tick, the
-/// delta-sigma's state lives in GPIORs. They're zero from reset, and this way
-/// the handler reads them in one cycle each, with nothing to save.
-const DSM_DUTY: usize = reg::GPIO_GPIOR1;
-/// The seven bits of `Output::dsm` below the duty.
-const DSM_FRACTION: usize = reg::GPIO_GPIOR2;
-/// What's piled up of the fraction so far. Only the handler changes it while
-/// the light's on.
-const DSM_SUM: usize = reg::GPIO_GPIOR3;
-/// The bits of `Output::dsm` that go in [`DSM_FRACTION`].
-const FRACTION_MASK: u8 = (1 << DSM_BITS) - 1;
+/// What [`tcb0_int`] writes to GPR1 at the end of each TCB0 period. Nothing
+/// else lives in GPR1, so the handler writes it whole.
+const PERIOD: u8 = 1 << 0;
+
+/// Writes `SLPCTRL.CTRLA` with a `nop` before it, errata 2.2.3's workaround.
+fn sleep_mode(value: u8) {
+    // SAFETY: a `nop`, then one store to SLPCTRL.CTRLA. Touches no memory
+    // Rust knows about and no flags.
+    unsafe {
+        asm!(
+            "nop",
+            "sts {addr}, {value}",
+            addr = const reg::SLPCTRL_CTRLA,
+            value = in(reg) value,
+            options(nostack, preserves_flags),
+        )
+    }
+}
 
 /// Sets up the sleep that [`wait_for_tick`] goes on to do. `rest` is
 /// `watchdog::Feeder::power_down`.
 ///
-/// Power-down stops TCA0 wherever it is, so it only happens with PB2 low. If
-/// the torch ever says it's resting with the boost converter on, this idles
-/// instead. The light stays as it was, and the loop keeps running, so the
-/// protection does too. The firmware never asks for that, so only
-/// examples/guards.rs runs this on the simulator.
+/// Power-down stops the main clock, and with it TCB0 and the tick deadline,
+/// and DAC0 (sections 24.3.6 and 34.3.3), so it only happens with PC1 low. If
+/// the torch ever says it's resting with the driver on, this idles instead.
+/// The light stays as it was, and the loop keeps running, so the protection
+/// does too. The firmware never asks for that, so only examples/guards.rs
+/// runs this.
 ///
-/// It also turns the ADC and its forced reference off. The datasheet gives no
-/// current for either left on in power-down, and the stock firmware does the
-/// same before it sleeps. [`adc_channel`] turns them back on.
+/// It also turns the ADC off, since a conversion caught by power-down comes
+/// back invalid (section 33.3.8). Its reference is only on while something
+/// asks for it (section 21.2). [`adc_channel`] turns it back on.
 ///
-/// Otherwise it's idle, which stops only the CPU and flash, so TCA0 keeps the
-/// PWM going and the ADC keeps converting. Standby would stop TCA0, which has
-/// no RUNSTDBY (section 11.3.2.1).
+/// Otherwise it's idle, which stops only the CPU, so TCB0 keeps counting and
+/// the ADC keeps converting.
 ///
 /// SEN has to stay set in both, because with it clear, `sleep` does nothing.
 fn prepare_sleep(rest: bool) {
-    let mode = if rest && read(reg::VPORTB_OUT) & 1 << ENABLE == 0 {
+    let mode = if rest && !lit() {
         write(reg::ADC0_CTRLA, 0);
-        write(reg::VREF_CTRLB, 0);
         regs::SLPCTRL_SMODE_PDOWN
     } else {
         regs::SLPCTRL_SMODE_IDLE
     };
-    write(reg::SLPCTRL_CTRLA, mode | regs::SLPCTRL_SEN);
+    sleep_mode(mode | regs::SLPCTRL_SEN);
 }
 
 /// Sleeps until the next 64 Hz tick, in power-down if `rest` allows it. The
-/// PIT carries on in there (section 23.8 and the errata's table 3-3), so the
-/// loop runs every tick, on or off, and that's how it sees the switch.
+/// PIT carries on in there (section 26.9), so the loop runs every tick, on or
+/// off, and that's how it sees the switch.
 ///
-/// The switch has no interrupt, so a press never wakes the chip. It waits for
-/// the next tick, 15.6 ms at most, and the loop reads PA5 then. A press that
-/// comes and goes between two ticks is missed. An interrupt on the pin
-/// wouldn't change either, since the loop only looks once a tick. The chip
-/// would wake and go straight back to sleep. It wouldn't be dependable from
-/// power-down anyway. PA5 is a partially asynchronous pin, so with the clock
-/// stopped a press that's over before the chip has woken can wake it and
-/// raise no interrupt (DS40002204A table 16-3, and table 5-1's note 2).
-/// Nobody's measured how short a press this switch can give.
+/// A press on PD4 wakes the chip too, through PORTD's interrupt, which this
+/// loop treats like any other wake that isn't a tick. The loop only looks at
+/// the switch once a tick, so a press that comes and goes between two ticks is
+/// still missed. Nobody's measured how short a press this switch can give.
 ///
 /// The PIT interrupt sets [`TICK`]; this checks and clears it with interrupts
 /// off, so a tick can't land between the check and the clear. If it isn't set
-/// yet, `sei` and `sleep` go back to back (AN2515C section 4.5). The
-/// instruction after `sei` always runs before a pending interrupt, so a tick
-/// that arrived after the check wakes the `sleep` at once rather than being
-/// slept through. The only other interrupt is TCA0's overflow, which wakes it
-/// from idle every PWM cycle while the light's on, and it goes round again.
+/// yet, `sei` and `sleep` go back to back. The instruction after `sei` always
+/// runs before a pending interrupt, so a tick that arrived after the check
+/// wakes the `sleep` at once rather than being slept through.
 ///
-/// Those turns are the deadline. The tick and the watchdog share the 32 kHz
+/// While the light's on, TCB0 sets [`PERIOD`] once a millisecond, timed by
+/// the main oscillator. The tick and the watchdog share the 32 kHz
 /// oscillator, so if that stopped with the light on, nothing else would ever
-/// turn it off. Each turn with PB2 high and no tick is one more PWM cycle,
-/// timed by the 20 MHz oscillator. After `watchdog::TICK_DEADLINE_CYCLES` of
-/// them, about 104 ms, this gives up and returns false, and `main` calls
-/// [`halt`]. src/watchdog.rs has the sums.
+/// turn it off. After `watchdog::TICK_DEADLINE_PERIODS` of those flags and no
+/// tick, 103 to 104 ms, this gives up and returns false, and `main` calls
+/// [`halt`]. It counts flags, not wakes, so a bouncing switch can't run the
+/// deadline down. src/watchdog.rs has the sums.
 ///
-/// With PB2 low there's no deadline, since there's no light to turn off.
-/// TCA0's interrupt is off then, so nothing wakes the sleep to count. A dead
-/// oscillator leaves the chip asleep, in idle or power-down, whichever `rest`
-/// chose, with the boost converter off, until the cell comes out.
+/// With PC1 low there's no deadline, since there's no light to turn off.
+/// TCB0 is stopped then. A dead oscillator leaves the chip asleep, in idle or
+/// power-down, whichever `rest` chose, with the driver off, until the cell
+/// comes out.
 ///
-/// Interrupts are on when it returns, either way. The simulator runs the
-/// deadline out (`oscillator_stops` in xtask/src/sim.rs). No real chip has.
+/// Interrupts are on when it returns, either way.
 pub fn wait_for_tick(rest: bool) -> bool {
     prepare_sleep(rest);
-    let mut cycles = TICK_DEADLINE_CYCLES;
+    let mut periods = TICK_DEADLINE_PERIODS;
     let ticked = loop {
         // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a
-        // compiler barrier, so the GPIOR0 read can't move above it.
+        // compiler barrier, so the GPR reads can't move above it.
         unsafe { asm!("cli", options(nostack)) };
-        if read(reg::GPIO_GPIOR0) & TICK != 0 {
-            write(reg::GPIO_GPIOR0, 0);
+        if read(reg::GPR_GPR0) & TICK != 0 {
+            out!(reg::GPR_GPR0, 0);
             break true;
         }
-        if read(reg::VPORTB_OUT) & 1 << ENABLE != 0 {
-            let Some(left) = cycles.checked_sub(1) else {
-                break false;
-            };
-            cycles = left;
+        if read(reg::GPR_GPR1) != 0 {
+            out!(reg::GPR_GPR1, 0);
+            if lit() {
+                periods = periods.saturating_sub(1);
+                if periods == 0 {
+                    break false;
+                }
+            }
         }
         // SAFETY: sets SREG.I and sleeps until an interrupt, whose handler
         // returns here. The handler saves what it touches.
@@ -398,51 +416,37 @@ pub fn wait_for_tick(rest: bool) -> bool {
 /// [`wait_for_tick`]'s deadline runs out, and it's the panic handler too.
 ///
 /// An interrupt with no handler ends up here as well. src/avr/rt.rs's
-/// `__unhandled_interrupt` zeroes r1 and jumps in, from inside the
-/// interrupt. CPUINT still has that interrupt marked as running then (LVL0EX,
-/// which only a `reti` clears, DS40002204A section 13.5.2), and this never
-/// `reti`s. That's fine, since all it does after turning the light off is
-/// sleep, and no other interrupt is wanted. That interrupt's own flag and
-/// enable stay up, since nothing here knows which peripheral it was. With
-/// LVL0EX set it can't be taken again, and the datasheet doesn't say whether
-/// it still wakes the `sleep`, so the loop round that covers it. The CPU
-/// doesn't clear SREG.I on the way into a handler on this core (section
-/// 8.7.3), so the `cli` below still matters. The return address that
-/// interrupt pushed stays on the stack. A level 0 interrupt can't land with
-/// the main loop halfway through one of TCA0's 16-bit registers, since
-/// [`set_output`] writes them with interrupts held off. Only an NMI could,
-/// and even then this overwriting the TEMP byte wouldn't matter, since the
-/// interrupted code never runs again.
+/// `__unhandled_interrupt` zeroes r1 and jumps in, from inside the interrupt.
+/// CPUINT still has that interrupt marked as running then (LVL0EX, which
+/// only a `reti` clears, section 15.5.2), and this never `reti`s. That's fine,
+/// since all it does after turning the light off is sleep. That interrupt's
+/// own flag and enable stay up, since nothing here knows which peripheral it
+/// was, and the loop round the `sleep` covers it waking anyway.
 ///
 /// Interrupts go off first, so nothing else runs from here on. Then the
-/// output goes off in the usual order, PB2 low and then the duty
-/// ([`set_output`]), which turns TCA0's interrupt off as well. The PIT's goes
-/// off after it, which leaves no interrupt enabled, and the last step is
-/// power-down, with the ADC and its reference off as for any rest
-/// ([`prepare_sleep`]).
+/// output goes off in the usual order ([`set_output`]), which stops TCB0 and
+/// its interrupt too. The PIT's and PORTD's interrupts go off after it, which
+/// leaves none enabled, and the last step is power-down, with the ADC off as
+/// for any rest ([`prepare_sleep`]).
 ///
-/// With no interrupt enabled, the datasheet says only a reset wakes the chip
-/// (DS40002204A section 11.3.1). Its block diagram has SREG.I gate the wake-up
-/// as well (figure 13-1), so `cli` alone ought to do, but no sentence says so
-/// and nobody's tried it, which is why this does both. The `sleep` is in a
-/// loop in case something wakes it all the same.
+/// With no interrupt enabled and SREG.I clear, only a reset wakes the chip.
+/// The `sleep` is in a loop in case something wakes it all the same.
 ///
 /// What comes next depends on the 32 kHz oscillator. If it's running, so is
-/// the watchdog, which counts in every sleep mode (section 19.3.4 and table
-/// 11-1). Nothing here feeds it, so it resets the chip within 64 WDT clocks of
-/// the last feed, and that boot comes up off and capped, like any hang. If the
-/// oscillator's stopped there's no reset. The chip stays here, off, at
-/// power-down current, until the cell comes out.
-///
-/// The simulator runs this with the oscillator stopped, and checks the chip
-/// stays down. It has no resets, so it can't run the other case. No real chip
-/// has run either.
+/// the watchdog, which counts in every sleep mode. Nothing here feeds it, so
+/// it resets the chip within 64 WDT clocks of the last feed, and that boot
+/// comes up off and as a fault. If the oscillator's stopped there's no reset.
+/// The chip stays here, off, at power-down current, until the cell comes out.
 pub fn halt() -> ! {
     // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a compiler
     // barrier, so nothing below can move above it.
     unsafe { asm!("cli", options(nostack)) };
     set_output(Output::OFF);
     write(reg::RTC_PITINTCTRL, 0);
+    pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_INTDISABLE);
+    // INTDISABLE stops new edges raising the flag, and doesn't clear one
+    // that's already up, which could otherwise wake every `sleep` below.
+    out!(reg::VPORTD_INTFLAGS, 1 << SWITCH);
     prepare_sleep(true);
     loop {
         // SAFETY: `sleep` stops the CPU. It touches no memory and no flags.
@@ -450,51 +454,64 @@ pub fn halt() -> ! {
     }
 }
 
-/// RTC_PIT, vector 7, the 64 Hz tick. It clears the PIT's flag and sets
-/// [`TICK`], and that's all, since the loop only reads or clears that with
-/// interrupts off.
+/// RTC_PIT, the 64 Hz tick. It clears the PIT's flag and sets [`TICK`], and
+/// that's all, since the loop only reads or clears that with interrupts off.
 #[unsafe(no_mangle)]
 pub extern "avr-interrupt" fn rtc_pit() {
     write(reg::RTC_PITINTFLAGS, regs::RTC_PI);
-    write(reg::GPIO_GPIOR0, TICK);
+    out!(reg::GPR_GPR0, TICK);
 }
 
-/// Points the ADC at `muxpos`, turning it and the 1.1 V reference on if a rest
-/// turned them off.
-///
-/// The reference is forced on, rather than left to start when each single
-/// conversion asks for it. The datasheet doesn't say how long a request lasts,
-/// and a reference caught starting up reads wrong. Nothing else uses VREF, so
-/// DAC0REFSEL's bits can stay zero.
-fn adc_channel(muxpos: u8) {
-    write(reg::VREF_CTRLB, regs::VREF_ADC0REFEN);
-    write(reg::VREF_CTRLA, regs::VREF_ADC0REFSEL_1V1);
+/// TCB0_INT, the end of each TCB0 period while the light's on. It clears the
+/// flag and sets [`PERIOD`] for [`wait_for_tick`] to count.
+#[unsafe(no_mangle)]
+pub extern "avr-interrupt" fn tcb0_int() {
+    write(reg::TCB0_INTFLAGS, regs::TCB_CAPT);
+    out!(reg::GPR_GPR1, PERIOD);
+}
+
+/// PORTD_PORT, an edge on PD4. It clears the flag and nothing more. The wake
+/// is the point, and the loop reads the switch on the next tick.
+#[unsafe(no_mangle)]
+pub extern "avr-interrupt" fn portd_port() {
+    out!(reg::VPORTD_INTFLAGS, 1 << SWITCH);
+}
+
+/// Points the ADC at `channel`, with that channel's reference, turning it on
+/// if a rest turned it off. The cell's VDD / 10 reads against 1.024 V, as
+/// the stock firmware has it, and the temperature sensor against 2.048 V,
+/// which its factory calibration is for (section 33.3.3.8). The reference
+/// starts when the ADC asks for it, in about 10 µs (table 38-18).
+fn adc_channel(channel: Channel) {
+    let (reference, muxpos) = match channel {
+        Channel::Voltage => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),
+        Channel::Temperature => (regs::VREF_REFSEL_2V048, regs::ADC_MUXPOS_TEMPSENSE),
+    };
+    write(reg::VREF_ADC0REF, reference);
     write(reg::ADC0_MUXPOS, muxpos);
-    write(reg::ADC0_CTRLA, regs::ADC_ENABLE);
+    write(
+        reg::ADC0_CTRLA,
+        regs::ADC_ENABLE | regs::ADC_RESSEL_12BIT | regs::ADC_CONVMODE_SINGLEENDED,
+    );
 }
 
 /// Starts a conversion, four accumulated, setting the ADC up for its channel
 /// first if asked. `sensors::Schedule` only asks when the channel changes, or
-/// after a rest. It takes 260 µs or so and carries on through idle. Going to
-/// rest turns the ADC off even if one's running, and the datasheet doesn't say
-/// what becomes of it, which is why the first reading after a rest gets thrown
-/// away.
+/// after a rest, and throws the first result after a setup away. Four
+/// conversions take about 200 µs and carry on through idle.
 ///
 /// It never clears RESRDY. That works because [`adc_result`] runs every tick
 /// and reading the result clears it, so a stale one is never read twice.
 pub fn adc_start(convert: Convert) {
     if convert.setup {
-        adc_channel(match convert.channel {
-            Channel::Voltage => regs::ADC_MUXPOS_AIN1,
-            Channel::Temperature => regs::ADC_MUXPOS_TEMPSENSE,
-        });
+        adc_channel(convert.channel);
     }
     write(reg::ADC0_COMMAND, regs::ADC_STCONV);
 }
 
 /// The last conversion's result, if it's finished and not been read yet, from
-/// 0 to 4092. Reading the high byte is what clears RESRDY (errata
-/// DS80000886C 2.4.5), so both bytes always get read, low first for TEMP.
+/// 0 to 16,380. Reading `RES` clears RESRDY (section 33.5.12), and it's read
+/// low byte first, through TEMP (section 8.10.3).
 pub fn adc_result() -> Option<u16> {
     if read(reg::ADC0_INTFLAGS) & regs::ADC_RESRDY == 0 {
         return None;
@@ -504,11 +521,21 @@ pub fn adc_result() -> Option<u16> {
     Some(u16::from_le_bytes([lo, hi]))
 }
 
-/// The temperature sensor's factory calibration from the signature row.
+/// A 16-bit word of the signature row, which is plain memory in data space.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "addr is a signature row word in data space"
+)]
+fn signature_word(addr: usize) -> u16 {
+    u16::from_le_bytes([read(addr), read(addr + 1)])
+}
+
+/// The temperature sensor's factory calibration from the signature row
+/// (section 8.6.2.2).
 pub fn temperature_calibration() -> Calibration {
     Calibration {
-        offset: read(reg::SIGROW_TEMPSENSE1).cast_signed(),
-        gain: read(reg::SIGROW_TEMPSENSE0),
+        offset: signature_word(reg::SIGROW_TEMPSENSE1),
+        slope: signature_word(reg::SIGROW_TEMPSENSE0),
     }
 }
 
@@ -516,13 +543,12 @@ pub fn temperature_calibration() -> Calibration {
 /// the first feed there's no closed window, only the 32-clock timeout, and the
 /// first pass of the loop feeds it.
 ///
-/// It waits for the write to sync, so that feed can't land while it's still
-/// syncing. The WDT shares its oscillator with the PIT, so if that's dead
-/// these waits never end, and neither would the loop's first wait for a tick,
-/// which has no deadline with the light off. The light's off at this point,
-/// so that's where it stays. The WDT keeps counting in every sleep mode, which
-/// is fine, since the PIT does too and the loop runs every tick, on or off.
-/// Never set WDT.STATUS.LOCK, and never touch the WDTCFG fuse.
+/// It waits for the write to sync (section 22.3.6), so that feed can't land
+/// while it's still syncing. The WDT shares its oscillator with the PIT, so if
+/// that's dead these waits never end, and neither would the loop's first wait
+/// for a tick, which has no deadline with the light off. The light's off at
+/// this point, so that's where it stays. Never set WDT.STATUS.LOCK, and never
+/// touch the WDTCFG fuse.
 pub fn start_watchdog() {
     while read(reg::WDT_STATUS) & regs::WDT_SYNCBUSY != 0 {}
     protected_write(
@@ -543,9 +569,8 @@ pub fn feed_watchdog() {
 }
 
 /// What caused this reset, from `RSTCTRL.RSTFR`, leaving it clear for the
-/// next one. The flags are sticky. Writing 1 clears any of them, and a
-/// power-on reset clears them all but PORF (section 12.5.1). No other reset
-/// does, so this has to run on every boot before anything could reset the
+/// next one. The flags are sticky, and writing 1 clears any of them (section
+/// 14.5.1), so this has to run on every boot before anything could reset the
 /// chip.
 pub fn take_reset_flags() -> u8 {
     let flags = read(reg::RSTCTRL_RSTFR);
@@ -555,24 +580,22 @@ pub fn take_reset_flags() -> u8 {
 
 /// Has CRCSCAN check all of flash against the CRC `cargo xtask hex` puts in
 /// its last two bytes, and says whether it matched. Run it before turning
-/// anything on, since the scan stalls the CPU until it's done, 8,192 words at
-/// three clocks each, about 7 ms at the reset clock of 20 MHz / 6.
+/// anything on, since the scan stalls the CPU until it's done, 16,384 words
+/// at three clocks each (section 30.3.2), about 12 ms at the reset clock of
+/// 4 MHz.
 ///
 /// STATUS.OK reads 1 from reset, before any scan, and the scan only starts
-/// three cycles after ENABLE while the CPU carries on (section 27.3.1). So
+/// three cycles after ENABLE while the CPU carries on (section 30.3.1). So
 /// `nop`s go between the write and the first read, or a read could see the
 /// reset value and pass a flash that's wrong. Three would do if the three
 /// cycles count from the end of the `sts`; the datasheet doesn't say, so
 /// there's a fourth. Then it waits for BUSY to clear, which it should
 /// already have done, since the CPU was stalled.
 ///
-/// SRC = FLASH is the only choice with BOOTEND and APPEND at 0, and PRIORITY
-/// the only mode. Writing ENABLE starts a scan even when it's already 1.
+/// SRC = FLASH is the whole of flash. Writing ENABLE starts a scan even when
+/// it's already 1.
 pub fn flash_ok() -> bool {
-    write(
-        reg::CRCSCAN_CTRLB,
-        regs::CRCSCAN_SRC_FLASH | regs::CRCSCAN_MODE_PRIORITY,
-    );
+    write(reg::CRCSCAN_CTRLB, regs::CRCSCAN_SRC_FLASH);
     write(reg::CRCSCAN_CTRLA, regs::CRCSCAN_ENABLE);
     // SAFETY: four `nop`s, which touch nothing.
     unsafe {
@@ -593,142 +616,127 @@ pub fn flash_ok() -> bool {
 pub fn fuses() -> Fuses {
     Fuses {
         wdtcfg: read(reg::FUSE_WDTCFG),
+        bodcfg: read(reg::FUSE_BODCFG),
         osccfg: read(reg::FUSE_OSCCFG),
         syscfg0: read(reg::FUSE_SYSCFG0),
-        append: read(reg::FUSE_APPEND),
-        bootend: read(reg::FUSE_BOOTEND),
+        syscfg1: read(reg::FUSE_SYSCFG1),
+        codesize: read(reg::FUSE_CODESIZE),
+        bootsize: read(reg::FUSE_BOOTSIZE),
     }
 }
 
-/// Lights the aux channels for `colour`, dimly or brightly as
-/// `board::aux_bright` says, or none. Safe to call every tick.
+/// What the aux LEDs should show. Nothing yet.
 ///
-/// PC1 to PC3 have only on and off, so dim comes from the pin's pull-up. Each
-/// dim channel is an input with its pull-up on, and the trickle through the
-/// pull-up is the low setting. A bright one is an output driven high by a 1
-/// in OUT, and the dark ones are outputs at a 0. That these are what the
-/// stock firmware's low and high aux settings do on this board is likely, and
-/// nobody's measured either here.
-///
-/// OUT goes first, so a channel going dark is never left driven high as an
-/// output on its way there.
-pub fn set_aux(colour: Aux) {
-    let lit = board::aux_pin(colour);
-    let dim = lit & !board::aux_bright(colour);
-    write(reg::VPORTC_OUT, board::aux_bright(colour));
-    write(reg::VPORTC_DIR, PORTC_OUTPUTS & !dim);
-    // Each mask is computed in `board::AUX`, so release builds, which check
-    // shifts for overflow, have nothing to check at run time.
-    for &(pin, mask) in &board::AUX {
-        let ctrl = if dim & mask != 0 {
-            regs::PORT_PULLUPEN
-        } else {
-            0
-        };
-        write(reg::PORTC_PIN0CTRL + usize::from(pin), ctrl);
-    }
+/// The RGB aux hang off an AW2016 LED driver on TWI0 (PA2 and PA3), and
+/// there's no TWI driver, so this never addresses it and the AW2016 keeps the
+/// LEDs off, as it comes up. PA2 and PA3 are left as reset has them. The
+/// button LED on PA4 stays an output at 0, off. `colour` and
+/// `colour.bright()` are what a driver for it would show.
+pub const fn set_aux(colour: Aux) {
+    let _ = colour;
 }
 
-/// Whether the switch is down. It pulls PA5 low against the pin's pull-up.
-/// The loop calls this once a tick, and it's all the firmware knows of the
-/// switch. PA5 has no interrupt (see [`wait_for_tick`]).
+/// Whether the switch is down. It pulls PD4 low against the external
+/// pull-up. The loop calls this once a tick.
 ///
 /// IN stops following the pin in power-down, since the clock that syncs it
-/// has stopped (DS40002204A section 16.3.5), and the datasheet doesn't say
-/// how many clocks it takes to catch up after a wake. The loop gets here once
-/// the PIT's handler has run and returned, dozens of clocks on, which ought to
-/// be plenty. Nobody's measured it.
+/// has stopped, and the datasheet doesn't say how many clocks it takes to
+/// catch up after a wake. The loop gets here once the PIT's handler has run
+/// and returned, dozens of clocks on, which ought to be plenty. Nobody's
+/// measured it.
 pub fn switch_pressed() -> bool {
-    read(reg::VPORTA_IN) & (1 << SWITCH) == 0
+    read(reg::VPORTD_IN) & (1 << SWITCH) == 0
 }
 
-/// Runs `f` with interrupts held off, and puts SREG back after, so it's safe
-/// whether they were on or not.
-fn without_interrupts(f: impl FnOnce()) {
-    let sreg = read(reg::CPU_SREG);
-    // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a compiler
-    // barrier, so nothing in `f` can move above it.
-    unsafe { asm!("cli", options(nostack)) };
-    f();
-    write(reg::CPU_SREG, sreg);
+/// Spins for about `loops` × 3 main clocks, 0.75 µs a loop at 4 MHz.
+fn spin(loops: u8) {
+    // SAFETY: counts a register down to zero. Touches no memory. `dec`
+    // changes the status flags, so there's no `preserves_flags`, and with no
+    // `nomem` it's a compiler barrier, so the DAC and VREF stores either side
+    // stay either side.
+    unsafe {
+        asm!(
+            "1:",
+            "dec {n}",
+            "brne 1b",
+            n = inout(reg) loops => _,
+            options(nostack),
+        )
+    };
 }
 
-/// TCA0_OVF, vector 8, the bottom of a PWM cycle, 19,600 times a second, and
-/// the only thing that writes the compare while the light's on.
-///
-/// This is a first-order delta-sigma. The fraction piles up in [`DSM_SUM`],
-/// and each time it passes a whole step of duty, this cycle runs one step
-/// brighter and the step comes off the pile. Over 128 cycles the duty averages
-/// out to `dsm / 128`. Both bytes are under 128, so the sum fits in a `u8`,
-/// and a duty of 255 has no fraction (`ramp::DSM_TOP`), so it can't wrap.
-///
-/// It's about 50 cycles of the 510 in a PWM cycle, since 8-bit sums in I/O
-/// space need nothing from RAM. CMP0BUF lands at the next BOTTOM, a whole cycle
-/// on, so it doesn't matter how late this runs within that.
-///
-/// CMP0BUF shares TCA0's TEMP byte with every other 16-bit TCA0 register
-/// (DS40002204A section 8.5.6), and a write that's half done when this fires
-/// would go wrong. `set_output` is the only other thing that touches them, and
-/// it does that with this interrupt off and interrupts held off.
-#[unsafe(no_mangle)]
-pub extern "avr-interrupt" fn tca0_ovf() {
-    write(reg::TCA0_INTFLAGS, regs::TCA_OVF);
-    let sum = read(DSM_SUM).wrapping_add(read(DSM_FRACTION));
-    write(DSM_SUM, sum & FRACTION_MASK);
-    let duty = read(DSM_DUTY).wrapping_add(sum >> DSM_BITS);
-    write16(reg::TCA0_CMP0BUF, u16::from(duty));
-}
+/// Loops of [`spin`] for DAC0's output to fall to 0 before a reference or a
+/// path changes, about 20 µs. The datasheet's settling time is 7 µs typical
+/// for a full-scale step into 50 pF (table 38-23), and the DAC can sink only
+/// 0.001 mA, so how fast PD6 really falls depends on what the board pulls it
+/// down with, which nobody's measured. This is about three times the typical
+/// figure, a guess.
+const DAC_FALLS: u8 = 27;
 
-/// Turning on sets the duty, then raises the enable. Turning off drops the
-/// enable, then zeroes the duty. The duty goes through CMP0BUF, so it lands
-/// at the bottom of the PWM cycle, up to 51 µs after the write. That's well
-/// inside the 180 µs the boost converter takes to start switching.
+/// Loops of [`spin`] for a change of reference to settle, about 3 µs against
+/// the 2 µs of table 38-18.
+const REFERENCE_SETTLES: u8 = 4;
+
+/// Sets the driver for `output`, in an order meant never to ask for more
+/// current than the old setting or the new one does.
 ///
-/// A change of level with the light on only touches [`DSM_DUTY`] and
-/// [`DSM_FRACTION`]; [`tca0_ovf`] picks them up at the next BOTTOM. Interrupts
-/// are held off so it can't see one byte of the new level and one of the old.
+/// - Off: DAC0 to 0, its reference to 1.024 V, PC1 low, the paths low, and
+///   TCB0 stopped. That's the stock firmware's off order, the only one known
+///   to have run on this board.
+/// - On, with PC1 low: DAC0 to 0 at 1.024 V and the paths low first, TCB0
+///   started, then PC1 high, and nothing else. PC1 only ever rises with the
+///   DAC at 0, whatever `output` says. `torch::Torch` sends
+///   [`Output::STARTING`] for the first tick of any light, so the level comes
+///   a tick later, 15.6 ms with the driver on and asked for nothing, which is
+///   the stock firmware's order (PC1, then 8 ms, then the DAC).
+/// - On, with PC1 high: if the reference or the paths change, DAC0 goes to 0
+///   first, a wait of [`DAC_FALLS`] for it to get there, then the reference
+///   and a wait of [`REFERENCE_SETTLES`], then the paths,
+///   then the new code. A new path, or a higher reference, with the old code
+///   still in DAC0 could ask for a hundred times the current for a moment.
+///   If only the code changes, it's written straight in. How fast PD6
+///   really falls to 0 is unmeasured, so the wait is a guess (H3 in
+///   docs/safety.md).
 ///
-/// PB0 only belongs to TCA0 while the light's on. The datasheet doesn't say
-/// what level a waveform output holds in power-down, with TCA0 stopped, so
-/// going off hands the pin back to PORT, whose OUT is 0. CMP0 gets a direct
-/// write too, so power-down can follow on this very pass. The datasheet
-/// doesn't say whether that clears the waveform output before BOTTOM, so PB0
-/// could go high for up to one cycle at the next turn-on, 51 µs, inside the
-/// 180 µs above. That's reasoning only, and not checked on a real
-/// light.
+/// DAC0's output follows its high byte (section 34.5.2), and [`write16`]
+/// writes that second, so a code changes in one step.
 pub fn set_output(output: Output) {
     if !output.enable {
-        write(reg::VPORTB_OUT, read(reg::VPORTB_OUT) & !(1 << ENABLE));
-        without_interrupts(|| {
-            write(reg::TCA0_INTCTRL, 0);
-            write(reg::TCA0_CTRLB, CTRLB_OFF);
-            write16(reg::TCA0_CMP0BUF, 0);
-            write16(reg::TCA0_CMP0, 0);
-            write(DSM_DUTY, 0);
-            write(DSM_FRACTION, 0);
-            write(DSM_SUM, 0);
-        });
+        write16(reg::DAC0_DATA, 0);
+        write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+        out!(reg::VPORTC_OUT, 0);
+        out!(reg::VPORTA_OUT, 0);
+        write(reg::TCB0_CTRLA, 0);
+        write(reg::TCB0_INTCTRL, 0);
         return;
     }
 
-    let dsm = output.dsm.min(DSM_TOP);
-    // The assert below makes the conversion total, so the fallback is never
-    // taken. A `PWM_TOP` or `DSM_BITS` that broke it fails the build instead of
-    // writing a duty of 0 with the enable high.
-    const _: () = assert!(DSM_TOP >> DSM_BITS <= 0xFF);
-    let duty = u8::try_from(dsm >> DSM_BITS).unwrap_or(0);
-    let [low, _] = dsm.to_le_bytes();
-    let fraction = low & FRACTION_MASK;
-    let was_off = read(reg::VPORTB_OUT) & 1 << ENABLE == 0;
-    without_interrupts(|| {
-        write(DSM_DUTY, duty);
-        write(DSM_FRACTION, fraction);
-        if was_off {
-            write16(reg::TCA0_CMP0BUF, u16::from(duty));
-            write(reg::TCA0_CTRLB, CTRLB_ON);
-            write(reg::TCA0_INTFLAGS, regs::TCA_OVF);
-            write(reg::TCA0_INTCTRL, regs::TCA_OVF);
-        }
-    });
-    write(reg::VPORTB_OUT, read(reg::VPORTB_OUT) | 1 << ENABLE);
+    if !lit() {
+        write16(reg::DAC0_DATA, 0);
+        write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);
+        out!(reg::VPORTA_OUT, 0);
+        // TCB0 from the start of a period, its flag cleared before its
+        // interrupt goes on, and GPR1 cleared of anything stale.
+        out!(reg::GPR_GPR1, 0);
+        write16(reg::TCB0_CNT, 0);
+        write(reg::TCB0_INTFLAGS, regs::TCB_CAPT);
+        write(reg::TCB0_INTCTRL, regs::TCB_CAPT);
+        write(reg::TCB0_CTRLA, regs::TCB_CLKSEL_DIV1 | regs::TCB_ENABLE);
+        out!(reg::VPORTC_OUT, 1 << ENABLE);
+        return;
+    }
+
+    let reference = match output.vref {
+        Vref::V1024 => regs::VREF_REFSEL_1V024,
+        Vref::V2500 => regs::VREF_REFSEL_2V500,
+    };
+    let paths = output.paths.mask();
+    if read(reg::VREF_DAC0REF) != reference || read(reg::VPORTA_OUT) != paths {
+        write16(reg::DAC0_DATA, 0);
+        spin(DAC_FALLS);
+        write(reg::VREF_DAC0REF, reference);
+        spin(REFERENCE_SETTLES);
+        out!(reg::VPORTA_OUT, paths);
+    }
+    write16(reg::DAC0_DATA, output.dac.min(DAC_MAX) << DAC_SHIFT);
 }

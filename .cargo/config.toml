@@ -5,7 +5,7 @@ xtask = "run --quiet --package xtask --"
 
 [target.avr-none]
 rustflags = [
-  "-C", "target-cpu=attiny1616",
+  "-C", "target-cpu=avr32dd20",
   # Link with the rust-lld that ships with the toolchain, against our own
   # linker script and vector table (link.x, src/avr/rt.rs), so there's no
   # avr-gcc or avr-libc anywhere in the build. build.rs passes -Tlink.x.

@@ -357,8 +357,14 @@ pub fn generate(xml: &str) -> String {
          /// The device signature.\n\
          pub const SIGNATURE: [u8; 3] = {signature:#04X?};\n",
         addr.render(|_| "usize"),
-        mem.render(|_| "usize"),
-        bits.render(|value| if value > 0xFF { "u16" } else { "u8" }),
+        // usize is 16 bits on the AVR, and the mapped-flash window ends at
+        // 0x10000, one past the top of data space.
+        mem.render(|value| if value > 0xFFFF { "u32" } else { "usize" }),
+        bits.render(|value| match value {
+            0x1_0000.. => "u32",
+            0x100.. => "u16",
+            _ => "u8",
+        }),
         vectors.render(|_| "usize"),
     )
 }
@@ -373,7 +379,7 @@ mod tests {
     use super::*;
 
     fn atdf() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/ATtiny1616.atdf");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/AVR32DD20.atdf");
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("can't read {}: {e}", path.display()))
     }
 
@@ -392,27 +398,27 @@ mod tests {
         assert_eq!(num("16"), 16);
     }
 
-    /// One constant per rule in `generate`, as the datasheet has them, so a
-    /// generator that goes wrong can't agree with itself.
+    /// One constant per rule in `generate`, as the AVR32DD20's datasheet and
+    /// ATDF have them, so a generator that goes wrong can't agree with itself.
     #[test]
     fn generates_each_kind_of_constant() {
         assert_eq!(addr::CPU_CCP, 0x0034, "a plain address");
         assert_eq!(addr::ADC0_CTRLA, 0x0600, "base plus offset");
         assert_eq!(addr::TCA0_CMP1BUF, 0x0A3A, "a SINGLE mode register");
-        assert_eq!(addr::FUSE_BOOTEND, 0x1288, "a fuse");
-        assert_eq!(mem::INTERNAL_SRAM_START, 0x3800, "a segment's start");
-        assert_eq!(mem::INTERNAL_SRAM_SIZE, 0x0800, "a segment's size");
-        assert_eq!(mem::INTERNAL_SRAM_END, 0x4000, "a segment's end");
-        assert_eq!(mem::EEPROM_PAGE, 32, "a segment's page size");
+        assert_eq!(addr::FUSE_BOOTSIZE, 0x1058, "a fuse");
+        assert_eq!(mem::INTERNAL_SRAM_START, 0x7000, "a segment's start");
+        assert_eq!(mem::INTERNAL_SRAM_SIZE, 0x1000, "a segment's size");
+        assert_eq!(mem::INTERNAL_SRAM_END, 0x8000, "a segment's end");
+        assert_eq!(mem::PROGMEM_PAGE, 512, "a segment's page size");
         assert_eq!(regs::PORT_PULLUPEN, 0x08, "a mask");
         assert_eq!(regs::TCA_CMP1EN, 0x20, "a mask on a mode's register");
         assert_eq!(regs::TCD_CMPASET, 0x0FFF, "a mask wider than a byte");
-        assert_eq!(regs::ADC_REFSEL_VDDREF, 0x10, "a shifted value");
+        assert_eq!(regs::FUSE_MVSYSCFG_DUAL, 0x08, "a shifted value");
         assert_eq!(regs::RTC_PERIOD_CYC512, 0x40, "a shifted value");
-        assert_eq!(regs::ADC_REFSEL_INTREF, 0x00, "a value of zero");
-        assert_eq!(regs::VECTOR_RTC_PIT, 7, "a vector");
-        assert_eq!(regs::VECTORS, 31, "the vector count");
-        assert_eq!(regs::SIGNATURE, [0x1E, 0x94, 0x21], "the signature");
+        assert_eq!(regs::VREF_REFSEL_1V024, 0x00, "a value of zero");
+        assert_eq!(regs::VECTOR_RTC_PIT, 6, "a vector");
+        assert_eq!(regs::VECTORS, 36, "the vector count");
+        assert_eq!(regs::SIGNATURE, [0x1E, 0x95, 0x3A], "the signature");
     }
 
     #[test]
@@ -421,6 +427,9 @@ mod tests {
         for line in [
             "pub const ADC0_RES: usize = 0x610;",
             "pub const TCD_CMPASET: u16 = 0xFFF;",
+            "pub const LOCK_KEY: u32 = 0xFFFFFFFF;",
+            "pub const MAPPED_PROGMEM_END: u32 = 0x10000;",
+            "pub const MAPPED_PROGMEM_SIZE: usize = 0x8000;",
             "pub const RTC_PI: u8 = 0x01;",
         ] {
             assert!(source.contains(line), "{line}");
@@ -447,8 +456,9 @@ mod tests {
         consts.add("A".into(), 2, "second".into());
     }
 
-    /// `write16` and the ADC result read take these two bytes at a time, and
-    /// the simulator times TCA0's from CNT to CMP2BUF.
+    /// `write16` and the ADC result read take these two bytes at a time, the
+    /// simulator times TCA0's from CNT to CMP2BUF, and DAC0.DATA is the
+    /// current setpoint.
     #[test]
     fn the_16_bit_registers_are_16_bits() {
         let xml = atdf();
@@ -462,6 +472,7 @@ mod tests {
             addr::TCA0_CMP0BUF,
             addr::TCA0_CMP2BUF,
             addr::ADC0_RES,
+            addr::DAC0_DATA,
         ] {
             let found = registers
                 .iter()
@@ -478,8 +489,9 @@ mod tests {
         let registers = registers(&document);
         for (base, port) in [
             (addr::PORTA_PIN0CTRL, "PORTA"),
-            (addr::PORTB_PIN0CTRL, "PORTB"),
             (addr::PORTC_PIN0CTRL, "PORTC"),
+            (addr::PORTD_PIN0CTRL, "PORTD"),
+            (addr::PORTF_PIN0CTRL, "PORTF"),
         ] {
             for n in 0..8 {
                 let name = format!("PIN{n}CTRL");

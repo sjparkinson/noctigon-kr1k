@@ -315,8 +315,9 @@ impl Live {
         (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
-    /// A brightness bar, the level and its delta-sigma value, the switch and
-    /// the aux colour, cut to fit in `width` columns.
+    /// A brightness bar, the level and what it asks of the driver (DAC0's
+    /// code, its reference in millivolts and the power paths), the switch
+    /// and the aux colour, cut to fit in `width` columns.
     fn status(&self, width: usize) -> String {
         let level = self.torch.level();
         let output = ramp::output(level);
@@ -327,9 +328,11 @@ impl Live {
             (false, _) => "up",
         };
         let text = format!(
-            " {:>#7}  dsm {:>5}  switch {switch:<4}  aux {:?}",
+            " {:>#7}  dac {:>4} of {:>4} mV {:<4}  switch {switch:<4}  aux {:?}",
             Level(level),
-            output.dsm,
+            output.dac,
+            output.vref.millivolts(),
+            format!("{:?}", output.paths),
             self.torch.aux()
         );
         let text: String = text.chars().take(width.saturating_sub(BAR + 1)).collect();

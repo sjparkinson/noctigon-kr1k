@@ -1,14 +1,15 @@
 //! Not firmware, but src/avr/hw.rs driven in a way the torch firmware never
 //! drives it, for `cargo xtask` to check hw.rs's own guards with. The library
 //! never says it's resting with the light on, so `main` never asks
-//! `hw::wait_for_tick` for power-down with PB2 high, and the guard in
+//! `hw::wait_for_tick` for power-down with PC1 high, and the guard in
 //! `prepare_sleep` that idles instead is never run by the firmware.
 //!
-//! `main` lights the output, waits for a few ticks asking for power-down each
-//! time, turns the output off, waits for one more asking the same, and stops
-//! in `guards_done`. xtask runs it on the simulator from reset and checks it
-//! only powered down that last time (`sim::guards`). Without the guard, the
-//! simulator's own rule against power-down with PB2 high refuses it first.
+//! `main` starts the driver, sets a level the tick after as `torch::Torch`
+//! does, waits for a few ticks asking for power-down each time, turns the
+//! output off, waits for one more asking the same, and stops in
+//! `guards_done`. xtask runs it on the simulator from reset and checks it only
+//! powered down that last time (`sim::guards`). Without the guard, the
+//! simulator's own rule against power-down with PC1 high refuses it first.
 //! `cargo xtask hex` builds this alongside the firmware; it's never flashed.
 
 #![cfg_attr(target_arch = "avr", no_std, no_main)]
@@ -31,7 +32,7 @@ mod rt;
 #[cfg(target_arch = "avr")]
 mod guards {
     use crate::hw;
-    use kr1k::ramp::Output;
+    use kr1k::ramp::{self, Output};
 
     /// Lit passes asking for power-down. `sim::guards` counts on this.
     const LIT_TICKS: u8 = 4;
@@ -42,10 +43,13 @@ mod guards {
     extern "C" fn main() -> ! {
         hw::hold_enable_low();
         hw::init();
-        hw::set_output(Output {
-            enable: true,
-            dsm: 1000,
-        });
+        hw::set_output(Output::STARTING);
+        // Idle for the warm-up tick, so only the LIT_TICKS below ask for
+        // power-down with PC1 high.
+        if !hw::wait_for_tick(false) {
+            hw::halt();
+        }
+        hw::set_output(ramp::output(ramp::CEILING));
         for _ in 0..LIT_TICKS {
             if !hw::wait_for_tick(true) {
                 hw::halt();
@@ -79,6 +83,6 @@ mod guards {
 
 #[cfg(not(target_arch = "avr"))]
 fn main() {
-    eprintln!("this is a check of hw.rs for the ATtiny1616; `cargo xtask hex` runs it");
+    eprintln!("this is a check of hw.rs for the AVR32DD20; `cargo xtask hex` runs it");
     std::process::exit(1);
 }

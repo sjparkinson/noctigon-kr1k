@@ -13,7 +13,7 @@
 //! clocks, halfway through a 32-clock open window that starts 32 clocks after
 //! the last feed.
 //!
-//! Window mode only starts with the first `wdr` (DS40002204A §19.3.3.2). Until
+//! Window mode only starts with the first `wdr` (DS40002413B §22.3.3.2). Until
 //! then the WDT most likely times out after the open window alone (the
 //! datasheet implies it rather than saying so), so the first pass feeds it
 //! straight away, which also lines the windows up with the ticks.
@@ -26,10 +26,9 @@
 //! so.
 //!
 //! The watchdog can't catch its own oscillator stopping, since the tick stops
-//! with it. [`TICK_DEADLINE_CYCLES`] is for that, and only with the light on.
+//! with it. [`TICK_DEADLINE_PERIODS`] is for that, and only with the light on.
 
 use crate::TICKS_PER_SECOND;
-use crate::ramp::PWM_TOP;
 
 /// Cycles of the WDT's 1.024 kHz clock in one tick.
 pub const CLOCKS_PER_TICK: u16 = 1024 / TICKS_PER_SECOND;
@@ -45,7 +44,7 @@ pub const FEED_TICKS: u8 = 3;
 // A feed lands strictly inside the open window, and the first one comes
 // before the open window alone runs out, since the first tick arrives within
 // a tick of `hw::start_watchdog` turning the WDT on. `wdr` takes two to three WDT clocks
-// to sync (§19.3.6), the same for every feed, so it shifts the windows without
+// to sync (§22.3.6), the same for every feed, so it shifts the windows without
 // changing the gap between feeds.
 #[expect(
     clippy::as_conversions,
@@ -57,55 +56,69 @@ const _: () = {
     assert!(CLOCKS_PER_TICK < OPEN_CLOCKS);
 };
 
-/// The main clock in hertz. It's the 20 MHz oscillator divided by 2, as
-/// `hw::init` sets it, and xtask's simulator holds the firmware to the same
-/// number.
-pub const CLOCK_HZ: u32 = 10_000_000;
+/// The main clock in hertz.
+///
+/// It's the internal high-frequency oscillator at 4 MHz with no prescaler,
+/// which is the reset value and which `hw::init` writes again. xtask's
+/// simulator holds the firmware to the same number.
+pub const CLOCK_HZ: u32 = 4_000_000;
 
-/// How many PWM cycles `hw::wait_for_tick` waits for a tick with the light on
-/// before it gives up, and `main` turns the light off for good (`hw::halt`).
+/// Main clocks in one period of TCB0, 1 ms.
+///
+/// TCB0 is the timer `hw::wait_for_tick` counts while the light's on. Its
+/// periodic interrupt mode counts from 0 to CCMP and starts again
+/// (DS40002413B section 24.3.3.1.1), so `hw::init` writes one less than this
+/// to CCMP.
+pub const TIMER_PERIOD_CLOCKS: u16 = 4000;
+
+/// How many TCB0 periods `hw::wait_for_tick` waits for a tick with the light
+/// on before it gives up, and `main` turns the light off for good
+/// (`hw::halt`).
 ///
 /// The tick and the watchdog both run off the 32 kHz oscillator. If that
 /// stopped with the light on, the loop would wait for a tick that never came
-/// and the watchdog would never bite, so the boost converter would stay on
-/// with nothing watching the cell or the temperature. While the light's on,
-/// TCA0's overflow wakes that wait once a PWM cycle, and TCA0 runs off the
-/// 20 MHz oscillator. So the wait counts those.
+/// and the watchdog would never bite, so the driver would stay on with
+/// nothing watching the cell or the temperature. While the light's on, TCB0
+/// runs off the main clock, the other oscillator, and flags each period. So
+/// the wait counts those flags.
 ///
-/// A PWM cycle is 2 × [`PWM_TOP`] clocks, 51 µs, and a tick is about 306 of
-/// them. 2,048 is about 104 ms, over six ticks.
+/// The first period it counts can be part of one, so the deadline is 103 to
+/// 104 ms, over six ticks.
 ///
 /// A tick that's only late is the watchdog's to catch. It bites 64 WDT clocks
-/// after a feed has synced, which takes up to three more (§19.3.6), so 67 in
-/// all, a little over four ticks however slow the oscillator runs. At worst
-/// the 32 kHz oscillator is 30% slow and the 20 MHz one 5% fast (DS40002204A
-/// tables 36-13 and 36-12, over the full operating range, from
-/// characterisation and not production test), which makes a tick about 460
-/// cycles and those 67 clocks about 1,925. The deadline is longer, by 6%, so
-/// with both oscillators inside their limits the watchdog gets there first,
-/// and this is left for an oscillator that's stopped. Nobody's seen either on
-/// a real chip.
-pub const TICK_DEADLINE_CYCLES: u16 = 2048;
+/// after a feed has synced, which takes up to three more, so 67 in all, a
+/// little over four ticks however slow the oscillator runs. DS40002413B gives
+/// no accuracy for the 32 kHz oscillator, so this keeps the margin the TS26
+/// had from the ATtiny1616's figure of 30 % slow (DS40002204A table 36-13),
+/// which is a guess for this chip. The main oscillator is at worst 5 % fast
+/// (DS40002413B figure 38-2, over its whole voltage and temperature range).
+/// Then those 67 clocks take about 93.5 ms and the deadline at least about
+/// 98, so with both oscillators inside those limits the watchdog gets there
+/// first, and this is left for an oscillator that's stopped. Nobody's seen
+/// either on a real chip.
+pub const TICK_DEADLINE_PERIODS: u16 = 104;
 
 #[expect(
     clippy::as_conversions,
     reason = "widening to u32 in a const, where From can't be called"
 )]
 const _: () = {
-    // Main clocks in a PWM cycle, in a tick and in the deadline.
-    let cycle = 2 * PWM_TOP as u32;
+    let period = TIMER_PERIOD_CLOCKS as u32;
     let tick = CLOCK_HZ / TICKS_PER_SECOND as u32;
-    let deadline = TICK_DEADLINE_CYCLES as u32 * cycle;
+    // The shortest the deadline can be, a partial period and the rest whole,
+    // and the longest.
+    let shortest = (TICK_DEADLINE_PERIODS as u32 - 1) * period;
+    let longest = TICK_DEADLINE_PERIODS as u32 * period;
     // About a tenth of a second.
-    assert!(deadline > 6 * tick && deadline < 7 * tick);
-    // The slowest tick inside the datasheet's limits, with 5% more clocks from
-    // the 20 MHz oscillator in the 1 / 0.7 of the time the 32 kHz one takes.
+    assert!(shortest > 6 * tick && longest < 7 * tick);
+    // The slowest tick inside those limits, with 5 % more main clocks in the
+    // 1 / 0.7 of the time the 32 kHz oscillator takes.
     let slowest = tick * 105 / 70;
     // The longest the watchdog takes to bite, in WDT clocks from the `wdr`.
     // That's three to sync it, then both windows. The deadline counts from the
     // wait after a tick, which is never before the last feed.
     let bite = (3 + CLOSED_CLOCKS + OPEN_CLOCKS) as u32;
-    assert!(deadline * CLOCKS_PER_TICK as u32 > bite * slowest);
+    assert!(shortest * CLOCKS_PER_TICK as u32 > bite * slowest);
 };
 
 /// Counts ticks between feeds.
@@ -148,7 +161,7 @@ impl Feeder {
 
     /// Whether the sleep after this pass can be power-down, `resting` being
     /// whether the torch has anything to do. Not straight after a feed, because
-    /// a `wdr` takes two or three WDT clocks to sync (§19.3.6), and the
+    /// a `wdr` takes two or three WDT clocks to sync (§22.3.6), and the
     /// datasheet doesn't say it gets there with the peripheral clock stopped.
     /// If it didn't, the watchdog would reset a resting torch. That costs an
     /// idle tick in [`FEED_TICKS`] while resting.
@@ -166,17 +179,19 @@ mod tests {
         assert_eq!(CLOCKS_PER_TICK, 16);
     }
 
-    /// The figures in [`TICK_DEADLINE_CYCLES`]'s comment.
+    /// The figures in [`TICK_DEADLINE_PERIODS`]'s comment.
     #[test]
-    fn the_tick_deadline_is_104_ms_against_ticks_of_306_cycles_or_460_at_worst() {
-        let cycle = 2 * u32::from(PWM_TOP);
-        let tick = CLOCK_HZ / u32::from(TICKS_PER_SECOND);
-        assert_eq!(tick / cycle, 306);
-        assert_eq!((tick * 105 / 70).div_ceil(cycle), 460);
-        // 67 WDT clocks at that speed, 16 to a tick.
-        assert_eq!((67 * (tick * 105 / 70) / 16).div_ceil(cycle), 1925);
-        let deadline = u32::from(TICK_DEADLINE_CYCLES) * cycle;
-        assert_eq!(deadline / (CLOCK_HZ / 1000), 104);
+    fn the_tick_deadline_is_103_to_104_ms_against_a_bite_of_93_5_at_worst() {
+        let period = u32::from(TIMER_PERIOD_CLOCKS);
+        let micros = |clocks: u32| clocks / (CLOCK_HZ / 1_000_000);
+        assert_eq!(micros(period), 1000);
+        let deadline = u32::from(TICK_DEADLINE_PERIODS);
+        assert_eq!(micros((deadline - 1) * period), 103_000);
+        assert_eq!(micros(deadline * period), 104_000);
+        // 67 WDT clocks of 1 / 1024 s, 30 % slow, in microseconds.
+        assert_eq!(67 * 1_000_000_u64 * 100 / (1024 * 70), 93_470);
+        // The shortest deadline on a main clock 5 % fast.
+        assert_eq!(micros((deadline - 1) * period) * 100 / 105, 98_095);
     }
 
     #[test]

@@ -7,7 +7,7 @@ use kr1k::regs::mem;
 
 /// AVR ELF files put data space at 0x800000.
 pub const DATA_SPACE: u32 = 0x80_0000;
-/// SRAM's data-space range on the ATtiny1616, as ELF addresses.
+/// SRAM's data-space range on the AVR32DD20, as ELF addresses.
 pub const RAM: Range<u32> =
     DATA_SPACE + mem::INTERNAL_SRAM_START as u32..DATA_SPACE + mem::INTERNAL_SRAM_END as u32;
 /// The same range as the CPU and UPDI see it, as data-space addresses.
@@ -270,10 +270,10 @@ mod tests {
         }
         // (name, type, flags, addr, offset, size, link)
         let sections = [
-            (1u32, 8u32, SHF_ALLOC | 0x1, 0x80_3800u32, 0u32, 12u32, 0u32), // .bss counts
+            (1u32, 8u32, SHF_ALLOC | 0x1, 0x80_7000u32, 0u32, 12u32, 0u32), // .bss counts
             // .debug_info doesn't, wherever it says it is, since it isn't
             // allocated.
-            (34, 1, 0, 0x80_3900, 0, 999, 0),
+            (34, 1, 0, 0x80_7100, 0, 999, 0),
             (6, 3, 0, 0, shstrtab_at, shstrtab.len() as u32, 0),
             (16, SHT_SYMTAB, 0, 0, symtab_at, symtab.len() as u32, 4),
             (24, 3, 0, 0, strtab_at, strtab.len() as u32, 0),
@@ -325,8 +325,8 @@ mod tests {
 
     #[test]
     fn sram_is_the_same_range_in_elf_and_data_space_addresses() {
-        assert_eq!(RAM, 0x80_3800..0x80_4000);
-        assert_eq!(SRAM, 0x3800..0x4000);
+        assert_eq!(RAM, 0x80_7000..0x80_8000);
+        assert_eq!(SRAM, 0x7000..0x8000);
     }
 
     #[test]
@@ -395,7 +395,7 @@ mod tests {
     #[test]
     fn reads_section_names_symbols_and_the_entry_point() {
         let elf = Elf::parse(&sample()).unwrap();
-        assert_eq!(elf.section(".bss"), Some(0x80_3800..0x80_380C));
+        assert_eq!(elf.section(".bss"), Some(0x80_7000..0x80_700C));
         assert_eq!(elf.section(".text"), None);
         assert_eq!(elf.symbol("__reset"), Some(0x7E));
         assert_eq!(elf.symbol("main"), Some(0xB2));

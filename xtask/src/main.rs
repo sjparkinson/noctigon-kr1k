@@ -42,7 +42,7 @@ commands:
                           target/noctigon-kr1k-0283.hex and print flash, RAM,
                           stack, loop and handler use
   hex --no-examples       the same, leaving docs/ui.md's examples out of the
-                          simulator run, for a breakout test build (T1, T5)
+                          simulator run, for a breakout test build (T1)
   breakages [name...]     check hex refuses copies of the firmware, each broken on
                           purpose in one way, and leave the checkout alone
   ping <port>           check the programmer can see the chip, writing nothing,
@@ -50,8 +50,8 @@ commands:
   peek <port>             read the running chip's registers and SRAM, to see how
                           far the firmware got; it writes nothing, and the same
                           reset follows, so only the first run counts
-  backup <port> <dir>     save the chip's flash, EEPROM, fuses and serial number
-                          into <dir>
+  backup <port> <dir>     save the chip's flash, EEPROM, fuses, lock bits, user
+                          row and serial number into <dir>
   flash <port> [file.hex] build and flash the firmware, or flash file.hex
   restore <port> <dir>    put <dir>/flash.hex and <dir>/eeprom.hex back, on the
                           chip whose serial number is in <dir>/serial.hex and
@@ -207,10 +207,10 @@ fn hex(examples: bool) -> Result<(), String> {
     println!(
         "{}",
         row(
-            "dsm",
+            "isr",
             sim.handler_instructions,
             Some(sim.handler_budget),
-            "instructions per PWM cycle"
+            "instructions per handler, against a TCB0 period"
         )
     );
     Ok(())
@@ -269,10 +269,12 @@ fn ping(port: &str) -> Result<(), String> {
 
 /// Reads what the running firmware has left behind, without a write, since
 /// UPDI reaches data space while the CPU runs. Turning UPDI off afterwards
-/// should reset the chip (DS §33.3.2.2.2), so a second read sees a fresh
-/// boot, not what the first one saw. Only `hw::init` sets the clock, the pin
-/// directions and the PIT, so those say whether it ran. VPORTB.OUT says
-/// whether the boost converter's on.
+/// should reset the chip (DS40002413B §36.3.2.2.2), so a second read sees a
+/// fresh boot, not what the first one saw. Only `hw::init` sets the pin
+/// directions, DAC0, TCB0's period and the PIT, so those say whether it ran.
+/// VPORTC.OUT says whether PC1, the driver's enable, is high, VPORTA.OUT
+/// which paths are on, and DAC0.DATA what current it's asking for. MVIO.STATUS
+/// says whether VDDIO2, which PC1 hangs off, is there.
 ///
 /// The addresses are the firmware's own, from src/regs.rs. src/regs.rs has no
 /// stack pointer, since the firmware never touches it, so that comes from the
@@ -286,17 +288,26 @@ fn peek(port: &str) -> Result<(), String> {
         ("CPU.SPL", usize::from(avr::SPL)),
         ("CPU.SPH", usize::from(avr::SPH)),
         ("CPU.SREG", addr::CPU_SREG),
-        ("VPORTB.DIR", addr::VPORTB_DIR),
-        ("VPORTB.OUT", addr::VPORTB_OUT),
+        ("CLKCTRL.OSCHFCTRLA", addr::CLKCTRL_OSCHFCTRLA),
+        ("MVIO.STATUS", addr::MVIO_STATUS),
+        ("VPORTA.DIR", addr::VPORTA_DIR),
+        ("VPORTA.OUT", addr::VPORTA_OUT),
         ("VPORTC.DIR", addr::VPORTC_DIR),
-        ("TCA0.CTRLA", addr::TCA0_CTRLA),
-        ("TCA0.CTRLB", addr::TCA0_CTRLB),
+        ("VPORTC.OUT", addr::VPORTC_OUT),
+        ("VPORTD.DIR", addr::VPORTD_DIR),
+        ("VPORTD.IN", addr::VPORTD_IN),
+        ("DAC0.CTRLA", addr::DAC0_CTRLA),
+        ("DAC0.DATAL", addr::DAC0_DATA),
+        ("DAC0.DATAH", addr::DAC0_DATA + 1),
+        ("VREF.DAC0REF", addr::VREF_DAC0REF),
+        ("TCB0.CTRLA", addr::TCB0_CTRLA),
+        ("TCB0.CCMPL", addr::TCB0_CCMP),
         ("RTC.PITCTRLA", addr::RTC_PITCTRLA),
     ];
 
     let mut p = connect(port)?;
     for (name, at) in registers {
-        println!("{name:18} {:02X}", p.read(at as u16, 1)?[0]);
+        println!("{name:20} {:02X}", p.read(at as u16, 1)?[0]);
     }
     let sram = p.read(
         elf::SRAM.start,
@@ -312,7 +323,7 @@ fn peek(port: &str) -> Result<(), String> {
 }
 
 /// `bytes` as one line per run of equal bytes, so a pattern and where it stops
-/// stand out from the 2 KB around it.
+/// stand out from the 4 KB around it.
 fn runs(start: u16, bytes: &[u8]) -> Vec<String> {
     bytes
         .chunk_by(|a, b| a == b)
@@ -345,16 +356,16 @@ fn this_boards_hex(path: &Path) -> Result<(), String> {
 /// Checks a file's image against the CRC the firmware checks at every power-on,
 /// since one that doesn't match would flash and verify cleanly, then cap itself
 /// at level 50 with nothing to say why. `cargo xtask hex` always writes all
-/// 16 KB, so a full image that doesn't check is refused. A shorter one isn't
+/// 32 KB, so a full image that doesn't check is refused. A shorter one isn't
 /// ours, or wasn't signed. The stock firmware's hex is like that and needs no
-/// CRC, and so is T0 (first light), so it gets a warning and goes ahead. Not for
+/// CRC, and so is the first-light image, so it gets a warning and goes ahead. Not for
 /// `restore`, since a factory backup has no CRC of ours.
 fn signed(image: &[u8]) -> Result<(), String> {
     if image.len() < map::FLASH_SIZE {
         eprintln!(
             "warning: the image isn't the full {} bytes with a CRC, so it isn't a signed build \
-             of the full firmware. That's right for the stock firmware and for T0 (first light), which check \
-             no CRC. If it's a build from main, it'll cap itself at level 50 on every boot, so \
+             of the full firmware. That's right for the stock firmware and for the first-light image, which \
+             check no CRC. If it's a build from main, it'll cap itself at level 50 on every boot, so \
              flash the file `cargo xtask hex` writes instead",
             map::FLASH_SIZE
         );
@@ -401,10 +412,12 @@ fn backup_from<W: Wire>(
     write(&flash_path, &ihex::encode(&chip.flash))?;
     write(&dir.join("eeprom.hex"), &ihex::encode(&chip.eeprom))?;
     write(&dir.join("fuses.hex"), &ihex::encode(&chip.fuses))?;
+    write(&dir.join("lock.hex"), &ihex::encode(&chip.lock))?;
+    write(&dir.join("userrow.hex"), &ihex::encode(&chip.userrow))?;
     write(&dir.join("serial.hex"), &ihex::encode(chip.serial.bytes()))?;
     eprintln!(
-        "saved flash, EEPROM, fuses (for reference, never written back) and the chip's serial \
-         number, {}, to {}",
+        "saved flash, EEPROM, fuses, lock bits and user row (those three for reference, never \
+         written back) and the chip's serial number, {}, to {}",
         chip.serial,
         dir.display()
     );
@@ -424,27 +437,37 @@ fn backup_from<W: Wire>(
     Ok(())
 }
 
-/// What `backup` saves.
+/// What `backup` saves. Each memory but the serial number is one avrdude
+/// names too (`-U flash:r:...`, `eeprom`, `fuses`, `lock`, `userrow`), read
+/// from the same addresses, so the files compare with avrdude's once both are
+/// decoded.
 struct Chip {
     flash: Vec<u8>,
     eeprom: Vec<u8>,
-    /// The fuses, then the lock byte.
+    /// FUSE.WDTCFG on, 16 bytes.
     fuses: Vec<u8>,
+    /// LOCK.KEY, low byte first.
+    lock: Vec<u8>,
+    userrow: Vec<u8>,
     /// Which chip this is, for `restore` to check before it writes.
     serial: SerialNumber,
 }
 
 fn read_chip<W: Wire>(p: &mut Programmer<W>) -> Result<Chip, String> {
     eprintln!("reading flash");
-    let flash = p.read(map::FLASH, map::FLASH_SIZE)?;
-    eprintln!("reading EEPROM, fuses and the serial number");
+    let flash = p.read(map::UPDI_FLASH, map::FLASH_SIZE)?;
+    eprintln!("reading EEPROM, fuses, lock bits, user row and the serial number");
     let eeprom = p.read(map::EEPROM, map::EEPROM_SIZE)?;
     let fuses = p.read(map::FUSES, map::FUSES_SIZE)?;
+    let lock = p.read(map::LOCK, map::LOCK_SIZE)?;
+    let userrow = p.read(map::USERROW, map::USERROW_SIZE)?;
     let serial = p.serial_number()?;
     Ok(Chip {
         flash,
         eeprom,
         fuses,
+        lock,
+        userrow,
         serial,
     })
 }
@@ -455,7 +478,7 @@ fn report_stamp(what: &str, flash: &[u8]) {
         Some(text) => eprintln!("{what} has the stamp `{text}`"),
         None => eprintln!(
             "{what} has no stamp, so it isn't a full build from this repo (it may be the \
-             stock firmware, T0 (first light) or an empty chip)"
+             stock firmware, the first-light image or an empty chip)"
         ),
     }
 }
@@ -525,7 +548,7 @@ fn read_backup(dir: &Path) -> Result<Backup, String> {
 /// Erase, write, verify, restart, on whatever `connect` connects to. The
 /// chip erase wipes EEPROM too unless the EESAVE fuse is set; pass `Some` to
 /// put contents back. Images that don't fit are refused before `connect`
-/// runs.
+/// runs, and `connect` refuses any chip but an AVR32DD20.
 fn program<W: Wire>(
     connect: impl FnOnce() -> Result<Programmer<W>, String>,
     flash: &[u8],
@@ -533,7 +556,7 @@ fn program<W: Wire>(
 ) -> Result<(), String> {
     if flash.len() > map::FLASH_SIZE {
         return Err(format!(
-            "the image is {} bytes; the ATtiny1616 has {}",
+            "the image is {} bytes; the AVR32DD20 has {}",
             flash.len(),
             map::FLASH_SIZE
         ));
@@ -563,10 +586,10 @@ fn write_and_verify<W: Wire>(
 ) -> Result<(), String> {
     eprintln!("erasing and writing {} bytes of flash", flash.len());
     p.erase_and_write_flash(flash)?;
-    p.verify(map::FLASH, flash)?;
+    p.verify(map::UPDI_FLASH, flash)?;
     if let Some(eeprom) = eeprom {
         eprintln!("writing EEPROM");
-        p.write(map::EEPROM, map::EEPROM_PAGE, eeprom)?;
+        p.write_eeprom(eeprom)?;
         p.verify(map::EEPROM, eeprom)?;
     }
     Ok(())
@@ -604,7 +627,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    use super::updi::tests::fake::Tiny;
+    use super::updi::tests::fake::Dd20;
     use super::updi::{Programmer, SerialNumber};
     use super::{
         backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, runs, signed, stamp,
@@ -636,24 +659,24 @@ mod tests {
     }
 
     /// A fake chip with something in flash and EEPROM worth backing up.
-    fn chip() -> Tiny {
-        let mut tiny = Tiny::new();
-        for (i, byte) in tiny.flash.iter_mut().take(1000).enumerate() {
+    fn chip() -> Dd20 {
+        let mut dd = Dd20::new();
+        for (i, byte) in dd.flash.iter_mut().take(1000).enumerate() {
             *byte = (i * 7 + 3) as u8;
         }
-        for (i, byte) in tiny.eeprom.iter_mut().enumerate() {
+        for (i, byte) in dd.eeprom.iter_mut().enumerate() {
             *byte = i as u8;
         }
-        tiny
+        dd
     }
 
     /// Stands in for opening the port, with the fake chip on the far end.
-    fn on<'a>(tiny: &'a mut Tiny) -> impl FnOnce() -> Result<&'a mut Tiny, String> {
-        move || Ok(tiny)
+    fn on<'a>(dd: &'a mut Dd20) -> impl FnOnce() -> Result<&'a mut Dd20, String> {
+        move || Ok(dd)
     }
 
     /// Stands in for opening the port where nothing should get that far.
-    fn no_port() -> Result<Tiny, String> {
+    fn no_port() -> Result<Dd20, String> {
         panic!("the port was opened");
     }
 
@@ -665,23 +688,28 @@ mod tests {
     fn backup_saves_the_serial_number_and_restore_puts_the_backup_back() {
         let scratch = Scratch::new("restores");
         let dir = scratch.backup();
-        let mut tiny = chip();
-        let (flash, eeprom) = (tiny.flash.clone(), tiny.eeprom.clone());
+        let mut dd = chip();
+        let (flash, eeprom) = (dd.flash.clone(), dd.eeprom.clone());
 
-        backup_from(on(&mut tiny), &dir).unwrap();
+        backup_from(on(&mut dd), &dir).unwrap();
         assert_eq!(read_hex(&dir.join("flash.hex")).unwrap(), flash);
         assert_eq!(read_hex(&dir.join("eeprom.hex")).unwrap(), eeprom);
-        assert_eq!(read_hex(&dir.join("serial.hex")).unwrap(), tiny.serial);
-        assert!(dir.join("fuses.hex").exists(), "no fuses.hex");
+        assert_eq!(read_hex(&dir.join("serial.hex")).unwrap(), dd.serial);
+        assert_eq!(read_hex(&dir.join("fuses.hex")).unwrap(), dd.fuses);
+        assert_eq!(read_hex(&dir.join("lock.hex")).unwrap(), dd.lock);
+        assert_eq!(read_hex(&dir.join("userrow.hex")).unwrap(), dd.userrow);
+        // A backup is reads, the key and two resets, and stores nothing.
+        assert_eq!(dd.stores_in, 0, "backup stored something");
+        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
 
         // Something else has been flashed since.
-        tiny.flash.fill(0x42);
-        tiny.eeprom.fill(0x24);
-        restore_onto(on(&mut tiny), &dir).unwrap();
-        assert!(tiny.flash == flash, "flash isn't the backup's");
-        assert!(tiny.eeprom == eeprom, "EEPROM isn't the backup's");
-        assert!(tiny.updi_disabled, "UPDI was left on");
-        assert!(!tiny.progmode, "the chip was left in programming mode");
+        dd.flash.fill(0x42);
+        dd.eeprom.fill(0x24);
+        restore_onto(on(&mut dd), &dir).unwrap();
+        assert!(dd.flash == flash, "flash isn't the backup's");
+        assert!(dd.eeprom == eeprom, "EEPROM isn't the backup's");
+        assert!(dd.updi_disabled, "UPDI was left on");
+        assert!(!dd.progmode, "the chip was left in programming mode");
     }
 
     #[test]
@@ -691,7 +719,7 @@ mod tests {
         let mut breakout = chip();
         backup_from(on(&mut breakout), &dir).unwrap();
 
-        let mut torch = Tiny::new();
+        let mut torch = Dd20::new();
         torch.serial[4] ^= 0x80;
         torch.flash.fill(0x42);
         torch.eeprom.fill(0x24);
@@ -702,7 +730,7 @@ mod tests {
         assert!(err.contains(&dir.display().to_string()), "{err}");
         assert!(torch.flash.iter().all(|&b| b == 0x42), "flash changed");
         assert!(torch.eeprom.iter().all(|&b| b == 0x24), "EEPROM changed");
-        assert_eq!(torch.page_writes + torch.page_erase_writes, 0);
+        assert_eq!(torch.nvm_operations(), 0);
         assert!(torch.updi_disabled, "UPDI was left on");
         assert!(!torch.progmode, "the chip was left in programming mode");
         assert!(!torch.in_reset, "the chip was left in reset");
@@ -729,7 +757,7 @@ mod tests {
 
         let err = restore_onto(no_port, &dir).unwrap_err();
         assert!(err.contains("serial.hex"), "{err}");
-        assert!(err.contains("10 bytes, not 9"), "{err}");
+        assert!(err.contains("16 bytes, not 9"), "{err}");
     }
 
     #[test]
@@ -737,12 +765,12 @@ mod tests {
         for blank in [0xFF, 0x00] {
             let scratch = Scratch::new(&format!("blank-{blank:02x}"));
             let dir = scratch.backup();
-            let mut tiny = chip();
-            tiny.serial.fill(blank);
+            let mut dd = chip();
+            dd.serial.fill(blank);
 
-            backup_from(on(&mut tiny), &dir).unwrap();
-            assert_eq!(read_hex(&dir.join("flash.hex")).unwrap(), tiny.flash);
-            assert_eq!(read_hex(&dir.join("serial.hex")).unwrap(), tiny.serial);
+            backup_from(on(&mut dd), &dir).unwrap();
+            assert_eq!(read_hex(&dir.join("flash.hex")).unwrap(), dd.flash);
+            assert_eq!(read_hex(&dir.join("serial.hex")).unwrap(), dd.serial);
 
             let err = restore_onto(no_port, &dir).unwrap_err();
             assert!(err.contains(&format!("all {blank:02X}")), "{err}");
@@ -776,18 +804,18 @@ mod tests {
         let scratch = Scratch::new("stamp");
         let dir = scratch.backup();
         let image = crc::sign(&[0x12, 0x34, 0x56], &stamp::format("abc1234567", true)).unwrap();
-        let mut tiny = Tiny::new();
+        let mut dd = Dd20::new();
 
-        let open = on(&mut tiny);
+        let open = on(&mut dd);
         program(
             || Programmer::connect_for_programming(open()?),
             &image,
             None,
         )
         .unwrap();
-        assert!(tiny.flash == image, "flash isn't the image");
+        assert!(dd.flash == image, "flash isn't the image");
 
-        backup_from(on(&mut tiny), &dir).unwrap();
+        backup_from(on(&mut dd), &dir).unwrap();
         let saved = read_hex(&dir.join("flash.hex")).unwrap();
         assert_eq!(
             stamp::read(&saved).as_deref(),
@@ -804,8 +832,8 @@ mod tests {
     #[test]
     fn runs_show_where_a_pattern_stops() {
         assert_eq!(
-            runs(0x3800, &[0xAA, 0xAA, 0xAA, 0x55, 0x00, 0x00]),
-            ["3800 AA x3", "3803 55 x1", "3804 00 x2"]
+            runs(0x7000, &[0xAA, 0xAA, 0xAA, 0x55, 0x00, 0x00]),
+            ["7000 AA x3", "7003 55 x1", "7004 00 x2"]
         );
     }
 
@@ -832,8 +860,8 @@ mod tests {
     #[test]
     fn rows_line_up_with_and_without_a_total() {
         assert_eq!(
-            row("flash", 3978, Some(16384), "bytes"),
-            "flash  3,978 / 16,384  24%  bytes"
+            row("flash", 3978, Some(32768), "bytes"),
+            "flash  3,978 / 32,768  12%  bytes"
         );
         assert_eq!(
             row("stack", 107, None, "bytes"),
@@ -854,18 +882,18 @@ mod tests {
     const EEPROM_SIZE: usize = super::updi::map::EEPROM_SIZE;
 
     /// Stands in for connecting where nothing should get that far.
-    fn no_connection() -> Result<Programmer<Tiny>, String> {
+    fn no_connection() -> Result<Programmer<Dd20>, String> {
         Programmer::connect_for_programming(no_port()?)
     }
 
     #[test]
     fn an_image_bigger_than_flash_is_refused_before_the_port_is_opened() {
         let err = program(no_connection, &vec![0x12; FLASH_SIZE + 1], None).unwrap_err();
-        assert_eq!(err, "the image is 16385 bytes; the ATtiny1616 has 16384");
+        assert_eq!(err, "the image is 32769 bytes; the AVR32DD20 has 32768");
         // And with an EEPROM image that would fit.
         let eeprom = vec![0x34; EEPROM_SIZE];
         let err = program(no_connection, &vec![0x12; 2 * FLASH_SIZE], Some(&eeprom)).unwrap_err();
-        assert_eq!(err, "the image is 32768 bytes; the ATtiny1616 has 16384");
+        assert_eq!(err, "the image is 65536 bytes; the AVR32DD20 has 32768");
     }
 
     #[test]
@@ -885,43 +913,43 @@ mod tests {
         ] {
             let flash: Vec<u8> = (0..flash_len).map(|i| (i * 5 + 1) as u8 & 0x7F).collect();
             let eeprom: Vec<u8> = (0..eeprom_len).map(|i| (i * 3 + 2) as u8 & 0x7F).collect();
-            let mut tiny = Tiny::new();
-            tiny.flash.fill(0x42);
+            let mut dd = Dd20::new();
+            dd.flash.fill(0x42);
 
-            let open = on(&mut tiny);
+            let open = on(&mut dd);
             program(
                 || Programmer::connect_for_programming(open()?),
                 &flash,
                 Some(&eeprom),
             )
             .unwrap_or_else(|e| panic!("{flash_len} and {eeprom_len} bytes: {e}"));
-            assert!(tiny.flash[..flash_len] == flash, "{flash_len} bytes");
+            assert!(dd.flash[..flash_len] == flash, "{flash_len} bytes");
             assert!(
-                tiny.flash[flash_len..].iter().all(|&b| b == 0xFF),
+                dd.flash[flash_len..].iter().all(|&b| b == 0xFF),
                 "{flash_len} bytes: the rest of flash isn't erased"
             );
-            assert!(tiny.eeprom[..eeprom_len] == eeprom, "{eeprom_len} bytes");
-            assert_eq!(tiny.lost_while_busy, 0);
-            assert!(tiny.updi_disabled, "UPDI was left on");
+            assert!(dd.eeprom[..eeprom_len] == eeprom, "{eeprom_len} bytes");
+            assert_eq!(dd.lost_while_busy, 0);
+            assert!(dd.updi_disabled, "UPDI was left on");
         }
     }
 
     /// Checks a chip was let go after a flash that failed part way, which is
     /// out of programming mode and reset, with UPDI off.
-    fn assert_let_go(tiny: &Tiny) {
-        assert!(tiny.updi_disabled, "UPDI was left on");
-        assert!(!tiny.progmode, "the chip was left in programming mode");
-        assert!(!tiny.in_reset, "the chip was left in reset");
-        assert_eq!(tiny.resets, 2, "one reset to enter and one to leave");
+    fn assert_let_go(dd: &Dd20) {
+        assert!(dd.updi_disabled, "UPDI was left on");
+        assert!(!dd.progmode, "the chip was left in programming mode");
+        assert!(!dd.in_reset, "the chip was left in reset");
+        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
     }
 
     #[test]
     fn a_locked_chip_is_refused_and_keeps_what_it_holds() {
-        let mut tiny = chip();
-        tiny.locked = true;
-        let (flash, eeprom) = (tiny.flash.clone(), tiny.eeprom.clone());
+        let mut dd = chip();
+        dd.lock = super::updi::tests::fake::LOCKED;
+        let (flash, eeprom) = (dd.flash.clone(), dd.eeprom.clone());
 
-        let open = on(&mut tiny);
+        let open = on(&mut dd);
         let err = program(
             || Programmer::connect_for_programming(open()?),
             &[0x12; 200],
@@ -930,38 +958,40 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("If it's locked"), "{err}");
         assert!(err.contains("which this tool won't do"), "{err}");
-        assert!(tiny.flash == flash, "flash changed");
-        assert!(tiny.eeprom == eeprom, "EEPROM changed");
-        assert_eq!(tiny.page_writes + tiny.page_erase_writes, 0);
-        assert_let_go(&tiny);
+        assert!(dd.flash == flash, "flash changed");
+        assert!(dd.eeprom == eeprom, "EEPROM changed");
+        assert_eq!(dd.nvm_operations(), 0);
+        assert_let_go(&dd);
     }
 
     #[test]
     fn a_write_error_stops_the_flash_and_lets_the_chip_go() {
-        let mut tiny = chip();
-        tiny.write_error_at = Some(1);
+        let mut dd = chip();
+        dd.write_error_at = Some(1);
 
-        let open = on(&mut tiny);
+        let open = on(&mut dd);
         let err = program(
             || Programmer::connect_for_programming(open()?),
             &[0x12; 200],
             Some(&[0x34; 40]),
         )
         .unwrap_err();
-        assert_eq!(err, "the NVM controller reported a write error");
-        // 200 bytes is four pages, and it stopped at the second, before any
-        // of EEPROM.
-        assert_eq!(tiny.page_writes, 1);
-        assert_eq!(tiny.page_erase_writes, 0);
-        assert_let_go(&tiny);
+        assert!(err.contains("WRITEPROTECT"), "{err}");
+        // 200 bytes is one page, erased first, and the first of its 100 words
+        // failed. The fake takes the rest of the burst, and the wait after it
+        // stops the flash there, before any of EEPROM.
+        assert_eq!(dd.page_erases, 1);
+        assert_eq!(dd.word_writes, 99);
+        assert_eq!(dd.eeprom_writes, 0);
+        assert_let_go(&dd);
     }
 
     #[test]
     fn a_chip_that_stays_busy_is_given_up_on_and_let_go() {
-        let mut tiny = chip();
-        tiny.erase_time = std::time::Duration::MAX;
+        let mut dd = chip();
+        dd.chip_erase_time = std::time::Duration::MAX;
 
-        let open = on(&mut tiny);
+        let open = on(&mut dd);
         let err = program(
             || Programmer::connect_for_programming(open()?),
             &[0x12; 200],
@@ -969,8 +999,8 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err, "timed out waiting for the NVM controller");
-        assert_eq!(tiny.page_writes, 0);
-        assert_eq!(tiny.lost_while_busy, 0);
-        assert_let_go(&tiny);
+        assert_eq!(dd.page_erases + dd.word_writes, 0);
+        assert_eq!(dd.lost_while_busy, 0);
+        assert_let_go(&dd);
     }
 }

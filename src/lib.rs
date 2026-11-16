@@ -1,6 +1,6 @@
 //! Everything that decides what the torch does, with no hardware in sight.
 //!
-//! This crate is `no_std` so the same code runs on the ATtiny1616 and in
+//! This crate is `no_std` so the same code runs on the AVR32DD20 and in
 //! `cargo test` on your laptop. The firmware binary (`src/main.rs`) is a thin
 //! loop that feeds switch samples in and writes the output back.
 

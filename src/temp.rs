@@ -1,82 +1,85 @@
 //! The MCU's internal temperature sensor, turned into sixteenths of a kelvin.
 //!
-//! The datasheet (DS40002204A, section 30.3.2.6) gives kelvin from one
-//! conversion as `((reading - offset) * gain + 0x80) >> 8`, with the offset
-//! and gain read from `SIGROW.TEMPSENSE1` (signed) and `SIGROW.TEMPSENSE0`
-//! (unsigned). That's whole kelvin, and at about 0.55 K a count most of what
-//! rounds away is real. `thermal` predicts from how the temperature's moving,
-//! so a reading that sits still and then jumps a kelvin misleads it.
+//! The datasheet (DS40002413B section 33.3.3.8) gives kelvin from one 12-bit
+//! conversion against the 2.048 V reference as
 //!
-//! So the ADC accumulates four conversions, and this works in the sum `s`.
+//! ```text
+//! kelvin  ==  ((offset - reading) * slope + 2048) >> 12
+//! ```
+//!
+//! with the offset from `SIGROW.TEMPSENSE1` and the slope from
+//! `SIGROW.TEMPSENSE0`, both 16-bit words. The reading falls as the die warms.
+//! That's whole kelvin, and at about a quarter of a kelvin a count, most of
+//! what rounds away is real. `thermal` predicts from how the temperature's
+//! moving, so a reading that sits still and then jumps a kelvin misleads it.
+//!
+//! So the ADC accumulates four conversions, and this works in their sum `s`.
 //! Four conversions are four times the reading, and sixteenths are sixteen
 //! times the kelvin, so the sum works out like this.
 //!
 //! ```text
-//! sixteenths  ==  ((s - 4 * offset) * gain + 0x20) >> 6
+//! sixteenths  ==  ((4 * offset - s) * slope + 512) >> 10
 //! ```
 //!
-//! The product runs to 21 bits, and there's no runtime 32-bit multiply on
-//! this chip (see docs/toolchain.md). It doesn't need one. Split the
-//! difference `d` into its high and low bytes, and the sum below holds.
-//!
-//! ```text
-//! (d * g + 0x20) >> 6  ==  hi * g * 4 + ((lo * g + 0x20) >> 6)
-//! ```
-//!
-//! `hi * g * 256` has nothing in its low six bits, so taking it out of the
-//! shift loses nothing and the answer is exact. `lo * g + 0x20` is at most
-//! 65,057. Four full-scale conversions and the lowest offset make `d` 4,604
-//! at most, but capping it at `MAX_DIFFERENCE` is what keeps every step inside
-//! a `u16` for any reading at all. Then `hi * g * 4` is at most 64,260, and
-//! the sum at most 65,276.
+//! The product runs to 32 bits, and there's no runtime 32-bit multiply on
+//! this chip (docs/toolchain.md). [`multiply`] builds it from four 8-by-8
+//! products, which the chip's `mul` does, and adds them up with shifts, which
+//! need no library call. Every step is exact, so this is the formula above to
+//! the bit.
 
-/// The factory calibration for this chip's temperature sensor, from
-/// `SIGROW.TEMPSENSE1` (the offset) and `SIGROW.TEMPSENSE0` (the gain).
+/// The factory calibration for this chip's temperature sensor, from the
+/// signature row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
-    pub offset: i8,
-    pub gain: u8,
+    /// `SIGROW.TEMPSENSE1`, the reading at absolute zero, in counts of one
+    /// conversion.
+    pub offset: u16,
+    /// `SIGROW.TEMPSENSE0`, 4096ths of a kelvin a count.
+    pub slope: u16,
 }
 
 impl Calibration {
     /// Sixteenths of a kelvin from four accumulated conversions, as
     /// [`sixteenths`] works it out.
     pub fn sixteenths(self, sum: u16) -> u16 {
-        sixteenths(sum, self.offset, self.gain)
+        sixteenths(sum, self.offset, self.slope)
     }
 }
 
-/// The biggest difference [`sixteenths`] works with. It's more than three
-/// times what the ADC can produce, and anything over it is garbage anyway.
-const MAX_DIFFERENCE: u16 = 0x3FFF;
-
-/// Every step of [`sixteenths`] fits a `u16`, with the highest bytes
-/// `MAX_DIFFERENCE` allows and the highest gain.
+/// `a × b`, exactly, from four 8-by-8 products.
+///
+/// Each partial product is at most 255 × 255, which fits a `u16`, so it's a
+/// single `mul` on the chip. The sum is at most 65,535 squared, under
+/// `u32::MAX`.
 #[expect(
-    clippy::as_conversions,
-    reason = "widening to u32 in a const, where From can't be called"
+    clippy::arithmetic_side_effects,
+    reason = "each byte product is at most 65,025, and the sum of the shifted products is \
+              a × b, which is under 2^32"
 )]
-const _: () = {
-    let (hi, lo, g) = ((MAX_DIFFERENCE >> 8) as u32, 0xFF, u8::MAX as u32);
-    assert!(lo * g + 0x20 <= u16::MAX as u32);
-    assert!(hi * g * 4 + ((lo * g + 0x20) >> 6) <= u16::MAX as u32);
-};
+pub fn multiply(a: u16, b: u16) -> u32 {
+    let [al, ah] = a.to_le_bytes();
+    let [bl, bh] = b.to_le_bytes();
+    let byte = |x: u8, y: u8| u32::from(u16::from(x) * u16::from(y));
+    byte(al, bl) + (byte(al, bh) << 8) + (byte(ah, bl) << 8) + (byte(ah, bh) << 16)
+}
 
 /// Sixteenths of a kelvin from four accumulated temperature sensor
 /// conversions, using the factory calibration from the signature row.
 ///
-/// A sum below the offset (which would mean a broken sensor or a bad read)
-/// comes out as 0 rather than wrapping.
+/// A sum at or over four times the offset (which would mean a broken sensor,
+/// a bad read or a die below absolute zero) comes out as 0 rather than
+/// wrapping, and anything over `u16::MAX` sixteenths comes out as that. Neither
+/// is plausible to `thermal`.
 #[expect(
     clippy::arithmetic_side_effects,
-    reason = "an i8 times -4 is within -508..=512, and the assert above bounds the rest"
+    reason = "the product is at most 65,535 squared, so adding 512 stays under 2^32"
 )]
-pub fn sixteenths(sum: u16, offset: i8, gain: u8) -> u16 {
-    let d = sum
-        .saturating_add_signed(-4 * i16::from(offset))
-        .min(MAX_DIFFERENCE);
-    let (hi, lo, g) = (d >> 8, d & 0xFF, u16::from(gain));
-    hi * g * 4 + ((lo * g + 0x20) >> 6)
+pub fn sixteenths(sum: u16, offset: u16, slope: u16) -> u16 {
+    let Some(difference) = (u32::from(offset) << 2).checked_sub(u32::from(sum)) else {
+        return 0;
+    };
+    let difference = u16::try_from(difference).unwrap_or(u16::MAX);
+    u16::try_from((multiply(difference, slope) + 512) >> 10).unwrap_or(u16::MAX)
 }
 
 #[cfg(test)]
@@ -84,35 +87,39 @@ mod tests {
     use super::*;
 
     /// The sum above, done the slow way with room to spare.
-    fn reference(sum: u16, offset: i8, gain: u8) -> u16 {
-        let d = (i32::from(sum) - 4 * i32::from(offset)).clamp(0, i32::from(MAX_DIFFERENCE));
-        ((d * i32::from(gain) + 0x20) >> 6) as u16
+    fn reference(sum: u16, offset: u16, slope: u16) -> u16 {
+        let d = (4 * i64::from(offset) - i64::from(sum)).clamp(0, i64::from(u16::MAX));
+        ((d * i64::from(slope) + 512) >> 10).min(i64::from(u16::MAX)) as u16
     }
 
+    /// The backup of this torch's signature row (backup/stock/prodsig.hex).
+    const BACKUP: Calibration = Calibration {
+        offset: 0x0D24,
+        slope: 0x03EE,
+    };
+
     #[test]
-    fn matches_the_sum_for_every_accumulated_reading_and_calibration() {
-        for sum in 0..=4 * 1023 {
-            for offset in i8::MIN..=i8::MAX {
-                for gain in (u8::MIN..=u8::MAX).step_by(5) {
-                    assert_eq!(
-                        sixteenths(sum, offset, gain),
-                        reference(sum, offset, gain),
-                        "sum {sum}, offset {offset}, gain {gain}",
-                    );
-                }
+    fn multiply_is_exact() {
+        let edges = [0, 1, 0xFF, 0x100, 0x1FF, 0x7FFF, 0x8000, 0xFF00, 0xFFFF];
+        let grid = (0..=u16::MAX).step_by(251).chain(edges);
+        for a in grid.clone() {
+            for b in grid.clone() {
+                assert_eq!(multiply(a, b), u32::from(a) * u32::from(b), "{a} {b}");
             }
         }
     }
 
     #[test]
-    fn the_split_is_exact_for_every_16_bit_sum() {
-        for sum in u16::MIN..=u16::MAX {
-            for gain in u8::MIN..=u8::MAX {
-                assert_eq!(
-                    sixteenths(sum, 0, gain),
-                    reference(sum, 0, gain),
-                    "sum {sum}, gain {gain}"
-                );
+    fn matches_the_sum_for_every_accumulated_reading_and_a_spread_of_calibrations() {
+        for sum in 0..=4 * 4095 {
+            for offset in (0..=u16::MAX).step_by(4099).chain([BACKUP.offset]) {
+                for slope in (0..=u16::MAX).step_by(4111).chain([BACKUP.slope]) {
+                    assert_eq!(
+                        sixteenths(sum, offset, slope),
+                        reference(sum, offset, slope),
+                        "sum {sum}, offset {offset}, slope {slope}",
+                    );
+                }
             }
         }
     }
@@ -121,46 +128,39 @@ mod tests {
     fn four_conversions_land_within_half_a_kelvin_of_the_datasheet() {
         // Its formula for one conversion rounds to the nearest kelvin, so
         // four of the same conversion can only differ from it by that.
-        for reading in 0..1024_i32 {
-            for offset in i8::MIN..=i8::MAX {
-                for gain in u8::MIN..=u8::MAX {
-                    let d = (reading - i32::from(offset)).max(0);
-                    let datasheet = (d * i32::from(gain) + 0x80) >> 8;
-                    let ours = i32::from(sixteenths(4 * reading as u16, offset, gain));
-                    assert!(
-                        (ours - 16 * datasheet).abs() <= 8,
-                        "reading {reading}, offset {offset}, gain {gain}",
-                    );
-                }
-            }
+        for reading in 0..4096_i64 {
+            let offset = i64::from(BACKUP.offset);
+            let slope = i64::from(BACKUP.slope);
+            let datasheet = (((offset - reading) * slope + 2048) >> 12).max(0);
+            let ours = i64::from(BACKUP.sixteenths(4 * reading as u16));
+            assert!((ours - 16 * datasheet).abs() <= 8, "reading {reading}");
         }
     }
 
     #[test]
-    fn the_calibration_does_the_same_sums() {
-        let calibration = Calibration {
-            offset: -10,
-            gain: 141,
-        };
-        assert_eq!(calibration.sixteenths(2124), sixteenths(2124, -10, 141));
-        assert_eq!(calibration.sixteenths(2124), 298 * 16);
+    fn the_backups_calibration_reads_room_temperature_about_where_it_should() {
+        // 25 °C is 298 K, and 4 × (3364 - 298 × 4096 / 1006) is about 8603.
+        assert_eq!(BACKUP.sixteenths(8603) / 16, 298);
+        // A count of the sum is about a sixteenth.
+        let step = BACKUP.sixteenths(8603) - BACKUP.sixteenths(8604);
+        assert!(step <= 1, "{step}");
     }
 
     #[test]
-    fn one_count_of_the_sum_is_a_fraction_of_a_kelvin() {
-        let at = |sum| sixteenths(sum, -10, 141);
-        // 141 / 64 is a little over two sixteenths, about 0.14 K.
-        assert_eq!(at(2125) - at(2124), 2);
-        assert_eq!(at(2128) - at(2124), 8);
+    fn a_warmer_die_reads_lower() {
+        assert!(BACKUP.sixteenths(8000) > BACKUP.sixteenths(9000));
     }
 
     #[test]
-    fn a_sum_below_the_offset_is_zero() {
-        assert_eq!(sixteenths(10, 20, 200), 0);
+    fn a_sum_at_or_over_four_times_the_offset_is_zero() {
+        assert_eq!(sixteenths(4 * 3364, 3364, 1006), 0);
+        assert_eq!(sixteenths(u16::MAX, 3364, 1006), 0);
     }
 
     #[test]
     fn a_sum_nothing_could_produce_stays_far_from_plausible() {
-        assert!(sixteenths(u16::MAX, -128, 141) > 423 * 16);
+        // An ADC stuck at zero.
+        assert!(BACKUP.sixteenths(0) > 423 * 16);
+        assert_eq!(sixteenths(0, u16::MAX, u16::MAX), u16::MAX);
     }
 }

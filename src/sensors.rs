@@ -22,14 +22,13 @@
 //! the next tick, and nothing ever waits on the ADC.
 //!
 //! The datasheet doesn't ask for the first conversion after a switch to be
-//! thrown away. It does say the ADC needs time to settle on a new channel,
-//! and the internal reference about 25 µs to start (DS40002204A, sections
-//! 30.3.2.4 and 36.15). Both channels here use the same 1.1 V reference, so
-//! only the ADC's input moves between them, but PA1 sits behind tens of
-//! kilohms of divider (docs/hardware.md), which is slow to pull the sample
-//! capacitor away from whatever the temperature sensor left on it. The stock
-//! firmware throws the first one away too ("first result is unstable").
-//! It costs a tick, so it's cheap insurance.
+//! thrown away. It does say the temperature sensor wants about 40 µs after
+//! MUXPOS moves to it, and a reference about 10 µs to start (DS40002413B
+//! tables 38-25 and 38-18), and the two channels use different references,
+//! 1.024 V for the cell and 2.048 V for the temperature, so both the input
+//! and the reference move at each switch. The stock firmware throws the
+//! first one away too ("first result is unstable"). It costs a tick, so it's
+//! cheap insurance.
 //!
 //! The temperature is only read when asked for, which the caller does while
 //! the light's on. The voltage is read until [`Schedule::rest`], since the
@@ -38,11 +37,12 @@
 /// What the ADC is measuring.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Channel {
-    /// PA1 (AIN1), the cell through its divider, against the internal 1.1 V
-    /// reference, four conversions accumulated, for `battery::centivolts`.
+    /// VDD / 10, which is the cell, against the internal 1.024 V reference,
+    /// four 12-bit conversions accumulated, for `battery::centivolts`.
     Voltage,
-    /// The temperature sensor against the internal 1.1 V reference, four
-    /// conversions accumulated, for `temp::sixteenths`.
+    /// The temperature sensor against the internal 2.048 V reference, which
+    /// its factory calibration is for (DS40002413B section 33.3.3.8), four
+    /// 12-bit conversions accumulated, for `temp::sixteenths`.
     Temperature,
 }
 
@@ -79,7 +79,7 @@ pub struct Schedule {
     /// The channel the ADC was last set up for, `None` before the first.
     /// Its registers keep their values until a reset, which starts this
     /// afresh too. [`Schedule::rest`] puts it back to `None`, since the
-    /// firmware turns the reference off to power down.
+    /// firmware turns the ADC off to power down.
     set_up: Option<Channel>,
 }
 

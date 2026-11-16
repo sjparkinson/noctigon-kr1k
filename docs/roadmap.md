@@ -37,14 +37,14 @@ A tick here means the firmware does it for the AVR32DD20 and it runs on the simu
 
 What covers each hazard, and how well, is in [safety.md](safety.md). These are the gaps it names that code can close. Like section 2, a tick means the firmware or the tests do it for the AVR32DD20, and none of it is bench evidence.
 
-- [ ] No-panic link check on the AVR32DD20 build
+- [x] No-panic link check on the AVR32DD20 build
 - [ ] Overflow checks in release builds, re-proven on the AVR32DD20 build
 - [x] Restriction lints on the library. Overflow, indexing, casts and unwraps are made explicit, and clippy denies the rest
 - [x] Hold every ADC reading through low-voltage protection and thermal regulation and check where each ends up, plus a randomised property test of `limits::Limits`
-- [ ] Fault injection on the AVR32DD20 simulator, a dead ADC and a stuck switch
-- [ ] Unhandled interrupts go to `hw::halt` instead of `reti`, across the AVR32DD20's 36 vectors
+- [x] Fault injection on the AVR32DD20 simulator, a dead ADC and a stuck switch
+- [x] Unhandled interrupts go to `hw::halt` instead of `reti`, across the AVR32DD20's 36 vectors
 - [ ] A commit stamp in flash, just before the CRC, at the end of 32 KB
-- [ ] The errata's lost write (DS80001026D §2.2.3) checked for every VPORT and `SLPCTRL.CTRLA` write, by the layout check or the simulator
+- [x] The errata's lost write (DS80001026D §2.2.3) checked by the simulator, for every VPORT, GPR and `SLPCTRL.CTRLA` write the runs reach
 
 ## 3. It's nice to use
 
@@ -53,7 +53,7 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 - ~~Remember the level in RAM~~ Struck. Every click on starts at the same level (docs/ui.md)
 - [x] A simpler UI. 1C on and off, 1H ramps each time the other way from the last, 3C lockout that never lights. Library only
 - [x] Aux that can't flatten a cell nobody's reading. Lockout's red is bright, for five seconds after a press, and off's dim blue goes dark a day after the last press. Library only, since nothing drives the aux on this board until the AW2016 driver lands
-- [ ] The simulator ported to a fake AVR32DD20, wired like the Lume X1-C
+- [x] The simulator ported to a fake AVR32DD20, wired like the Lume X1-C
 - ~~Battery check~~ Struck. No magic flashes, so no 3C voltage blink (docs/ui.md)
 
 ## Maybe

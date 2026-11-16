@@ -1,20 +1,23 @@
 //! The checksum the chip's CRCSCAN checks flash against at power-on.
 //!
-//! DS40002204A §27.2 has CRC-16-CCITT (x¹⁶ + x¹² + x⁵ + 1, so 0x1021), the
-//! checksum register starting at 0xFFFF, each byte fed in most significant
-//! bit first. That's the parameter set usually called CRC-16/CCITT-FALSE
-//! (or CRC-16/IBM-3740), with no reflection and no final XOR. §27.3.2.1 and
-//! table 27-1 put the checksum for a whole-flash scan in the last two bytes
-//! of flash, high byte at FLASHEND - 1.
+//! DS40002413A (the AVR32/16DD14/20 datasheet) §30.3.2 has CRC-16-CCITT
+//! (x¹⁶ + x¹² + x⁵ + 1, so 0x1021), the checksum register starting at
+//! 0xFFFF, each byte fed in most significant bit first. That's the parameter
+//! set usually called CRC-16/CCITT-FALSE (or CRC-16/IBM-3740), with no
+//! reflection and no final XOR. FUSE.SYSCFG0.CRCSEL picks it over CRC-32
+//! (§8.8.2.4), and `selftest` insists on that. §30.3.2.1 and table 30-1 put
+//! the checksum for a whole-flash scan in the last two bytes of flash, high
+//! byte at FLASHEND - 1.
 //!
 //! With no final XOR, running the same CRC over the data and then the
 //! checksum high byte first always ends at 0, which is how the scan can
 //! "pass if the last bytes contain the correct checksum". `sim.rs` models
-//! the scan that way, over all 16 KB, so it checks [`sign`] rather than
+//! the scan that way, over all of flash, so it checks [`sign`] rather than
 //! repeating it.
 //!
 //! Microchip's AN2521A ("CRCSCAN on devices in the tinyAVR 1-series", not
-//! in docs/microchip/) agrees. Its whole-flash post-build step (§5) is
+//! in docs/microchip/) agrees for the tinyAVR, whose CRC-16 the datasheet
+//! describes the same way. Its whole-flash post-build step (§5) is
 //! `srec_cat ... -fill 0xFF ... -CRC16_Big_Endian <end-2> -broken`, where
 //! `-broken` is this CRC, and §6 says a signed section scans to 0x0000.
 //!
@@ -68,8 +71,8 @@ mod tests {
     use crate::stamp;
 
     #[test]
-    fn the_checksum_sits_at_the_end_of_16_kb() {
-        assert_eq!(CHECKSUM_AT, 0x3FFE);
+    fn the_checksum_sits_at_the_end_of_32_kb() {
+        assert_eq!(CHECKSUM_AT, 0x7FFE);
     }
 
     #[test]

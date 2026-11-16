@@ -1,4 +1,4 @@
-//! ATtiny1616 register addresses and bitfield values, generated at build time.
+//! AVR32DD20 register addresses and bitfield values, generated at build time.
 //!
 //! They come from Microchip's ATDF in `vendor/`, by `build.rs`, with
 //! `generate` in `xtask/src/atdf.rs`. Nothing in here that the ATDF can give
@@ -28,8 +28,13 @@
 
 include!(concat!(env!("OUT_DIR"), "/regs.rs"));
 
-/// ADC0.SAMPCTRL.SAMPLEN as 20 more ADC clocks of sampling. Hand-written, since
-/// it's a count chosen here rather than a value the ATDF names; src/avr/hw.rs
-/// says why 20.
-pub const ADC_SAMPLEN_32US: u8 = 20;
-const _: () = assert!(ADC_SAMPLEN_32US & !ADC_SAMPLEN == 0);
+/// `ADC0.SAMPCTRL` for a sample of 34 ADC clocks.
+///
+/// That's 34 µs at the 1 MHz ADC clock `hw::init` sets. The ATDF has `SAMPLEN` as a plain 8-bit field with
+/// no named values, so this is typed by hand. The sample lasts `2 + SAMPLEN`
+/// ADC clocks (DS40002413B section 33.3.3.4), and the temperature sensor
+/// wants at least 28 µs of it (section 33.3.3.8), so 32 gives 34 µs.
+pub const ADC_SAMPLEN_32CLK: u8 = 32;
+
+// SAMPLEN is the whole register, so any byte is a length.
+const _: () = assert!(ADC_SAMPLEN == u8::MAX);

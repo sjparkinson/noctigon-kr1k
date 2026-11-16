@@ -5,14 +5,16 @@ use crate::ramp::CEILING;
 
 /// The lowest level the UI goes to.
 ///
-/// The stock firmware's smooth floor on this light is 5 of 150, which is 36
-/// in delta-sigma units on its table, and reviewers saw flicker below that.
-/// This curve is flatter at the bottom, so its level 5 is only 24, and level
-/// 13 is the first at 36 or over. Unmeasured.
+/// The same number as the TS26 firmware's, so the UI didn't change. On this
+/// curve it's the low path at DAC code 92, inside the range where the
+/// datasheet specifies the DAC's linearity (0x030 up, DS40002413B table
+/// 38-23). The moon path's levels under it stay for the low-voltage steps to
+/// fade through. How bright it is, and whether the levels under it light
+/// steadily, is unmeasured.
 pub const FLOOR: u8 = 13;
 
-/// Where every click on starts, a duty of about 10 of 255. Nothing's
-/// remembered, so it's this every time.
+/// Where every click on starts, low on the high path, at a few per cent of
+/// the ramp's top. Nothing's remembered, so it's this every time.
 pub const ON_LEVEL: u8 = 52;
 
 // The top of the UI's ramp is [`CEILING`].
@@ -25,24 +27,36 @@ pub enum Mode {
     Lockout,
 }
 
-/// What the aux LEDs on PC1 to PC3 should be doing.
+/// What the RGB aux LEDs should be doing.
+///
+/// On the KR1K they hang off an AW2016 LED driver over TWI, which nothing
+/// drives yet, so `hw::set_aux` ignores this and they stay dark. The library
+/// still says what it wants, colour and [`Aux::bright`], for that driver.
 ///
 /// Every colour is steady, so they never report anything by flashing, and
-/// all but red are dim. The channels are separate emitters that don't blend
-/// well, so the two states a glance most needs, off and lockout, get one
-/// channel each.
+/// all but red are dim. Off and lockout, the two states a glance most needs,
+/// get one channel each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aux {
     Off,
     /// Off, and nothing wrong.
     Blue,
-    /// Locked out. Bright, since dim red is hard to see, so `torch::Torch`
-    /// only shows it for [`crate::torch::LOCKED_TICKS`] after a press.
+    /// Locked out. Bright, since dim red was hard to see on the TS26, so
+    /// `torch::Torch` only shows it for [`crate::torch::LOCKED_TICKS`] after a
+    /// press.
     Red,
     /// The cell's flat. Red and green, the usual low-battery warning.
     Yellow,
     /// A fault, which nothing short of a cell swap clears. All three.
     White,
+}
+
+impl Aux {
+    /// Whether this colour is the bright setting rather than the dim one.
+    /// Only lockout's red is.
+    pub const fn bright(self) -> bool {
+        matches!(self, Self::Red)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -130,7 +144,7 @@ impl Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ramp::output;
+    use crate::ramp::{Paths, Vref, output};
 
     fn hold(clicks: u8, ticks: u16) -> Event {
         Event::Hold { clicks, ticks }
@@ -144,23 +158,32 @@ mod tests {
     }
 
     #[test]
+    fn only_lockout_red_is_bright() {
+        assert!(Aux::Red.bright());
+        for colour in [Aux::Off, Aux::Blue, Aux::Yellow, Aux::White] {
+            assert!(!colour.bright(), "{colour:?}");
+        }
+    }
+
+    #[test]
     fn starts_off() {
         let ui = Ui::new();
         assert_eq!(ui.mode(), Mode::Off);
         assert_eq!(ui.output_level(), 0);
     }
 
-    /// The stock firmware's floor is 36 in these units, and the level under
-    /// ours isn't.
     #[test]
-    fn the_floor_is_the_first_level_at_the_stock_smooth_floor() {
-        assert!(output(FLOOR).dsm >= 36);
-        assert!(output(FLOOR - 1).dsm < 36);
+    fn the_floor_is_on_the_low_path_where_the_dacs_linearity_is_specified() {
+        let out = output(FLOOR);
+        assert_eq!(out.paths, Paths::Low);
+        assert!(out.dac >= 0x30, "{out:?}");
     }
 
     #[test]
-    fn it_comes_on_at_a_duty_of_ten() {
-        assert_eq!(output(ON_LEVEL).dsm >> crate::ramp::DSM_BITS, 10);
+    fn it_comes_on_low_on_the_high_path() {
+        let out = output(ON_LEVEL);
+        assert_eq!((out.paths, out.vref), (Paths::High, Vref::V1024));
+        assert!(out.dac < 100, "{out:?}");
     }
 
     #[test]

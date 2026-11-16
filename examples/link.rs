@@ -34,7 +34,8 @@ mod rt;
 )]
 mod hw {
     pub extern "avr-interrupt" fn rtc_pit() {}
-    pub extern "avr-interrupt" fn tca0_ovf() {}
+    pub extern "avr-interrupt" fn tcb0_int() {}
+    pub extern "avr-interrupt" fn portd_port() {}
 
     #[allow(clippy::empty_loop)]
     pub fn halt() -> ! {
@@ -113,6 +114,6 @@ mod probe {
 
 #[cfg(not(target_arch = "avr"))]
 fn main() {
-    eprintln!("this is a linker check for the ATtiny1616; `cargo xtask hex` runs it");
+    eprintln!("this is a linker check for the AVR32DD20; `cargo xtask hex` runs it");
     std::process::exit(1);
 }

@@ -21,9 +21,11 @@
 //!   firmware's window) and it isn't warming up, step back up the same way,
 //!   but slower and never more than a level a reading. In between, hold. That
 //!   gap, the slow climb and the lookahead are what stop it hunting.
-//! - Never step down below a floor. The stock firmware's TS26 build stops at
-//!   level 50 of 150, so this does too, though the same number on this
-//!   firmware's own curve (`src/ramp.rs`) needn't be the same brightness.
+//! - Never step down below a floor, level 50 of 150, as the TS26 firmware
+//!   had it. The stock firmware on this driver stops at 60 of its own 150.
+//!   On this firmware's curve (`src/ramp.rs`) level 50 is the high path at
+//!   about 3.5 % of the top, and nobody's measured what that is in lumens or
+//!   watts.
 //!
 //! Only sample while the light's on. The stock firmware leaves the
 //! temperature alone in standby because the ADC costs about 250 µA against
@@ -37,7 +39,7 @@
 //!
 //! The numbers here are a first guess, carried over from an earlier torch
 //! where they aren't the stock firmware's. None of them has been measured on a
-//! TS26, so expect them to change once one's been run up to temperature.
+//! KR1K, so expect them to change once one's been run up to temperature.
 //! That's why `ramp::CEILING` holds the light back in the meantime.
 
 use crate::gradual::Ceiling;
@@ -380,7 +382,7 @@ mod tests {
     // what each closed-loop stretch did. Handy when retuning.
     extern crate std;
     use super::*;
-    use crate::ramp::{self, DSM_TOP};
+    use crate::ramp::{self, TOP};
 
     /// The light at whatever level the UI asks for, capped by thermal
     /// regulation, checking every tick that the cap never moves the output
@@ -480,10 +482,11 @@ mod tests {
         }
 
         /// Where the head would settle at `level`, taking the power as
-        /// proportional to the delta-sigma value, which is a guess.
+        /// proportional to the current the ramp's model asks for, which is a
+        /// guess.
         fn settle(&self, level: u8) -> i32 {
-            let power = i64::from(ramp::output(level).dsm);
-            self.ambient + (Self::FULL_RISE * power / i64::from(DSM_TOP)) as i32
+            let power = ramp::output(level).modelled() as i64;
+            self.ambient + (Self::FULL_RISE * power / TOP.modelled() as i64) as i32
         }
 
         /// One tick at `level`. The head settles with a time constant of a
@@ -1250,7 +1253,7 @@ mod tests {
         let limit = LIMIT * FRACTION as u16;
         let mut hot = 0;
         let mut cool = 0;
-        for sum in 0..=4 * 1023 {
+        for sum in 0..=4 * 4095 {
             let reading = crate::testing::CALIBRATION.sixteenths(sum);
             let too_hot = !plausible(reading) || reading > limit;
             let mut thermal = Thermal::new();

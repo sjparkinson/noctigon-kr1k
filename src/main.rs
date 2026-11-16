@@ -49,13 +49,14 @@ extern "C" fn main() -> ! {
     use kr1k::torch::{Changes, Torch};
     use kr1k::watchdog::Feeder;
 
-    // PB2 floats from reset until it's an output.
+    // PC1 floats from reset until it's an output.
     hw::hold_enable_low();
 
     let faults = Faults {
         hang: selftest::hung(hw::take_reset_flags()),
         flash: !hw::flash_ok(),
         fuses: !hw::fuses().ok(),
+        supply: !hw::vddio2_ok(),
     };
 
     hw::init();
@@ -69,7 +70,7 @@ extern "C" fn main() -> ! {
     loop {
         // Power-down or idle, by `Feeder::power_down`'s rule, which the
         // simulator holds this loop to. False means the light's on and no
-        // tick came in about 104 ms, so the 32 kHz oscillator has most likely
+        // tick came in about 103 ms, so the 32 kHz oscillator has most likely
         // stopped, and the watchdog with it. The light goes off and stays off
         // until a reset.
         if !hw::wait_for_tick(feeder.power_down(torch.resting())) {
@@ -116,6 +117,6 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
 
 #[cfg(not(target_arch = "avr"))]
 fn main() {
-    eprintln!("this is firmware for the ATtiny1616; build it with `cargo xtask hex`");
+    eprintln!("this is firmware for the AVR32DD20; build it with `cargo xtask hex`");
     std::process::exit(1);
 }

@@ -20,7 +20,7 @@ use crate::updi::map;
 /// CPU.CCP's I/O address, the same number as its data-space one.
 const CPU_CCP: u16 = addr::CPU_CCP as u16;
 
-/// Where tinyAVR maps flash into data space, and how much of it there is.
+/// Where the chip maps flash into data space, and how much of it there is.
 const MAPPED_FLASH: u32 = map::FLASH as u32;
 const FLASH_SIZE: u32 = map::FLASH_SIZE as u32;
 /// `eor r1, r1`. `eor Rd, Rr` is 0010 01rd dddd rrrr.
@@ -307,9 +307,9 @@ mod tests {
     }
 
     /// Where `image` puts `__unhandled_interrupt`, reset and `hw::halt`.
-    const UNHANDLED: u32 = 0x7C;
-    const RESET: u32 = 0x82;
-    const HALT_AT: u32 = 0x84;
+    const UNHANDLED: u32 = 0x90;
+    const RESET: u32 = 0x96;
+    const HALT_AT: u32 = 0x98;
     const RETI: u16 = 0x9518;
 
     /// `__unhandled_interrupt` as src/avr/rt.rs has it.
@@ -318,8 +318,8 @@ mod tests {
         [EOR_R1_R1, w0, w1]
     }
 
-    /// A vector table, then `unhandled` at 0x7C, and a `nop` each for reset
-    /// at 0x82 and `hw::halt` at 0x84.
+    /// A vector table, then `unhandled` at 0x90, and a `nop` each for reset
+    /// at 0x96 and `hw::halt` at 0x98.
     fn image_with(table: impl Fn(usize) -> [u16; 2], unhandled: [u16; 3]) -> Vec<u8> {
         let mut words: Vec<u16> = (0..VECTORS).flat_map(table).collect();
         words.extend(unhandled);
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn decodes_jmp_across_the_whole_address_range() {
-        for addr in [0, 0x7C, 0x3FFE, 0x2_0000, 0x7F_FFFE] {
+        for addr in [0, 0x90, 0x7FFE, 0x2_0000, 0x7F_FFFE] {
             assert_eq!(jmp_target(&bytes(&jmp(addr)), 0), Some(addr));
         }
         assert_eq!(jmp_target(&bytes(&[0x940E, 0]), 0), None, "call, not jmp");
@@ -365,9 +365,9 @@ mod tests {
 
     #[test]
     fn rejects_a_vector_into_the_table_or_past_the_image() {
-        // 0x78 is the table's last slot, and 0x86 the first byte past the
+        // 0x8C is the table's last slot, and 0x9A the first byte past the
         // image.
-        for bad in [0x10, 0x78, 0x86, 0x1000] {
+        for bad in [0x10, 0x8C, 0x9A, 0x1000] {
             let img = image(|slot| if slot == 5 { jmp(bad) } else { standard(slot) });
             let err = vectors(&img, RESET, UNHANDLED, HALT_AT).unwrap_err();
             assert!(err.contains("vector 5"), "{bad:#x}: {err}");
@@ -376,10 +376,10 @@ mod tests {
 
     #[test]
     fn the_table_is_four_bytes_a_vector() {
-        assert_eq!(VECTORS * 4, 0x7C, "the ATtiny1616 has 31 vectors");
+        assert_eq!(VECTORS * 4, 0x90, "the AVR32DD20 has 36 vectors");
         // The first byte after the table is the first a vector can go to, and
         // the image's last word the last.
-        for good in [0x7C, 0x84] {
+        for good in [0x90, 0x98] {
             let img = image(|slot| if slot == 5 { jmp(good) } else { standard(slot) });
             let checked = vectors(&img, RESET, UNHANDLED, HALT_AT);
             assert_eq!(checked, Ok(()), "{good:#x}");
@@ -394,14 +394,14 @@ mod tests {
         };
         // `__unhandled_interrupt` jumps to where `hw::halt` is said to be,
         // which is inside the table, or past the end of the image.
-        for bad in [0x10, 0x78, 0x86, 0x1000] {
+        for bad in [0x10, 0x8C, 0x9A, 0x1000] {
             let img = image_with(standard, to(bad));
             let err = vectors(&img, RESET, UNHANDLED, bad).unwrap_err();
             assert!(err.contains("hw::halt is at"), "{bad:#x}: {err}");
         }
         // Straight after the table is code, so a halt there is fine.
-        let img = image_with(standard, to(0x7C));
-        assert_eq!(vectors(&img, RESET, UNHANDLED, 0x7C), Ok(()));
+        let img = image_with(standard, to(0x90));
+        assert_eq!(vectors(&img, RESET, UNHANDLED, 0x90), Ok(()));
     }
 
     #[test]
@@ -502,19 +502,19 @@ mod tests {
     }
 
     /// The mapped-flash window, as data-space addresses.
-    const WINDOW: std::ops::Range<u32> = 0x8000..0xC000;
+    const WINDOW: std::ops::Range<u32> = 0x8000..0x1_0000;
 
     #[test]
     fn accepts_data_loaded_at_either_end_of_the_mapped_window() {
         assert_eq!(MAPPED_FLASH..MAPPED_FLASH + FLASH_SIZE, WINDOW);
         // The first four bytes of flash, and the last four.
-        for paddr in [0, 0x3FFC] {
+        for paddr in [0, 0x7FFC] {
             let segs = [segment(RAM.start, paddr, 4)];
             let r = ram_at(RAM.start, 4, 8, WINDOW.start + paddr);
             assert_eq!(ram(&r, &segs), Ok(()), "flash {paddr:#06x}");
         }
         // And a single byte, the very last of flash.
-        let segs = [segment(RAM.start, 0x3FFF, 1)];
+        let segs = [segment(RAM.start, 0x7FFF, 1)];
         assert_eq!(ram(&ram_at(RAM.start, 1, 0, WINDOW.end - 1), &segs), Ok(()));
     }
 
@@ -529,7 +529,7 @@ mod tests {
             (WINDOW.end - 3, 4),
             (WINDOW.end, 4),
             (WINDOW.end, 1),
-            (0x1_0000, 4),
+            (0x1_8000, 4),
         ] {
             let segs = [segment(
                 RAM.start,
@@ -558,7 +558,7 @@ mod tests {
         assert!(mapped(&bad).is_err());
         let text_moved = [segment(0x10, 0, 4)];
         assert!(mapped(&text_moved).is_err());
-        let data = [segment(0x80_3800, 0x200, 2)];
+        let data = [segment(0x80_7000, 0x200, 2)];
         assert_eq!(mapped(&data), Ok(()), ".data is `ram`'s job");
     }
 

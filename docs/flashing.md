@@ -60,7 +60,7 @@ This torch already has one. avrdude read it on 2026-11-16 into `backup/stock/` (
 cargo xtask backup /dev/cu.usbserial-XXXX backup/torch
 ```
 
-That puts the chip in programming mode, checks its signature, and saves `flash.hex`, `eeprom.hex`, `fuses.hex` and `serial.hex` into the directory you name. The fuses are there for reference only. The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy.
+That checks the chip's System Information Block says NVM version P:2, puts the chip in programming mode, checks its signature, and saves `flash.hex` (all 32 KB), `eeprom.hex`, `fuses.hex` (16 bytes from 0x1050), `lock.hex` (LOCK.KEY, 4 bytes from 0x1040), `userrow.hex` and `serial.hex` (SERNUM0 to SERNUM15) into the directory you name. The fuses, lock bits and user row are there for reference only, and nothing writes them back. The first five are the same memories avrdude's `backup/stock/` files of those names hold, so compare the decoded bytes, not the text. avrdude writes 32-byte records and leaves off flash's trailing 0xFF bytes, where `backup` writes 16-byte records and every byte. The serial number is the chip's own, from its signature row, and it's how `restore` knows whose backup it's been given. It refuses to run if that directory already has a `flash.hex`, so a second run can't overwrite your factory copy.
 
 If it warns that the serial number can't tell one chip from another (all FF or all 00), the backup is saved all the same, but `restore` will refuse it. Stop there, before anything goes over the factory firmware.
 
@@ -80,9 +80,9 @@ cargo xtask flash /dev/cu.usbserial-XXXX
 
 That builds the firmware, refuses it if the simulator finds a mistake, and then
 
-1. puts the chip in programming mode and checks its signature (`1E 95 3A`)
+1. refuses a chip whose System Information Block doesn't say NVM version P:2, before any key goes out, then puts the chip in programming mode and checks its signature (`1E 95 3A`), refusing anything else
 2. chip-erases it, which wipes flash and, unless the EESAVE fuse is set, EEPROM
-3. writes the image, which ends in a stamp of the commit and a CRC the firmware checks at power-on
+3. writes the image a 512-byte page at a time, skipping blank pages (the erase already left them blank), each page erased again and then written by the word. The image ends in a stamp of the commit and a CRC the firmware checks at power-on
 4. reads it all back and compares
 5. resets the chip and turns UPDI off, so the new firmware starts
 
@@ -96,7 +96,7 @@ If the light goes dark after a flash that verified, run `cargo xtask peek /dev/c
 
 ## Going back
 
-`restore` puts a backup's flash and EEPROM back, and only onto the chip they were read from. Before it erases anything it reads the chip's serial number and compares it with the backup's `serial.hex`, and it refuses on a mismatch, a missing `serial.hex` or a serial number that's blank.
+`restore` puts a backup's flash and EEPROM back, and only onto the chip they were read from. Before it erases anything it reads the chip's serial number and compares it with the backup's `serial.hex`, and it refuses on a mismatch, a missing `serial.hex` or a serial number that's blank. It writes every EEPROM byte, blank ones included, one erase-write at a time, since with EESAVE set the old contents survive the erase.
 
 ```sh
 cargo xtask restore /dev/cu.usbserial-XXXX backup/torch

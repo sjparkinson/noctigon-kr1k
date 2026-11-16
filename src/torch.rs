@@ -28,7 +28,7 @@ pub const LOCKED_TICKS: u16 = 5 * TICKS_PER_SECOND;
 ///
 /// A day, then dark until the next press, so a torch left in a drawer
 /// doesn't spend its cell on the aux. The 32 kHz oscillator that times it
-/// can be 30 % out, so it's a day give or take a few hours. Unmeasured.
+/// has no accuracy in the datasheet, so it's a day give or take. Unmeasured.
 pub const BLUE_TICKS: u32 = 24 * 60 * 60 * 64;
 
 // `u32::from` isn't const, so the 64 is spelled out above.
@@ -43,6 +43,9 @@ pub struct Torch {
     showing: u16,
     /// Ticks left of [`BLUE_TICKS`].
     blue: u32,
+    /// Whether the light was on last tick, so the driver's been on for a
+    /// tick. See [`Torch::output`].
+    warm: bool,
 }
 
 impl Torch {
@@ -56,6 +59,7 @@ impl Torch {
             limits: Limits::new(calibration, faults),
             showing: if faults.any() { SHOW_TICKS } else { 0 },
             blue: BLUE_TICKS,
+            warm: false,
         }
     }
 
@@ -75,6 +79,7 @@ impl Torch {
     /// bright red for [`LOCKED_TICKS`], counted the same way. Any of them
     /// starts [`BLUE_TICKS`] again.
     pub fn tick(&mut self, pressed: bool, adc: Option<u16>) -> Option<Event> {
+        self.warm = self.level() > 0;
         self.showing = self.showing.saturating_sub(1);
         self.blue = self.blue.saturating_sub(1);
         let event = self.clicks.tick(pressed);
@@ -131,8 +136,22 @@ impl Torch {
         self.limits.convert()
     }
 
+    /// What the driver should be doing this tick.
+    ///
+    /// The first tick of any lit stretch is [`Output::STARTING`], the boost
+    /// converter and amplifier on with the DAC at 0 and no path, and the level
+    /// only comes on the tick after, 15.6 ms later. That's the stock
+    /// firmware's order, PC1 up and then 8 ms before the DAC, done as a tick
+    /// rather than a wait, so the loop never stalls. The 32 kHz oscillator
+    /// would have to run about 95 % fast for a tick to come in under 8 ms. The
+    /// stock order is the only one known to have run on this board, and
+    /// whether the other way round would be safer is unknown.
     pub fn output(&self) -> Output {
-        ramp::output(self.level())
+        match self.level() {
+            0 => Output::OFF,
+            _ if !self.warm => Output::STARTING,
+            level => ramp::output(level),
+        }
     }
 
     /// The UI's colour while all's well, but with lockout's red only for
@@ -255,7 +274,27 @@ mod tests {
         run(&mut torch, false, RELEASE_TICKS);
         assert_eq!(torch.output(), Output::OFF);
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
+        assert_eq!(torch.output(), Output::STARTING);
+        torch.tick(false);
         assert_eq!(torch.output(), dim());
+    }
+
+    #[test]
+    fn the_driver_starts_with_the_dac_at_zero_for_a_tick_every_time() {
+        let mut torch = Rig::default();
+        for _ in 0..3 {
+            run(&mut torch, true, 4);
+            run(&mut torch, false, RELEASE_TICKS);
+            torch.tick(false);
+            assert_eq!(torch.level(), ON_LEVEL);
+            assert_eq!(torch.output(), Output::STARTING);
+            torch.tick(false);
+            assert_eq!(torch.output(), dim());
+            run(&mut torch, true, 4);
+            run(&mut torch, false, RELEASE_TICKS);
+            torch.tick(false);
+            assert_eq!(torch.output(), Output::OFF);
+        }
     }
 
     #[test]
@@ -713,7 +752,7 @@ mod tests {
                 Self::Glitchy(raw) if rng.next_u16() % 4 != 0 => raw,
                 Self::Glitchy(_) | Self::Garbage => match rng.next_u16() % 2 {
                     0 => rng.next_u16(),
-                    _ => rng.next_u16() % (4 * 1023 + 1),
+                    _ => rng.next_u16() % (4 * 4095 + 1),
                 },
             }
         }
@@ -729,7 +768,7 @@ mod tests {
                 12 => Self::Steady(match rng.next_u16() % 3 {
                     0 => 0,
                     1 => voltage_reading(60),
-                    _ => 4 * 1023,
+                    _ => 4 * 4095,
                 }),
                 13..=14 => Self::Glitchy(voltage_reading(between(rng, 300, 420))),
                 _ => Self::Garbage,
@@ -837,7 +876,7 @@ mod tests {
             blue_until: BLUE_TICKS,
         };
         let (mut pressed, mut switch_left) = (false, 0);
-        let (mut cell, mut head) = (Source::Steady(3516), Source::Steady(2124));
+        let (mut cell, mut head) = (Source::Steady(6140), Source::Steady(8603));
         // One result in `lose` never arrives, and `0` is none of them.
         let (mut lose, mut world_left) = (0, 0);
         // Ticks the switch has been up, and ticks since the fault.
@@ -910,7 +949,12 @@ mod tests {
 
             // The level.
             check!(t, level <= CEILING, "level {level}");
-            check!(t, rig.output() == ramp::output(level), "level {level}");
+            let expected = match (level_before, level) {
+                (_, 0) => Output::OFF,
+                (0, _) => Output::STARTING,
+                _ => ramp::output(level),
+            };
+            check!(t, rig.output() == expected, "level {level}");
             check!(t, level <= asked, "level {level} of {asked}");
             check!(t, (level > 0) == (model.mode == Mode::On), "level {level}");
             check!(t, !failed || level == 0, "lit after a failed check");

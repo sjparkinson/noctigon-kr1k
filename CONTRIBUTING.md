@@ -12,17 +12,20 @@ cargo clippy --package kr1k --lib --bins --examples --release --target avr-none 
 cargo xtask hex
 ```
 
-The first three run on your machine's own target. The second clippy lints the firmware as the AVR sees it, which is the only place `src/avr/hw.rs` and `src/avr/rt.rs` get linted. `cargo xtask hex` builds the real firmware and checks the linked image against what those two files assume. That's the vector table, where startup copies and zeroes memory, and that each protected-register unlock is followed straight away by its write, and that no panic or bounds-check symbol is linked, so nothing can reach the panic handler (the checks are in `xtask/src/layout.rs`). It does the same layout checks on `examples/link.rs`, a throwaway program with a const table, a `.data` static and a `.bss` static, since the firmware has none of those yet. Then it runs both on the simulator, along with `examples/guards.rs`, which drives `src/avr/hw.rs` in ways the firmware never does so its guards get run too. If that passes, it pads the image to 16 KB, puts a 16-byte stamp of the commit (`xtask/src/stamp.rs`) just before the CRC in the last two bytes, and writes the file you'd flash. It prints how much of the 16 KB of flash and 2 KB of RAM the firmware uses, its stack, and how many instructions a tick and a PWM cycle take. CI keeps that hex and the ELF as a build artefact.
+The first three run on your machine's own target. The second clippy lints the firmware as the AVR sees it, which is the only place `src/avr/hw.rs` and `src/avr/rt.rs` get linted. `cargo xtask hex` builds the real firmware and checks the linked image against what those two files assume. That's the vector table, where startup copies and zeroes memory, and that each protected-register unlock is followed straight away by its write, and that no panic or bounds-check symbol is linked, so nothing can reach the panic handler (the checks are in `xtask/src/layout.rs`). It does the same layout checks on `examples/link.rs`, a throwaway program with a const table, a `.data` static and a `.bss` static, since the firmware has none of those yet. Then it runs both on the simulator, along with `examples/guards.rs`, which drives `src/avr/hw.rs` in ways the firmware never does so its guards get run too. If that passes, it pads the image to 32 KB, puts a 16-byte stamp of the commit (`xtask/src/stamp.rs`) just before the CRC in the last two bytes, and writes the file you'd flash. It prints how much of the 32 KB of flash and 4 KB of RAM the firmware uses, its stack, how many instructions a tick takes, and how many the longest interrupt handler takes against a TCB0 period. CI keeps that hex and the ELF as a build artefact.
 
 ## The simulator
 
-`xtask/src/sim.rs` puts a fake ATtiny1616 around a CPU in `xtask/src/avr.rs`, wired like the TS26, and runs the real firmware on it, from reset, through every example in docs/ui.md, through thousands of ticks of random clicks, and again with an interrupt landing on every instruction the loop reaches. It also starts once with PB2 already high, checks start-up happens in order (reset flags cleared before the watchdog, flash and fuses checked before anything else is set up, the PIT on before the watchdog), runs with every tick as slow as the datasheet allows, and stops the 32 kHz oscillator with the light on. It turns the rules a real chip enforces quietly into errors, such as PB2 high with no duty, a `wdr` in the closed window, or a handler that touches TCA0's shared TEMP byte. It refuses any register it doesn't model, so the first `cargo xtask hex` after you touch a new one fails until you teach it.
+`xtask/src/sim.rs` puts a fake AVR32DD20 around a CPU in `xtask/src/avr.rs`, wired like the KR1K's Lume X1-C driver, and runs the real firmware on it, from reset, through every example in docs/ui.md, through thousands of ticks of random clicks, and again with a switch bounce and a TCB0 period landing on every instruction the loop reaches. It also starts once with PC1 already high, checks start-up happens in order (reset flags cleared before the watchdog, flash, fuses and VDDIO2 checked before anything else is set up, the PIT on before the watchdog), runs with every tick as slow as the datasheet allows, stops the 32 kHz oscillator with the light on, and runs with VDDIO2 missing. It compares PC1, DAC0, its reference and the three paths with the library's output on every tick.
+
+It turns the rules a real chip enforces quietly into errors, such as a `wdr` in the closed window, a 16-bit register written high byte first, or the errata's lost write (a store under 64 straight after one at 64 or over, DS80001026D §2.2.3). It holds the firmware to the board's rules too, which have no datasheet section. PC1 only rises with DAC0 at 0, its reference at 1.024 V and the paths low, DAC0 only goes above 0 8 ms after that, a reference or path only changes with DAC0 at 0, and only goes up once it's settled, and TCB0 runs exactly while PC1 is high. It refuses any register it doesn't model, so the first `cargo xtask hex` after you touch a new one fails until you teach it.
 
 It's a mistake-finder, not proof. It's one reading of the datasheet, run against code written from that same reading, and it's never been compared with a real chip. A pass means the firmware does what the simulator thinks it should. Here's what it leaves out.
 
 - **Chip resets.** A watchdog bite is a failed run, so a real bite, and the boot after one, never runs anywhere. Neither does anything that happens to the pins during a reset.
-- **Anything analogue.** The MP3432, whatever turns PB0's PWM into current, the cell, the divider's real ratio and VCC. The ADC reads scripted numbers.
-- **Clocks and time.** It counts instructions, not cycles, and budgets by taking each as the slowest. The oscillators don't drift, apart from the one run that slows every tick to the datasheet's limit and the one that stops the 32 kHz oscillator outright, and a `wdr` that's lost in power-down can't happen.
+- **Anything analogue.** The boost converter, the amplifier, how fast PD6 really falls when DAC0 goes to 0, the cell, VDD and VDDIO2. The ADC reads scripted numbers, and the DAC's settling time is the datasheet's figure for a load nobody's measured.
+- **The AW2016.** Nothing drives it yet, so the aux LEDs aren't checked at all.
+- **Clocks and time.** It counts instructions, not cycles. A minimum wait is checked as if every instruction took one clock, which a real one never beats, and a budget as if each took four. The oscillators don't drift, apart from the one run that slows every tick to the limit and the one that stops the 32 kHz oscillator outright, and a `wdr` that's lost in power-down can't happen.
 - **The flash itself.** Fuses are scripted, and the CRC runs over the image, so it shows `xtask` and the firmware agree with each other and not that the chip does.
 - **The programmer on the pads.** Nothing here can see a slipped probe, or 12 V.
 
@@ -37,7 +40,7 @@ cargo xtask breakages <name>   # only the ones named
 
 Firmware that's right trips none of the simulator's rules, nor `xtask/src/layout.rs`'s, so a passing `cargo xtask hex` doesn't show they still work. The tests in `xtask/src/sim.rs` trip the ones a test can reach by driving the fake chip. The rest only go off with the real firmware running, and `cargo xtask breakages` is for those.
 
-`xtask/src/breakages.rs` has a table of mistakes, each a line or two of `src/avr/hw.rs` or `src/main.rs` changed. PB2 raised before the duty's set, a 16-bit register written high byte first, a watchdog that's never fed, a handler that changes a register, an array indexed by a reading, a `u16` divided by ten, and so on, one for each kind of alarm. The command copies the source to a temporary directory and runs `cargo xtask hex` there. First on the copy as it is, which has to pass. Then with each mistake in turn, which `hex` has to refuse, at the stage and with the message the table names. A mistake that passes fails the command, and so does one that's refused for some other reason, such as not compiling. The checkout is never edited.
+`xtask/src/breakages.rs` has a table of mistakes, each a line or two of `src/avr/hw.rs` or `src/main.rs` changed. DAC0 left live as PC1 drops, a path added with DAC0 still up, a pull-up on PC1, PD6's input buffer left on, `sts` where the errata wants `out`, TCB0 left running, the tick deadline removed, a 16-bit register written high byte first, a watchdog that's never fed, a handler that changes a register, an array indexed by a reading, a `u16` divided by ten, and so on, one for each kind of alarm. The command copies the source to a temporary directory and runs `cargo xtask hex` there. First on the copy as it is, which has to pass. Then with each mistake in turn, which `hex` has to refuse, at the stage and with the message the table names. A mistake that passes fails the command, and so does one that's refused for some other reason, such as not compiling. The checkout is never edited.
 
 Run it after touching `xtask/src/sim.rs`, `xtask/src/layout.rs`, `src/avr/hw.rs` or `src/avr/rt.rs`, and when bumping the nightly. It takes about a minute on a four-core machine, half of that building the copy's xtask and `core`, which is too long for every pull request, so CI doesn't run it.
 
@@ -51,10 +54,10 @@ Like the simulator, it finds mistakes and proves nothing. A refusal shows one al
 src/lib.rs        the no_std library: everything testable, nothing hardware
 src/button.rs     switch samples in, clicks and holds out
 src/ui.rs         the state machine docs/ui.md describes
-src/torch.rs      one pass of the firmware loop: switch and ADC in, boost enable, duty and aux out
-src/ramp.rs       the 150 levels, and the ceiling on them
+src/torch.rs      one pass of the firmware loop: switch and ADC in, driver output and aux out
+src/ramp.rs       the 150 levels as DAC0 codes, references and paths, and the ceiling on them
 src/limits.rs     what the cell and the temperature allow, from the UI's level to the level to run at
-src/battery.rs    AIN1 to centivolts, and low-voltage protection
+src/battery.rs    VDD / 10 to centivolts, and low-voltage protection
 src/thermal.rs    thermal regulation
 src/temp.rs       the temperature sensor's calibration
 src/sensors.rs    which ADC conversion is due on which tick
@@ -64,6 +67,7 @@ src/watchdog.rs   which passes of the loop feed the watchdog, the window that's 
 src/selftest.rs   what the checks at power-on found
 src/testing.rs    a fake ADC, readings and the docs/ui.md script reader, shared by the tests and the simulator
 src/regs.rs       register addresses and bit values, generated from the ATDF by build.rs
+src/board.rs      the KR1K's pin map, which hw.rs and the simulator both wire up from
 src/main.rs       the firmware loop (a stub on the host)
 src/avr/hw.rs     pins, register access and the interrupt handlers (AVR only)
 src/avr/rt.rs     vector table and startup (AVR only)

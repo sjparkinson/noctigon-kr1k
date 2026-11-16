@@ -1,56 +1,88 @@
-//! An AVR CPU, the AVRxt flavour in the tinyAVR 1-series, so the real
-//! firmware can run on the host. `sim.rs` puts a fake ATtiny1616 around it.
+//! An AVR CPU, the AVRxt flavour the AVR32DD20 has, so the real firmware can
+//! run on the host. `sim.rs` puts a fake AVR32DD20 around it. Section numbers
+//! are DS40002413B, the AVR32/16DD14/20 datasheet, unless they say otherwise.
 //!
 //! It counts instructions, not cycles. Anything it doesn't decode is an
 //! error naming the opcode, so a new instruction from a compiler upgrade
 //! shows up as a clear failure rather than a wrong answer. Encodings and
-//! flag rules come from Microchip's AVR Instruction Set Manual (DS40002198).
+//! flag rules come from Microchip's AVR Instruction Set Manual (DS40002198),
+//! whose AVRxt column is the one that applies.
 //!
-//! Interrupts work the AVRxt way (DS40002204A §13, and §8.7.3 for SREG.I;
-//! the instruction set manual's `reti` says it sets I, and its AVRxt note
-//! only covers CPUINT.STATUS). With SREG.I set, the CPU takes the
-//! lowest-numbered pending vector the bus offers, pushes PC and jumps to the
-//! vector's slot, two words each on a 16 KB part. Taking one doesn't clear I
-//! and `reti` doesn't set it; what stops a second level-0 interrupt nesting
-//! is CPUINT.STATUS.LVL0EX, which is set on the way in and cleared by `reti`.
-//! The instruction after `sei` always runs before a pending interrupt, which
-//! is what lets `sei; sleep` close the race AN2515C §4.5 describes. Only
+//! Interrupts work the AVRxt way (§15, and §7.6.3 for SREG.I; the
+//! instruction set manual's `reti` says it sets I, and its AVRxt note only
+//! covers CPUINT.STATUS). With SREG.I set, the CPU takes the lowest-numbered
+//! pending vector the bus offers, pushes PC and jumps to the vector's slot,
+//! two words each on a part with more than 8 KB of flash (table 15-1).
+//! Taking one doesn't clear I and `reti` doesn't set it; what stops a second
+//! level-0 interrupt nesting is CPUINT.STATUS.LVL0EX (§15.5.2), which is set
+//! on the way in and cleared by `reti`. The instruction after `sei` always
+//! runs before a pending interrupt (the instruction set manual's `sei`),
+//! which is what lets `sei; sleep` close the race AN2515D describes. Only
 //! level 0 is modelled, so there's no NMI, no level 1 vector and no round
 //! robin.
 //!
 //! Between instructions, then, an interrupt waits while SREG.I is clear,
 //! while LVL0EX is set, for the instruction after `sei`, for four
 //! instructions after a write to SPL or until the next I/O write if that's
-//! sooner (§8.5.4, §8.7.2), and for as long as the bus says
-//! (`holds_interrupts`, which is the CCP window, §8.5.7). Each of those
-//! leaves the request pending. `out SREG` setting I gets no hold, since the
-//! instruction set manual only promises one for `sei`, though §8.7.3 gives
-//! that write a one-cycle wait state and doesn't say whether it delays an
-//! interrupt, so that's likely, not known. None of this has been seen on a
-//! real chip.
+//! sooner (§7.6.2), and for as long as the bus says (`holds_interrupts`,
+//! which is the CCP window, §7.6.1). Each of those leaves the request
+//! pending. `out SREG` setting I gets no hold, since the instruction set
+//! manual only promises one for `sei`. None of this has been seen on a real
+//! chip.
 //!
 //! `sleep` asks the bus whether the chip would sleep, and whether any
 //! interrupt is enabled that could wake it. With none, only a reset wakes it
-//! (§11.3.1), whatever SREG.I says, and that's how firmware stops for good.
-//! With one, `sleep` is an error with SREG.I clear. Figure 13-1 takes the
-//! wake-up from the interrupt request after SREG.I has gated it, so that
-//! interrupt couldn't wake the CPU. That's a block diagram, though, and no
-//! text says it. So firmware that means to stop turns the enables off as
-//! well, and firmware that doesn't has made a mistake. With one enabled it's
-//! an error inside a handler too, where LVL0EX holds every other interrupt
-//! off. With none, a handler that sleeps has stopped for good like any other
-//! code, which is `hw::halt` reached from `__unhandled_interrupt`. Asleep, each
-//! step either takes a pending interrupt or lets the bus move time on.
+//! (§13.3.1), whatever SREG.I says, and that's how firmware stops for good.
+//! With one, `sleep` is an error with SREG.I clear. Figure 15-1 takes the
+//! wake-up from the interrupt request after the global enable has gated it,
+//! so that interrupt couldn't wake the CPU. That's a block diagram, though,
+//! and no text says it. So firmware that means to stop turns the enables off
+//! as well, and firmware that doesn't has made a mistake. With one enabled
+//! it's an error inside a handler too, where LVL0EX holds every other
+//! interrupt off. With none, a handler that sleeps has stopped for good like
+//! any other code, which is `hw::halt` reached from `__unhandled_interrupt`.
+//! Asleep, each step either takes a pending interrupt or lets the bus move
+//! time on.
+//!
+//! Errata DS80001026D §2.2.3 loses a write: "An ST/STD/STS instruction to
+//! address >= 64 followed by an ST/STD instruction to address < 64 or
+//! SLPCTRL.CTRLA will cause a loss of the last write." The CPU can tell
+//! instructions apart where the bus can't, so it notes each instruction that
+//! stored to 64 or over with `st`, `std` or `sts`, and tells the bus
+//! (`Bus::consecutive_store`) when the very next instruction stores with
+//! anything but `out`, `push` or a call. The errata names `st` and `std` for
+//! the second store and not `sts`, `sbi` or `cbi`, and says nothing either
+//! way, so this takes those as caught too. `push` and the return address a
+//! call or an interrupt stores aren't named as either store, and those stay
+//! out, since the stack is never under 64.
 
 use std::ops::Range;
 
 use kr1k::regs::addr;
 
 /// CPU.SPL, CPU.SPH and CPU.SREG. The CPU keeps these itself rather than
-/// passing them to the bus.
-pub const SPL: u16 = addr::CPU_SPL as u16;
-pub const SPH: u16 = addr::CPU_SPH as u16;
+/// passing them to the bus. The ATDF has SP as one 16-bit register, low byte
+/// at its address and high byte after it (§7.6.2).
+pub const SPL: u16 = addr::CPU_SP as u16;
+pub const SPH: u16 = SPL + 1;
 pub const SREG: u16 = addr::CPU_SREG as u16;
+
+/// The data addresses `out` reaches, which are also the ones under errata
+/// 2.2.3's 64 (§8.10.1).
+pub const IO_LOW_END: u16 = 0x40;
+
+/// How an instruction stores to data space, which errata 2.2.3 cares about.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Store {
+    /// `st`, `std` or `sts`.
+    Data,
+    /// `out`, the errata's workaround.
+    Out,
+    /// `sbi` or `cbi`.
+    Bit,
+    /// `push`, or the return address of a call or an interrupt.
+    Stack,
+}
 
 // SREG bits.
 const C: u8 = 0;
@@ -64,14 +96,14 @@ const T: u8 = 6;
 pub const I: u8 = 7;
 
 /// Words in each vector slot. Parts with more than 8 KB of flash use a
-/// two-word `jmp` per slot, so vector n is at word 2n (DS40002204A table 7-2).
+/// two-word `jmp` per slot, so vector n is at word 2n (table 15-1's note).
 pub const VECTOR_WORDS: u32 = 2;
 
-/// Instructions a write to SPL holds interrupts off for (DS40002204A §8.5.4).
+/// Instructions a write to SPL holds interrupts off for (§7.6.2).
 const SPL_HOLD: u8 = 4;
-/// Where I/O memory ends, the 64 I/O registers and the extended ones (§6.2,
-/// the memory map). A write below this ends SPL's hold early.
-const IO_END: u16 = 0x1000;
+/// Where I/O memory ends, the 64 I/O registers and the extended ones
+/// (§8.10.2). A write below this ends SPL's hold early.
+const IO_END: u16 = 0x1040;
 
 /// Everything outside the CPU, meaning program memory, data space and the
 /// interrupt lines.
@@ -95,11 +127,19 @@ pub trait Bus {
     }
     /// The CPU has run `sleep`. Errors if the chip wouldn't sleep. Otherwise
     /// says whether an interrupt is enabled that could wake it. With none,
-    /// only a reset does (DS40002204A §11.3.1).
+    /// only a reset does (§13.3.1).
     fn sleep(&mut self) -> Result<bool, String>;
     /// The CPU's asleep and nothing's pending, so move time on to the next
     /// thing that happens.
     fn idle(&mut self) -> Result<(), String>;
+    /// An instruction is storing to `addr` with `st`, `std`, `sts`, `sbi` or
+    /// `cbi`, straight after one that stored to 64 or over with `st`, `std`
+    /// or `sts`. Errata 2.2.3 says that loses the store if it's under 64 or
+    /// to SLPCTRL.CTRLA, and the bus knows where that is.
+    fn consecutive_store(&mut self, addr: u16) -> Result<(), String> {
+        let _ = addr;
+        Ok(())
+    }
 }
 
 pub struct Cpu {
@@ -118,16 +158,26 @@ pub struct Cpu {
     /// Set by a write to SPL, and counts the instructions still to run before
     /// any interrupt.
     spl_hold: u8,
-    /// The SP bits that exist. The datasheet says unused ones read 0
-    /// without saying which (DS40002204A §8.7.2), so this keeps only the
-    /// ones SRAM needs, the fewest it could be.
+    /// The SP bits that exist. Only the ones needed to address SRAM are
+    /// implemented and the rest are fixed "so the Stack Pointer (SP) always
+    /// points to the SRAM" (§7.6.2). That says "set", which taken literally
+    /// would put SP above data space on this part, so this takes the fixed
+    /// bits as whatever keeps SP inside SRAM, which is SRAM's start.
     sp_bits: u16,
+    /// What the fixed bits hold.
+    sp_fixed: u16,
+    /// The instruction running has stored to 64 or over with `st`, `std` or
+    /// `sts` (errata 2.2.3).
+    stored_high: bool,
+    /// The instruction before it did.
+    stored_high_before: bool,
 }
 
 impl Cpu {
     /// The state after reset, with PC at 0, SP at the top of SRAM and SREG
-    /// clear.
+    /// clear. `sram`'s size has to be a power of two, aligned to itself.
     pub const fn new(sram: &Range<u16>) -> Self {
+        let sp_bits = sram.end.wrapping_sub(sram.start).wrapping_sub(1);
         Self {
             r: [0; 32],
             pc: 0,
@@ -137,7 +187,10 @@ impl Cpu {
             handling: None,
             hold: false,
             spl_hold: 0,
-            sp_bits: sram.end.next_power_of_two() - 1,
+            sp_bits,
+            sp_fixed: sram.start & !sp_bits,
+            stored_high: false,
+            stored_high_before: false,
         }
     }
 
@@ -147,6 +200,11 @@ impl Cpu {
         let hold = std::mem::take(&mut self.hold);
         let spl_hold = self.spl_hold;
         self.spl_hold = spl_hold.saturating_sub(1);
+        // Whatever this step does, the instruction that ran last is the one
+        // before it. Taking an interrupt or sleeping on runs none, and the
+        // next is then a vector's `jmp` or another wait, so the errata's pair
+        // can't straddle either.
+        self.stored_high_before = std::mem::take(&mut self.stored_high);
         if self.flag(I)
             && self.handling.is_none()
             && !hold
@@ -271,7 +329,7 @@ impl Cpu {
                 // address.
                 let a = ((w >> 5) & 0x30) | (w & 0x0F);
                 if w & 0x0800 != 0 {
-                    self.store(bus, a, rd)?;
+                    self.store_as(bus, a, rd, Store::Out)?;
                 } else {
                     self.r[d] = self.load(bus, a)?;
                 }
@@ -443,8 +501,8 @@ impl Cpu {
                 let mask = 1u8 << (w & 7);
                 let value = self.load(bus, a)?;
                 match (w >> 8) & 3 {
-                    0 => self.store(bus, a, value & !mask)?,
-                    2 => self.store(bus, a, value | mask)?,
+                    0 => self.store_as(bus, a, value & !mask, Store::Bit)?,
+                    2 => self.store_as(bus, a, value | mask, Store::Bit)?,
                     // sbic (1) and sbis (3)
                     op => {
                         if (value & mask != 0) == (op == 3) {
@@ -600,16 +658,35 @@ impl Cpu {
         }
     }
 
+    /// A store by `st`, `std` or `sts`.
     fn store(&mut self, bus: &mut impl Bus, addr: u16, value: u8) -> Result<(), String> {
+        self.store_as(bus, addr, value, Store::Data)
+    }
+
+    fn store_as(
+        &mut self,
+        bus: &mut impl Bus,
+        addr: u16,
+        value: u8,
+        how: Store,
+    ) -> Result<(), String> {
+        if self.stored_high_before && matches!(how, Store::Data | Store::Bit) {
+            bus.consecutive_store(addr)?;
+        }
+        if how == Store::Data && addr >= IO_LOW_END {
+            self.stored_high = true;
+        }
         if addr < IO_END {
             self.spl_hold = 0;
         }
         match addr {
             SPL => {
-                self.sp = (self.sp & 0xFF00 | u16::from(value)) & self.sp_bits;
+                self.sp = self.sp_fixed | (self.sp & 0xFF00 | u16::from(value)) & self.sp_bits;
                 self.spl_hold = SPL_HOLD;
             }
-            SPH => self.sp = (self.sp & 0x00FF | u16::from(value) << 8) & self.sp_bits,
+            SPH => {
+                self.sp = self.sp_fixed | (self.sp & 0x00FF | u16::from(value) << 8) & self.sp_bits;
+            }
             SREG => self.sreg = value,
             _ => bus.write(addr, value)?,
         }
@@ -651,7 +728,7 @@ impl Cpu {
     }
 
     fn push(&mut self, bus: &mut impl Bus, value: u8) -> Result<(), String> {
-        self.store(bus, self.sp, value)?;
+        self.store_as(bus, self.sp, value, Store::Stack)?;
         self.sp = self.sp.wrapping_sub(1);
         Ok(())
     }
@@ -661,7 +738,8 @@ impl Cpu {
         self.load(bus, self.sp)
     }
 
-    /// Return addresses are two bytes on a 16 KB part, low byte pushed first.
+    /// Return addresses are two bytes on a part with a 16-bit PC, which 32 KB
+    /// of flash needs, low byte pushed first.
     fn push_pc(&mut self, bus: &mut impl Bus) -> Result<(), String> {
         let [lo, hi] = (self.pc as u16).to_le_bytes();
         self.push(bus, lo)?;
@@ -928,7 +1006,7 @@ mod tests {
         let (cpu, bus) = run(&program, |_, _| {});
         assert_eq!((cpu.r[16], cpu.r[17]), (1, 2));
         assert_eq!(cpu.sp, RAM.end - 1, "the stack is balanced");
-        assert_eq!(&bus.data[0x3FFE..0x4000], &[0x00, 0x01], "return address 1");
+        assert_eq!(&bus.data[0x7FFE..0x8000], &[0x00, 0x01], "return address 1");
     }
 
     #[test]
@@ -963,9 +1041,9 @@ mod tests {
             cpu.sreg = 0xFF;
             cpu.r[16] = 0x80;
         });
-        assert_eq!(cpu.pair(28), 0x3FFF);
+        assert_eq!(cpu.pair(28), 0x7FFF);
         assert_eq!(cpu.sreg, 0);
-        assert_eq!(cpu.sp, 0x3F80);
+        assert_eq!(cpu.sp, 0x7F80);
         assert!(
             bus.data[0x3D..0x40].iter().all(|&b| b == 0),
             "never reaches the bus"
@@ -992,10 +1070,62 @@ mod tests {
     }
 
     #[test]
-    fn sp_only_has_the_bits_sram_needs() {
+    fn sp_only_has_the_bits_sram_needs_and_stays_in_sram() {
         // ldi r16, 0xFF; out SPH, r16; out SPL, r16
         let (cpu, _) = run(&[ldi(16, 0xFF), 0xBF0E, 0xBF0D], |_, _| {});
-        assert_eq!(cpu.sp, 0x3FFF);
+        assert_eq!(cpu.sp, 0x7FFF);
+        // ldi r16, 0; out SPH, r16; out SPL, r16
+        let (cpu, _) = run(&[ldi(16, 0), 0xBF0E, 0xBF0D], |_, _| {});
+        assert_eq!(cpu.sp, 0x7000);
+    }
+
+    /// Errata 2.2.3's pair, as the CPU tells the bus about it.
+    #[test]
+    fn tells_the_bus_of_a_store_straight_after_a_store_to_64_or_over() {
+        struct Pairs(TestBus, Vec<u16>);
+        impl Bus for Pairs {
+            fn fetch(&self, pc: u32) -> Option<u16> {
+                self.0.fetch(pc)
+            }
+            fn read(&mut self, addr: u16) -> Result<u8, String> {
+                self.0.read(addr)
+            }
+            fn write(&mut self, addr: u16, value: u8) -> Result<(), String> {
+                self.0.write(addr, value)
+            }
+            fn interrupt(&self) -> Option<u8> {
+                None
+            }
+            fn sleep(&mut self) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn idle(&mut self) -> Result<(), String> {
+                Ok(())
+            }
+            fn consecutive_store(&mut self, addr: u16) -> Result<(), String> {
+                self.1.push(addr);
+                Ok(())
+            }
+        }
+        let pairs = |program: &[u16]| {
+            let mut bus = Pairs(TestBus::new(program), Vec::new());
+            let mut cpu = Cpu::new(&RAM);
+            cpu.r[26] = 0x10; // X, for st X
+            while (cpu.pc as usize) < program.len() {
+                cpu.step(&mut bus).unwrap();
+            }
+            bus.1
+        };
+        // sts 0x0100, r16 then sts 0x0011, r16; st X, r16; out 0x12, r16;
+        // push r16; sbi 0x13, 0.
+        let program = [
+            0x9300, 0x0100, 0x9300, 0x0011, 0x930C, 0xBB02, 0x930F, 0x9A98,
+        ];
+        assert_eq!(pairs(&program), [0x0011]);
+        // A store under 64 doesn't start a pair, and `push` doesn't either.
+        assert_eq!(pairs(&[0x930C, 0x930C, 0x930F, 0x930C]), Vec::<u16>::new());
+        // `sbi` straight after `sts` is told too.
+        assert_eq!(pairs(&[0x9300, 0x0100, 0x9A98]), [0x0013]);
     }
 
     #[test]
@@ -1397,7 +1527,7 @@ mod tests {
         assert!(err.contains("asleep: nothing to wake on"), "{err}");
     }
 
-    /// DS40002204A §11.3.1 says that with no interrupt enabled, only a reset
+    /// §13.3.1 says that with no interrupt enabled, only a reset
     /// wakes it. SREG.I makes no difference to that.
     #[test]
     fn sleeps_for_good_with_no_interrupt_enabled() {

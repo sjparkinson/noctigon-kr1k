@@ -13,20 +13,23 @@ use crate::updi::map;
 /// row, the same as the library tests'.
 pub use kr1k::testing::CALIBRATION;
 
-/// The fuse bytes the simulated chip has, FUSE.WDTCFG to FUSE.BOOTEND.
+/// The fuse bytes the simulated chip has, FUSE.WDTCFG to FUSE.BOOTSIZE.
 pub const FUSE_BYTES: usize = 9;
 
-/// Each fuse byte's name, by its offset from FUSE.WDTCFG. Offset 3 is reserved.
+/// Each fuse byte's name, by its offset from FUSE.WDTCFG. Offsets 3 and 4 are
+/// reserved.
 pub const FUSE_NAMES: [&str; FUSE_BYTES] = [
-    "WDTCFG", "BODCFG", "OSCCFG", "", "TCD0CFG", "SYSCFG0", "SYSCFG1", "APPEND", "BOOTEND",
+    "WDTCFG", "BODCFG", "OSCCFG", "", "", "SYSCFG0", "SYSCFG1", "CODESIZE", "BOOTSIZE",
 ];
 
-/// The fuses the firmware expects, as the datasheet has a factory chip. That's
-/// no watchdog from the fuse, BOD off, 20 MHz, UPDI on the reset pin, no CRC
-/// at start-up and no boot or application section. The datasheet, the errata
-/// and the ATDF disagree on OSCCFG and SYSCFG0's spare bits, which is why the
-/// firmware only checks fields.
-pub const FACTORY_FUSES: [u8; FUSE_BYTES] = [0x00, 0x00, 0x02, 0xFF, 0x00, 0xC4, 0x07, 0x00, 0x00];
+/// This torch's fuses, from the backup read with the stock firmware on it
+/// (2026-11-16, `backup/stock/fuses.hex`), which are the factory defaults
+/// (DS40002413B section 8.8.2). That's no watchdog from the fuse, the
+/// brown-out detector off, the high-frequency oscillator, UPDI on PF7, no CRC
+/// at start-up, dual supply with no start-up delay, and no boot or
+/// application section. The reserved bytes read 0xFF in that backup, and
+/// `World::fuse` never reads them anyway.
+pub const FACTORY_FUSES: [u8; FUSE_BYTES] = [0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x08, 0x00, 0x00];
 
 /// FUSE.OSCCFG's offset in [`FACTORY_FUSES`].
 const OSCCFG: usize = reg::FUSE_OSCCFG - reg::FUSE_WDTCFG;
@@ -52,7 +55,7 @@ impl World {
         self.scene.reading(channel)
     }
 
-    /// The fuse at a data-space address, if it's one of `fuses` and not the
+    /// The fuse at a data-space address, if it's one of `fuses` and not a
     /// reserved byte, which the datasheet doesn't say how reads.
     pub fn fuse(&self, addr: usize) -> Option<u8> {
         let offset = addr.checked_sub(usize::from(map::FUSES))?;
@@ -63,7 +66,7 @@ impl World {
     }
 
     /// A world whose fuses fail the firmware's read-back, which is what a
-    /// script's `fault` means. OSCCFG asks for 16 MHz.
+    /// script's `fault` means. OSCCFG asks for the 32 kHz oscillator.
     pub const fn with_bad_fuse(mut self) -> Self {
         self.fuses[OSCCFG] = 0x01;
         self.scene.fault = true;
@@ -75,10 +78,12 @@ impl World {
         let at = |addr| self.fuse(addr).unwrap_or(0xFF);
         let fuses = Fuses {
             wdtcfg: at(reg::FUSE_WDTCFG),
+            bodcfg: at(reg::FUSE_BODCFG),
             osccfg: at(reg::FUSE_OSCCFG),
             syscfg0: at(reg::FUSE_SYSCFG0),
-            append: at(reg::FUSE_APPEND),
-            bootend: at(reg::FUSE_BOOTEND),
+            syscfg1: at(reg::FUSE_SYSCFG1),
+            codesize: at(reg::FUSE_CODESIZE),
+            bootsize: at(reg::FUSE_BOOTSIZE),
         };
         Faults {
             fuses: !fuses.ok(),
@@ -131,8 +136,9 @@ mod tests {
 
     #[test]
     fn fuses_read_by_address_and_the_reserved_byte_doesnt() {
-        assert_eq!(World::NORMAL.fuse(reg::FUSE_OSCCFG), Some(0x02), "OSCCFG");
+        assert_eq!(World::NORMAL.fuse(reg::FUSE_BODCFG), Some(0x00), "BODCFG");
         assert_eq!(World::NORMAL.fuse(reg::FUSE_OSCCFG + 1), None, "reserved");
+        assert_eq!(World::NORMAL.fuse(reg::FUSE_OSCCFG + 2), None, "reserved");
         let end = usize::from(map::FUSES) + FUSE_BYTES;
         assert_eq!(World::NORMAL.fuse(end), None, "past the end");
     }

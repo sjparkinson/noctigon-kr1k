@@ -86,77 +86,165 @@ const MAIN: &str = "src/main.rs";
 /// and seen refused for the reason it gives, and `cargo xtask breakages`
 /// sees to it that stays true.
 const BREAKAGES: &[Breakage] = &[
-    // Turning on: the duty goes first, then the enable.
+    // PC1 only rises with DAC0 at 0. DAC0 above 0 with PC1 low is refused
+    // first, which is as close as a breakage gets, since the DAC can't be
+    // live before PC1 rises without that going off.
     Breakage {
-        name: "enable-before-duty",
+        name: "dac-live-before-pc1",
         file: HW,
-        find: "    let was_off = read(reg::VPORTB_OUT) & 1 << ENABLE == 0;\n",
-        replace: "    let was_off = read(reg::VPORTB_OUT) & 1 << ENABLE == 0;\n    \
-                  write(reg::VPORTB_OUT, read(reg::VPORTB_OUT) | 1 << ENABLE);\n",
+        find: "        out!(reg::VPORTC_OUT, 1 << ENABLE);\n        return;\n",
+        replace: "        write16(reg::DAC0_DATA, 1 << DAC_SHIFT);\n        \
+                  out!(reg::VPORTC_OUT, 1 << ENABLE);\n        return;\n",
         stage: Stage::Simulator,
-        expect: "raises PB2 with the duty at 0",
+        expect: "sets DAC0 to 1 with PC1 low",
     },
-    // Turning off: the enable drops first, then the duty.
+    // Turning off: DAC0 to 0 before PC1 drops.
     Breakage {
-        name: "duty-before-enable",
+        name: "pc1-down-with-dac-live",
         file: HW,
-        find: "        write(reg::VPORTB_OUT, read(reg::VPORTB_OUT) & !(1 << ENABLE));\n        \
-               without_interrupts(|| {\n",
-        replace: "        without_interrupts(|| {\n",
+        find: "    if !output.enable {\n        write16(reg::DAC0_DATA, 0);\n",
+        replace: "    if !output.enable {\n",
         stage: Stage::Simulator,
-        expect: "writes TCA0.CMP0BUF from the main loop with PB2 high",
+        expect: "drops PC1 with DAC0 still at",
     },
-    // Turning off hands PB0 back to PORT, since nothing says what a stopped
-    // timer leaves on it.
+    // The level comes a tick after PC1 rises. This sets it in the same pass,
+    // by asking `set_output` twice with the level, never `Output::STARTING`.
     Breakage {
-        name: "pb0-left-to-tca0",
+        name: "dac-before-the-boost-starts",
+        file: MAIN,
+        find: "        if let Some(output) = output_changes.update(torch.output()) {\n            \
+               hw::set_output(output);\n",
+        replace: "        if let Some(output) = \
+                  output_changes.update(kr1k::ramp::output(torch.level())) {\n            \
+                  hw::set_output(output);\n            hw::set_output(output);\n",
+        stage: Stage::Simulator,
+        expect: "the stock firmware gives the boost converter",
+    },
+    // A reference or a path only goes up with DAC0 at 0.
+    Breakage {
+        name: "path-change-with-dac-live",
         file: HW,
-        find: "            write(reg::TCA0_CTRLB, CTRLB_OFF);\n",
+        find: "        write16(reg::DAC0_DATA, 0);\n        spin(DAC_FALLS);\n",
         replace: "",
         stage: Stage::Simulator,
-        expect: "powers down with TCA0.CTRLB.CMP0EN set",
+        expect: "with PC1 high and DAC0 at",
     },
-    // Turning off zeroes the live compare too, so power-down can follow on
-    // the same pass without waiting for BOTTOM to bring in CMP0BUF's 0. That
-    // makes this one depend on timing. It's refused because `hw::halt` powers
-    // down within a cycle of turning off, and a BOTTOM in between would hide
-    // it, as it would on a real chip.
+    // Coming down too, since how the paths combine is unknown. This drops
+    // the paths first at turn-off, with DAC0 still at the level's code.
     Breakage {
-        name: "no-direct-compare-write",
+        name: "paths-off-before-dac",
         file: HW,
-        find: "            write16(reg::TCA0_CMP0, 0);\n",
+        find: "    if !output.enable {\n        write16(reg::DAC0_DATA, 0);\n",
+        replace: "    if !output.enable {\n        out!(reg::VPORTA_OUT, 0);\n        \
+                  write16(reg::DAC0_DATA, 0);\n",
+        stage: Stage::Simulator,
+        expect: "off with PC1 high and DAC0 at",
+    },
+    // ... and with DAC0's output given time to get there.
+    Breakage {
+        name: "dac-fall-not-waited",
+        file: HW,
+        find: "        spin(DAC_FALLS);\n",
         replace: "",
         stage: Stage::Simulator,
-        expect: "powers down with CMP0 at",
+        expect: "table 38-23",
     },
-    // A change of level holds interrupts off, so the handler never sees one
-    // byte of the new level and one of the old.
     Breakage {
-        name: "level-change-with-interrupts-on",
+        name: "pc1-pull-up",
         file: HW,
-        find: "    unsafe { asm!(\"cli\", options(nostack)) };\n    f();\n",
-        replace: "    f();\n",
+        find: "    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);\n",
+        replace: "    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, regs::PORT_PULLUPEN);\n",
         stage: Stage::Simulator,
-        expect: "so the handler can catch the delta-sigma half changed",
+        expect: "gives PC1 a pull-up",
     },
-    // The delta-sigma starts from nothing each time the light comes on.
     Breakage {
-        name: "sum-kept-at-turn-off",
+        name: "switch-pull-up",
         file: HW,
-        find: "            write(DSM_SUM, 0);\n",
+        find: "    pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_BOTHEDGES);\n",
+        replace: "    pin_ctrl(\n        reg::PORTD_PIN0CTRL,\n        SWITCH,\n        \
+                  regs::PORT_ISC_BOTHEDGES | regs::PORT_PULLUPEN,\n    );\n",
+        stage: Stage::Simulator,
+        expect: "gives PD4 a pull-up",
+    },
+    // PD6's input buffer goes off before DAC0 drives it.
+    Breakage {
+        name: "pd6-input-left-on",
+        file: HW,
+        find: "    pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);\n",
         replace: "",
         stage: Stage::Simulator,
-        expect: "with the delta-sigma's sum at",
+        expect: "PD6's input buffer still on",
     },
-    // Every BOTTOM raises the overflow flag, light on or off, so turning on
-    // clears it before the interrupt goes on.
+    // PA2 and PA3 are the AW2016's, and never driven.
     Breakage {
-        name: "stale-overflow-flag",
+        name: "twi-line-driven",
         file: HW,
-        find: "            write(reg::TCA0_INTFLAGS, regs::TCA_OVF);\n",
-        replace: "",
+        find: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED;\n",
+        replace: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << 2;\n",
         stage: Stage::Simulator,
-        expect: "with INTFLAGS.OVF still up from before",
+        expect: "PA2 and PA3 are the AW2016's TWI lines",
+    },
+    // Errata 2.2.3: a store under 64 straight after one at 64 or over is
+    // lost, so the VPORTs and GPRs take `out`. This is every `out!` as the
+    // ATtiny1616 firmware would have written it, an `sts`. A plain `write`
+    // to a VPORT doesn't show it, since LLVM emits `out` for any constant
+    // address under 64 itself.
+    Breakage {
+        name: "sts-to-a-vport",
+        file: HW,
+        find: "                \"out {addr}, {value}\",\n",
+        replace: "                \"sts {addr}, {value}\",\n",
+        stage: Stage::Simulator,
+        expect: "straight after a store to 64 or over",
+    },
+    // ... and SLPCTRL.CTRLA gets a `nop` before it. This puts a store at 64
+    // or over there instead, as a store before `sleep_mode` would be if the
+    // `nop` went and the compiler put nothing between.
+    Breakage {
+        name: "sleep-mode-without-nop",
+        file: HW,
+        find: "            \"nop\",\n            \"sts {addr}, {value}\",\n",
+        replace: "            \"sts {addr}, {value}\",\n            \"sts {addr}, {value}\",\n",
+        stage: Stage::Simulator,
+        expect: "SLPCTRL.CTRLA straight after a store to 64 or over",
+    },
+    // `prepare_sleep` idles rather than power down with PC1 high, whatever
+    // it's asked. The firmware never asks, so examples/guards.rs does.
+    Breakage {
+        name: "power-down-with-the-light-on",
+        file: HW,
+        find: "    let mode = if rest && !lit() {\n",
+        replace: "    let mode = if rest {\n",
+        stage: Stage::Simulator,
+        expect: "powers down with PC1 high",
+    },
+    Breakage {
+        name: "adc-on-in-power-down",
+        file: HW,
+        find: "        write(reg::ADC0_CTRLA, 0);\n        regs::SLPCTRL_SMODE_PDOWN\n",
+        replace: "        regs::SLPCTRL_SMODE_PDOWN\n",
+        stage: Stage::Simulator,
+        expect: "powers down with ADC0 still enabled",
+    },
+    // TCB0, the deadline's timer, stops with the light.
+    Breakage {
+        name: "tcb0-left-running",
+        file: HW,
+        find: "        write(reg::TCB0_CTRLA, 0);\n        write(reg::TCB0_INTCTRL, 0);\n",
+        replace: "        write(reg::TCB0_INTCTRL, 0);\n",
+        stage: Stage::Simulator,
+        expect: "powers down with TCB0 running",
+    },
+    // With the light on and no tick, the wait gives up and `main` halts.
+    // This count never runs out.
+    Breakage {
+        name: "no-tick-deadline",
+        file: HW,
+        find: "                if periods == 0 {\n                    break false;\n",
+        replace: "                if periods == 0 {\n                    \
+                  periods = TICK_DEADLINE_PERIODS;\n",
+        stage: Stage::Simulator,
+        expect: "past the deadline",
     },
     // `hw::halt` clears SREG.I as well as turning every interrupt off, since
     // the datasheet doesn't say either alone keeps the chip down.
@@ -168,32 +256,56 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "stops for good with SREG.I still set",
     },
-    // `prepare_sleep` idles rather than power down with PB2 high, whatever
-    // it's asked. The firmware never asks, so examples/guards.rs does.
+    // `hw::halt` is where the firmware ends up when it can't go on, and it
+    // has to leave the light off. This one still turns TCB0's interrupt off,
+    // so the `sleep` is one the chip would take, with PC1 high, and it's in
+    // idle, since `prepare_sleep` won't power down with the light on.
     Breakage {
-        name: "power-down-with-the-light-on",
+        name: "halt-leaves-the-light-on",
         file: HW,
-        find: "    let mode = if rest && read(reg::VPORTB_OUT) & 1 << ENABLE == 0 {\n",
-        replace: "    let mode = if rest {\n",
+        find: "    set_output(Output::OFF);\n    write(reg::RTC_PITINTCTRL, 0);\n",
+        replace: "    write(reg::TCB0_INTCTRL, 0);\n    write(reg::RTC_PITINTCTRL, 0);\n",
         stage: Stage::Simulator,
-        expect: "powers down with PB2 high",
+        expect: "sleeps with TCB0 running and PC1 high",
     },
+    // PC1 is cleared in OUT before it's made an output.
     Breakage {
-        name: "pb2-pull-up",
+        name: "dir-before-out",
         file: HW,
-        find: "        if PORTB_OUTPUTS & 1 << pin == 0 {\n",
-        replace: "        if 1 << PWM & 1 << pin == 0 {\n",
+        find: "    out!(reg::VPORTC_OUT, 0);\n    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);\n}\n",
+        replace: "    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);\n    out!(reg::VPORTC_OUT, 0);\n}\n",
         stage: Stage::Simulator,
-        expect: "gives PB2 a pull-up",
+        expect: "starting with PC1 high: the first register it writes leaves PC1 set",
     },
-    // 16-bit registers go low byte first.
+    // The reset flags are read and cleared before anything can reset the
+    // chip again.
     Breakage {
-        name: "high-byte-first",
-        file: HW,
-        find: "    write(addr, lo);\n    write(addr + 1, hi);\n",
-        replace: "    write(addr + 1, hi);\n    write(addr, lo);\n",
+        name: "watchdog-before-reset-flags",
+        file: MAIN,
+        find: "    let faults = Faults {\n        \
+               hang: selftest::hung(hw::take_reset_flags()),\n        \
+               flash: !hw::flash_ok(),\n        \
+               fuses: !hw::fuses().ok(),\n        \
+               supply: !hw::vddio2_ok(),\n    };\n\n    \
+               hw::init();\n    hw::start_watchdog();\n",
+        replace: "    hw::init();\n    hw::start_watchdog();\n\n    \
+                  let faults = Faults {\n        \
+                  hang: selftest::hung(hw::take_reset_flags()),\n        \
+                  flash: !hw::flash_ok(),\n        \
+                  fuses: !hw::fuses().ok(),\n        \
+                  supply: !hw::vddio2_ok(),\n    };\n",
         stage: Stage::Simulator,
-        expect: "writes the high byte of TCA0.PER without its low byte",
+        expect: "start-up order: turns the watchdog on before clearing the reset flags",
+    },
+    // Without VDDIO2, PC1 is tri-stated, so the light stays off as a fault.
+    // This reads MVIO.STATUS and ignores it.
+    Breakage {
+        name: "vddio2-ignored",
+        file: MAIN,
+        find: "        supply: !hw::vddio2_ok(),\n",
+        replace: "        supply: !hw::vddio2_ok() && false,\n",
+        stage: Stage::Simulator,
+        expect: "with VDDIO2 missing: tick",
     },
     Breakage {
         name: "watchdog-never-fed",
@@ -211,79 +323,14 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "closed window",
     },
+    // 16-bit registers go low byte first.
     Breakage {
-        name: "adc-on-in-power-down",
+        name: "high-byte-first",
         file: HW,
-        find: "        write(reg::ADC0_CTRLA, 0);\n        write(reg::VREF_CTRLB, 0);\n",
-        replace: "        write(reg::VREF_CTRLB, 0);\n",
+        find: "    write(addr, lo);\n    write(addr + 1, hi);\n",
+        replace: "    write(addr + 1, hi);\n    write(addr, lo);\n",
         stage: Stage::Simulator,
-        expect: "powers down with ADC0 still enabled",
-    },
-    // `hw::halt` is where the firmware ends up when it can't go on, and it
-    // has to leave the light off. This one still turns TCA0's interrupt off,
-    // so the `sleep` is one the chip would take, with PB2 high.
-    Breakage {
-        name: "halt-leaves-the-light-on",
-        file: HW,
-        find: "    set_output(Output::OFF);\n    write(reg::RTC_PITINTCTRL, 0);\n",
-        replace: "    write(reg::TCA0_INTCTRL, 0);\n    write(reg::RTC_PITINTCTRL, 0);\n",
-        stage: Stage::Simulator,
-        expect: "stopped for good with PB2 high",
-    },
-    // PB2 is cleared in OUT before it's made an output.
-    Breakage {
-        name: "dir-before-out",
-        file: HW,
-        find: "    write(reg::VPORTB_OUT, 0);\n    write(reg::VPORTB_DIR, PORTB_OUTPUTS);\n",
-        replace: "    write(reg::VPORTB_DIR, PORTB_OUTPUTS);\n    write(reg::VPORTB_OUT, 0);\n",
-        stage: Stage::Simulator,
-        expect: "starting with PB2 high: the first register it writes leaves PB2 set",
-    },
-    // The reset flags are read and cleared before anything can reset the
-    // chip again.
-    Breakage {
-        name: "watchdog-before-reset-flags",
-        file: MAIN,
-        find: "    let faults = Faults {\n        \
-               hang: selftest::hung(hw::take_reset_flags()),\n        \
-               flash: !hw::flash_ok(),\n        \
-               fuses: !hw::fuses().ok(),\n    };\n\n    \
-               hw::init();\n    hw::start_watchdog();\n",
-        replace: "    hw::init();\n    hw::start_watchdog();\n\n    \
-                  let faults = Faults {\n        \
-                  hang: selftest::hung(hw::take_reset_flags()),\n        \
-                  flash: !hw::flash_ok(),\n        \
-                  fuses: !hw::fuses().ok(),\n    };\n",
-        stage: Stage::Simulator,
-        expect: "start-up order: turns the watchdog on before clearing the reset flags",
-    },
-    // A handler never touches TCA0's 16-bit registers while the main loop is
-    // halfway through one. This moves the main loop's write of the compare
-    // to after the handler's turned on and interrupts are back.
-    Breakage {
-        name: "handler-races-temp",
-        file: HW,
-        find: "            write16(reg::TCA0_CMP0BUF, u16::from(duty));\n            \
-               write(reg::TCA0_CTRLB, CTRLB_ON);\n            \
-               write(reg::TCA0_INTFLAGS, regs::TCA_OVF);\n            \
-               write(reg::TCA0_INTCTRL, regs::TCA_OVF);\n        }\n    });\n",
-        replace: "            write(reg::TCA0_CTRLB, CTRLB_ON);\n            \
-                  write(reg::TCA0_INTFLAGS, regs::TCA_OVF);\n            \
-                  write(reg::TCA0_INTCTRL, regs::TCA_OVF);\n        }\n    });\n    \
-                  if was_off {\n        \
-                  write16(reg::TCA0_CMP0BUF, u16::from(duty));\n    }\n",
-        stage: Stage::Simulator,
-        expect: "share TCA0's TEMP byte",
-    },
-    // With the light on and no tick, the wait gives up and `main` halts.
-    // This count never runs out.
-    Breakage {
-        name: "no-tick-deadline",
-        file: HW,
-        find: "            cycles = left;\n",
-        replace: "            cycles = left.max(1);\n",
-        stage: Stage::Simulator,
-        expect: "past the deadline",
+        expect: "writes the high byte of DAC0.DATA without its low byte",
     },
     // A protected register's write comes straight after its unlock.
     Breakage {
@@ -294,15 +341,27 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Layout,
         expect: "isn't followed by `st Z`",
     },
+    // A handler never touches a 16-bit register of a peripheral the main
+    // loop might be halfway through. This one zeroes DAC0 from the switch's
+    // handler, which a bounce lands between `set_output`'s two bytes.
+    Breakage {
+        name: "handler-races-temp",
+        file: HW,
+        find: "pub extern \"avr-interrupt\" fn portd_port() {\n",
+        replace: "pub extern \"avr-interrupt\" fn portd_port() {\n    write16(reg::DAC0_DATA, 0);\n",
+        stage: Stage::Simulator,
+        expect: "share its TEMP byte",
+    },
     // A handler gives back every register as it found it.
     Breakage {
         name: "handler-clobbers-a-register",
         file: HW,
-        find: "    write(reg::TCA0_INTFLAGS, regs::TCA_OVF);\n    let sum =",
-        replace: "    write(reg::TCA0_INTFLAGS, regs::TCA_OVF);\n    \
-                  unsafe { asm!(\"inc r2\", options(nostack)) };\n    let sum =",
+        find: "    write(reg::RTC_PITINTFLAGS, regs::RTC_PI);\n    out!(reg::GPR_GPR0, TICK);\n",
+        replace: "    write(reg::RTC_PITINTFLAGS, regs::RTC_PI);\n    \
+                  unsafe { asm!(\"inc r2\", options(nostack)) };\n    \
+                  out!(reg::GPR_GPR0, TICK);\n",
         stage: Stage::Simulator,
-        expect: "the handler for TCA0_OVF (vector 8): returns with r2",
+        expect: "the handler for RTC_PIT (vector 6): returns with r2",
     },
     // Nothing in the firmware can panic. This is the check CONTRIBUTING.md
     // wants shown to fire on every new nightly, since it goes by the names
@@ -604,17 +663,17 @@ mod tests {
     #[test]
     fn breakages_are_chosen_by_name_and_an_unknown_name_is_refused() {
         assert_eq!(choose(&[]).unwrap().len(), BREAKAGES.len());
-        let chosen = choose(&["wide-multiply", "pb2-pull-up"]).unwrap();
+        let chosen = choose(&["wide-multiply", "pc1-pull-up"]).unwrap();
         let names: Vec<&str> = chosen.iter().map(|b| b.name).collect();
-        assert_eq!(names, ["pb2-pull-up", "wide-multiply"]);
-        let err = choose(&["pb2-pull-up", "pb3-pull-up"]).err().unwrap();
-        assert!(err.contains("no breakage called `pb3-pull-up`"), "{err}");
+        assert_eq!(names, ["pc1-pull-up", "wide-multiply"]);
+        let err = choose(&["pc1-pull-up", "pc2-pull-up"]).err().unwrap();
+        assert!(err.contains("no breakage called `pc2-pull-up`"), "{err}");
     }
 
     const SIMULATOR: &str = "\
    Compiling kr1k v0.0.0 (/tmp/copy)
     Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
-error: /tmp/copy/target/avr-none/release/kr1k.elf: simulator: startup: 0x0a1c: gives PB2 a pull-up
+error: /tmp/copy/target/avr-none/release/kr1k.elf: simulator: startup: 0x0a1c: gives PC1 a pull-up
 ";
     const LAYOUT: &str = "\
     Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
@@ -646,8 +705,8 @@ error: cargo failed (exit status: 101)
 
     #[test]
     fn a_refusal_counts_only_at_the_stage_and_with_the_text_expected() {
-        let line = refused(SIMULATOR, Stage::Simulator, "gives PB2 a pull-up").unwrap();
-        assert_eq!(line, "simulator: startup: 0x0a1c: gives PB2 a pull-up");
+        let line = refused(SIMULATOR, Stage::Simulator, "gives PC1 a pull-up").unwrap();
+        assert_eq!(line, "simulator: startup: 0x0a1c: gives PC1 a pull-up");
         let line = refused(LAYOUT, Stage::Layout, "isn't followed by `st Z`").unwrap();
         assert_eq!(line, "the CCP unlock at 0x0010 isn't followed by `st Z`");
         let line = refused(LINKER, Stage::Build, "undefined symbol: __mulsi3").unwrap();

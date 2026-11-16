@@ -5,7 +5,7 @@ use std::{env, fs};
 #[path = "xtask/src/atdf.rs"]
 mod atdf;
 
-const ATDF: &str = "vendor/ATtiny1616.atdf";
+const ATDF: &str = "vendor/AVR32DD20.atdf";
 
 fn main() {
     println!("cargo::rerun-if-changed=link.x");

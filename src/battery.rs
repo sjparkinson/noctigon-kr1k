@@ -1,57 +1,58 @@
 //! The cell's voltage, and what to do as it runs flat.
 //!
-//! The MCU runs from a regulator, so its own supply says nothing about the
-//! cell. The cell comes in on PA1 (AIN1) through a divider,
-//! and the ADC reads that against the internal 1.1 V reference, four
-//! conversions accumulated.
+//! The MCU runs straight off the cell, through a PFET for reverse polarity
+//! and with no regulator, so VDD is the cell. The ADC reads VDD / 10 (MUXPOS
+//! `VDDDIV10`, DS40002413B section 33.5.7) against the internal 1.024 V
+//! reference, four 12-bit conversions accumulated, as the stock firmware does.
 //!
 //! ```text
-//! pin  = 1.1 V × reading / (4 × 1024)
-//! cell = pin × 4.3 × 1024 / SLOPE
+//! VDD / 10  = 1.024 V × reading / (4 × 4096)
+//! cell      = VDD × SLOPE / 1024
 //! ```
 //!
-//! which in centivolts comes to `reading × 473 / (4 × SLOPE)`. Those are the
-//! facts of the stock firmware's voltage sums and its slope for this board.
-//! The effective ratio is 4.3 × 1024 / 1094, about 4.03, so the ADC runs out
-//! at about 4.42 V (docs/hardware.md).
+//! which in centivolts comes to `reading × SLOPE / 16384`, a sixteenth of the
+//! reading with a slope of 1024. The ADC would run out at 10.24 V, far over
+//! any cell.
 //!
-//! `reading × 473` needs 21 bits, and there's no runtime 32-bit multiply on
+//! `reading × SLOPE` needs 24 bits, and there's no runtime 32-bit multiply on
 //! this chip (docs/toolchain.md). So this splits the reading into its high
 //! and low bytes, each multiplied by a constant worked out at compile time
 //! that's scaled to keep the product in a `u16`.
 //!
 //! ```text
-//! centivolts = (hi × HIGH + ((lo × LOW) >> 4) + 64) >> 7
+//! centivolts = (hi × HIGH + ((lo × LOW) >> 6) + 32) >> 6
 //! ```
 //!
-//! That's in 128ths of a centivolt until the last shift. The two rounded
-//! constants cost under a tenth of a centivolt, which next to a calibration
-//! from one sample is nothing.
+//! That's in 64ths of a centivolt until the last shift. `HIGH` is exact, and
+//! rounding `LOW` costs under a tenth of a centivolt, which next to a 4 %
+//! reference is nothing.
 //!
-//! The thresholds are this board's. The Wurkkos 21700 is
-//! unprotected, and the MP3432 keeps running down to 0.8 V on its input once
-//! it's started, pulling more current as the voltage falls, so nothing but
-//! this module stops the cell being run into the ground.
+//! The KR1K wants an unprotected flat-top 21700, and the boost converter
+//! keeps pulling current as the voltage falls, so nothing but this module
+//! stops the cell being run into the ground. The fuses have the brown-out
+//! detector off (from the backup of this torch), so a cell that sags far
+//! enough takes the MCU with it, with no reset to catch it
+//! (docs/safety.md).
 
 use crate::TICKS_PER_SECOND;
 use crate::gradual::Ceiling;
 use crate::ramp::CEILING;
 use crate::sensors::CYCLE_TICKS;
 
-/// The stock firmware's voltage slope for this board.
+/// The voltage calibration, against a default of 1024, higher reading
+/// higher.
 ///
-/// It's against its default of 1024, higher reading lower. Calibrated on one
-/// of ToyKeeper's samples, and unmeasured on any light of ours. Its offset is
-/// 0 here, so there's no offset to carry.
-pub const SLOPE: u16 = 1094;
+/// It's the stock firmware's figure for this driver, so it reads about 1 %
+/// under the nominal sums. It's unmeasured on this torch. If it's wrong in
+/// that direction the light cuts out a little early, which is the safe way
+/// to be wrong. The 1.024 V reference alone is ±4 % (DS40002413B table
+/// 38-18), which swamps it.
+pub const SLOPE: u16 = 1014;
 
-/// 1.1 V in centivolts times the 4.3 that a slope of 1024 stands for.
-const NUMERATOR: u32 = 473;
+/// Four full-scale 12-bit conversions, the most the ADC can give.
+const MAX_READING: u16 = 4 * 4095;
 
-/// Four full-scale 10-bit conversions, the most the ADC can give.
-const MAX_READING: u16 = 4 * 1023;
-
-/// `NUMERATOR / (4 × SLOPE)` centivolts a count, times `scale`, rounded.
+/// `SLOPE / 16384` centivolts a count, times `scale`, rounded.
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::cast_possible_truncation,
@@ -60,19 +61,19 @@ const MAX_READING: u16 = 4 * 1023;
               build, and From can't be called in a const fn"
 )]
 const fn scaled(scale: u32) -> u16 {
-    let denominator = 4 * SLOPE as u32;
-    let value = (NUMERATOR * scale + denominator / 2) / denominator;
+    let value = (SLOPE as u32 * scale + 8192) / 16384;
     assert!(value <= u16::MAX as u32);
     value as u16
 }
 
-/// 256 counts in 128ths of a centivolt.
-const HIGH: u16 = scaled(256 << 7);
+/// 256 counts in 64ths of a centivolt, which is [`SLOPE`] exactly.
+const HIGH: u16 = scaled(256 << 6);
 
-/// One count in 2048ths of a centivolt, sixteen times finer than [`HIGH`]
+/// One count in 4096ths of a centivolt, 64 times finer than [`HIGH`]
 /// because it's a small number that needs the digits.
-const LOW: u16 = scaled(1 << 11);
+const LOW: u16 = scaled(1 << 12);
 
+const _: () = assert!(HIGH == SLOPE);
 #[expect(
     clippy::as_conversions,
     reason = "widening to u32 in a const, where From can't be called"
@@ -83,11 +84,11 @@ const _: () = assert!(LOW as u32 * 0xFF <= u16::MAX as u32);
     reason = "widening to u32 in a const, where From can't be called"
 )]
 const _: () = {
-    let top = (MAX_READING >> 8) as u32 * HIGH as u32 + ((0xFF * LOW as u32) >> 4) + 64;
+    let top = (MAX_READING >> 8) as u32 * HIGH as u32 + ((0xFF * LOW as u32) >> 6) + 32;
     assert!(top <= u16::MAX as u32);
 };
 
-/// The cell's voltage in centivolts from one accumulated reading of AIN1,
+/// The cell's voltage in centivolts from one accumulated reading of VDD / 10,
 /// rounded to the nearest centivolt.
 ///
 /// A reading over [`MAX_READING`] can't come from the ADC, so it comes out as
@@ -103,7 +104,7 @@ pub const fn centivolts(reading: u16) -> u16 {
         return u16::MAX;
     }
     let (hi, lo) = (reading >> 8, reading & 0xFF);
-    (hi * HIGH + ((lo * LOW) >> 4) + 64) >> 7
+    (hi * HIGH + ((lo * LOW) >> 6) + 32) >> 6
 }
 
 /// Four voltage samples a second, one every [`CYCLE_TICKS`].
@@ -127,13 +128,13 @@ pub const STEP_DOWN_BELOW: u16 = 300;
 /// Below this many centivolts, held for [`HOLD_SAMPLES`], the ceiling drops
 /// [`FLAT_STEP`] levels, and at level 1 the torch turns off.
 ///
-/// It's the stock firmware's default low-voltage threshold, which the TS26's
-/// build doesn't override. Wurkkos quotes 2.8 V, but with an unprotected cell the
-/// higher figure is the one to have. It also leaves 0.2 V, about 7%, over the
-/// MP3432's 2.7 V start-up, so a light that's cut out can start again, and
-/// that 7% has to cover the 1.1 V reference's tolerance and a divider ratio
-/// nobody's checked. If the ratio's really the 4.3 of the old comment, this
-/// reads low and cuts out early, which is the safe way to be wrong.
+/// It's the stock firmware's default low-voltage threshold, and with an
+/// unprotected cell the higher figures are the ones to have. It leaves
+/// 0.2 V, about 7 %, over the 2.7 V the 2.5 V DAC reference is specified
+/// from (DS40002413B table 38-18), and that 7 % has to cover the 1.024 V ADC
+/// reference's ±4 %. A reference that's 4 % high reads 4 % low, and cuts out
+/// early, which is the safe way to be wrong. One that's 4 % low reads 4 %
+/// high and cuts out at about 2.78 V real, only about 3 % over that 2.7 V.
 /// Unmeasured.
 pub const OFF_BELOW: u16 = 290;
 
@@ -155,10 +156,11 @@ pub const RECOVER_AT: u16 = 330;
 /// be a broken ADC rather than noise. Unmeasured.
 pub const CHARGED_AT: u16 = 360;
 
-/// The MP3432's start-up voltage from its datasheet, in centivolts.
-const BOOST_START: u16 = 270;
+/// The lowest VDD the 2.5 V DAC reference is specified at, in centivolts
+/// (DS40002413B table 38-18). The 1.024 V references want 2.5 V.
+const REFERENCE_MIN: u16 = 270;
 
-const _: () = assert!(BOOST_START < OFF_BELOW);
+const _: () = assert!(REFERENCE_MIN < OFF_BELOW);
 const _: () = assert!(OFF_BELOW < STEP_DOWN_BELOW && STEP_DOWN_BELOW < RECOVER_AT);
 const _: () = assert!(RECOVER_AT < CHARGED_AT && CHARGED_AT < *PLAUSIBLE.end());
 
@@ -196,12 +198,13 @@ pub const FORGET_TICKS: u16 = TICKS_PER_SECOND * 60 * 5;
 
 /// Voltages this board could really read, in centivolts.
 ///
-/// The top sits under the 4.42 V of four saturated conversions, with room
-/// for a full cell and a calibration off by a few per cent. The bottom is
-/// low on purpose. The boost converter can drag a dying cell far below
-/// anything sensible, and a reading of 1.5 V under load is the worst possible
-/// moment to call a real voltage garbage, so only what's left of a dead ADC
-/// or a shorted pin falls under it. Unmeasured.
+/// The top has room for a full 4.20 V cell read 4 % high, by a reference
+/// that's 4 % low. The bottom is low on purpose. The boost converter can drag
+/// a dying cell far below anything sensible, and a reading of 1.5 V under
+/// load is the worst possible moment to call a real voltage garbage, so only
+/// what's left of a dead ADC falls under it. VDD is the cell, so by then the
+/// MCU is running under the 2.5 V its references are specified at, and below
+/// 1.8 V under anything the datasheet specifies at all. Unmeasured.
 pub const PLAUSIBLE: core::ops::RangeInclusive<u16> = 100..=440;
 
 /// Whether a voltage from [`centivolts`] could be a real cell.
@@ -490,15 +493,15 @@ mod tests {
 
     /// The conversion from first principles, in floating point.
     fn exact(reading: u16) -> f64 {
-        let pin = 1.1 * f64::from(reading) / (4.0 * 1024.0);
-        pin * 4.3 * 1024.0 / f64::from(SLOPE) * 100.0
+        let vdd = 10.0 * 1.024 * f64::from(reading) / (4.0 * 4096.0);
+        vdd * f64::from(SLOPE) / 1024.0 * 100.0
     }
 
     #[test]
     fn matches_the_formula_for_every_reading_the_adc_can_give() {
         for reading in 0..=MAX_READING {
             let error = (f64::from(centivolts(reading)) - exact(reading)).abs();
-            // Half a centivolt of rounding, plus what the constants lose.
+            // Half a centivolt of rounding, plus what LOW loses.
             assert!(error < 0.6, "{reading} is off by {error}");
         }
     }
@@ -511,18 +514,19 @@ mod tests {
     }
 
     #[test]
-    fn the_effective_ratio_is_about_4_03() {
-        let ratio = 4.3 * 1024.0 / f64::from(SLOPE);
-        assert!((ratio - 4.03).abs() < 0.01, "{ratio}");
+    fn a_count_is_about_a_sixteenth_of_a_centivolt() {
+        assert_eq!(centivolts(16 * 300), 297);
+        assert_eq!(HIGH, 1014);
+        assert_eq!(LOW, 254);
     }
 
     #[test]
     fn known_points() {
         assert_eq!(centivolts(0), 0);
-        assert_eq!(centivolts(2775), 300);
-        assert_eq!(centivolts(3886), 420);
-        // Four saturated conversions are as high as this board can see.
-        assert_eq!(centivolts(MAX_READING), 442);
+        assert_eq!(centivolts(4847), 300);
+        assert_eq!(centivolts(6786), 420);
+        // Four saturated conversions, 10.24 V less the slope.
+        assert_eq!(centivolts(MAX_READING), 1014);
     }
 
     #[test]

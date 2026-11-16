@@ -110,7 +110,7 @@ impl Limits {
     /// A tick in place of [`Limits::tick`] while the torch rests. The light's
     /// off, and nothing's measured, since the ADC can't run in power-down. A
     /// conversion started now would come back on waking with an invalid
-    /// result (DS40002204A §30.3.5). So a battery ceiling only climbs once
+    /// result (DS40002413B §33.3.8). So a battery ceiling only climbs once
     /// readings start again, and a long rest forgets the last ones
     /// (`battery::FORGET_TICKS`).
     pub const fn rest(&mut self) {
@@ -451,7 +451,7 @@ mod tests {
 
     #[test]
     fn garbage_voltages_fade_it_out_and_latch_a_fault() {
-        for garbage in [0, 4 * 1023, 1] {
+        for garbage in [0, 4 * 4095, 1] {
             let mut run = Run::new();
             run.ui = CEILING;
             run.secs(2);
@@ -717,7 +717,7 @@ mod tests {
     #[test]
     fn garbage_from_power_on_shows_nothing_from_off() {
         let (voltage, temperature) = (Adc::new().voltage, Adc::new().temperature);
-        for (voltage, temperature) in [(0, temperature), (voltage, 0), (0, 0), (4 * 1023, 4 * 1023)]
+        for (voltage, temperature) in [(0, temperature), (voltage, 0), (0, 0), (4 * 4095, 4 * 4095)]
         {
             let mut run = Run::new();
             run.adc.voltage = voltage;
@@ -762,12 +762,12 @@ mod tests {
             // What the ADC says for this run. Anything at all, a believable
             // reading, or one believable reading over and over.
             let mode = rng.next_u16() % 3;
-            let held = rng.next_u16() % (4 * 1023 + 1);
+            let held = rng.next_u16() % (4 * 4095 + 1);
             for _ in 0..run {
                 let result = match (rng.next_u16() % 4, mode) {
                     (0, _) => None,
                     (_, 0) => Some(rng.next_u16()),
-                    (_, 1) => Some(rng.next_u16() % (4 * 1023 + 1)),
+                    (_, 1) => Some(rng.next_u16() % (4 * 4095 + 1)),
                     _ => Some(held),
                 };
                 let step = limits.tick(ui, result);

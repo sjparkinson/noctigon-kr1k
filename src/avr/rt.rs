@@ -39,8 +39,9 @@ use crate::regs;
 // unhandled slots between them.
 const _: () = assert!(
     0 < regs::VECTOR_RTC_PIT
-        && regs::VECTOR_RTC_PIT < regs::VECTOR_TCA0_OVF
-        && regs::VECTOR_TCA0_OVF < regs::VECTORS
+        && regs::VECTOR_RTC_PIT < regs::VECTOR_TCB0_INT
+        && regs::VECTOR_TCB0_INT < regs::VECTOR_PORTD_PORT
+        && regs::VECTOR_PORTD_PORT < regs::VECTORS
 );
 
 // `global_asm!` drops raw assembly into the object file, outside any Rust
@@ -54,9 +55,10 @@ global_asm!(
     // slot is only big enough for one jump instruction, so the table is a
     // row of jumps to the real code.
     //
-    // The ATtiny1616 has 31 slots (reset plus 30 interrupts,
-    // `regs::VECTORS`). With 16 KB of flash each one is a two-word (4-byte)
-    // `jmp`, which can reach anywhere in flash.
+    // The AVR32DD20 has 36 slots (reset plus 35 interrupts,
+    // `regs::VECTORS`), slot 30 among them though nothing uses it
+    // (DS40002413B table 9-3). With 32 KB of flash each one is a two-word
+    // (4-byte) `jmp` at word 2n, which can reach anywhere in flash.
     //
     // `.section .vectors` puts this in its own section, and link.x pins
     // that section to the very start of flash. "ax" marks it allocated
@@ -67,7 +69,7 @@ global_asm!(
     "__vectors:",
     // Slot 0 is reset.
     "  jmp __reset",
-    // Slots 1 to 30 are the interrupts. `.rept` and `.endr` make the
+    // Slots 1 to 35 are the interrupts. `.rept` and `.endr` make the
     // assembler repeat the line between them. The handled ones go to hw.rs
     // and the rest to `__unhandled_interrupt`. Nothing enables those, so they
     // shouldn't fire, and if one does the torch goes dark.
@@ -75,19 +77,24 @@ global_asm!(
     "  jmp __unhandled_interrupt",
     "  .endr",
     "  jmp {rtc_pit}",
-    "  .rept {before_ovf}",
+    "  .rept {before_tcb0}",
     "  jmp __unhandled_interrupt",
     "  .endr",
-    "  jmp {tca0_ovf}",
-    "  .rept {after_ovf}",
+    "  jmp {tcb0_int}",
+    "  .rept {before_portd}",
+    "  jmp __unhandled_interrupt",
+    "  .endr",
+    "  jmp {portd_port}",
+    "  .rept {after_portd}",
     "  jmp __unhandled_interrupt",
     "  .endr",
     "",
     // An interrupt with no handler. A `reti` here would return with its flag
     // still up, so it'd be taken again after every single instruction of the
-    // main loop (DS40002204A section 13.2). The loop would crawl, and the
-    // datasheet can't say whether it would ever reach a watchdog feed or the
-    // tick deadline. PB2 could be high all that time. So this turns the light
+    // main loop (the request stays active until the flag's cleared,
+    // DS40002413B section 9.2). The loop would crawl, and the datasheet
+    // can't say whether it would ever reach a watchdog feed or the tick
+    // deadline. PC1, the driver's enable, could be high all that time. So this turns the light
     // off and stops instead, in `hw::halt`, which never returns. A watchdog
     // reset follows if the 32 kHz oscillator is running.
     //
@@ -122,8 +129,9 @@ global_asm!(
     // holds the flags (carry, zero and so on) and the global interrupt
     // enable bit. It's already zero after reset, but say so anyway.
     //
-    // SP, the stack pointer, already points at the top of SRAM. The
-    // hardware sets that on reset, so there's nothing to do for it.
+    // SP, the stack pointer, already points at the top of SRAM, 0x7FFF.
+    // The hardware sets that on reset (DS40002413B section 7.6.2), so
+    // there's nothing to do for it.
     "  clr r1",
     "  out {sreg}, r1",
     // Copy .data into SRAM.
@@ -131,7 +139,7 @@ global_asm!(
     // .data holds statics with a non-zero starting value, such as
     // `static mut X: u8 = 5`. Rust expects to find them in SRAM, but SRAM
     // is blank at power-up, so the starting values are stored in flash and
-    // copied over here. tinyAVR maps flash into data space at 0x8000 (see
+    // copied over here. The chip maps flash into data space at 0x8000 (see
     // link.x), so the copy reads it with an ordinary `ld`.
     //
     // `ldi` (load immediate) puts a constant in a register, one byte at a
@@ -185,9 +193,11 @@ global_asm!(
     // The unhandled slots around the handled ones. Slot 0 is reset.
     before_pit = const regs::VECTOR_RTC_PIT - 1,
     rtc_pit = sym super::hw::rtc_pit,
-    before_ovf = const regs::VECTOR_TCA0_OVF - regs::VECTOR_RTC_PIT - 1,
-    tca0_ovf = sym super::hw::tca0_ovf,
-    after_ovf = const regs::VECTORS - regs::VECTOR_TCA0_OVF - 1,
+    before_tcb0 = const regs::VECTOR_TCB0_INT - regs::VECTOR_RTC_PIT - 1,
+    tcb0_int = sym super::hw::tcb0_int,
+    before_portd = const regs::VECTOR_PORTD_PORT - regs::VECTOR_TCB0_INT - 1,
+    portd_port = sym super::hw::portd_port,
+    after_portd = const regs::VECTORS - regs::VECTOR_PORTD_PORT - 1,
     // Where an interrupt with no handler goes.
     halt = sym super::hw::halt,
     // SREG's I/O address, small enough for `out` to reach.
