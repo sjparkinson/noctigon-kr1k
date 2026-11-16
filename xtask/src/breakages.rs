@@ -82,6 +82,7 @@ struct Breakage {
 const HW: &str = "src/avr/hw.rs";
 const MAIN: &str = "src/main.rs";
 const FIRST_LIGHT: &str = "examples/first_light.rs";
+const AW2016: &str = "src/aw2016.rs";
 
 /// The mistakes, each one a different alarm. Every one of them has been run
 /// and seen refused for the reason it gives, and `cargo xtask breakages`
@@ -476,6 +477,56 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with a bouncing switch",
     },
+    // Every wait on TWI0 counts down the update's budget. This one waits for
+    // WIF for ever, which a held-down SCL never raises.
+    Breakage {
+        name: "twi-unbounded-wait",
+        file: HW,
+        find: "        match polls.checked_sub(1) {\n            Some(left) => *polls = left,\n            \
+               None => return Sent::TimedOut,\n        }\n",
+        replace: "",
+        stage: Stage::Simulator,
+        expect: "with SCL held low: tick",
+    },
+    // The aux go dark before the light comes on. This keeps off's blue
+    // wanted while the light's on, so PC1 rises with it lit.
+    Breakage {
+        name: "aux-lit-while-lit",
+        file: MAIN,
+        find: "aux.step(torch.aux())",
+        replace: "aux.step(if torch.output().enable { kr1k::ui::Aux::Blue } else { torch.aux() })",
+        stage: Stage::Simulator,
+        expect: "raises PC1 with the aux lit",
+    },
+    // Off is standby. This leaves CHIPEN set, the AW2016 awake at 100 µA.
+    Breakage {
+        name: "aux-off-not-standby",
+        file: AW2016,
+        find: "        data: &[CHGDIS],\n",
+        replace: "        data: &[CHGDIS | CHIPEN],\n",
+        stage: Stage::Simulator,
+        expect: "isn't in standby",
+    },
+    // A failed update is given up until the colour changes. Without this,
+    // the next tick carries on as if it had gone through.
+    Breakage {
+        name: "aux-retried-on-the-next-tick",
+        file: MAIN,
+        find: "            aux.failed();\n",
+        replace: "",
+        stage: Stage::Simulator,
+        expect: "tries the AW2016 again",
+    },
+    // ... and within an update, a NACK ends it. This tries each transfer
+    // until it goes through.
+    Breakage {
+        name: "aux-retried-after-a-nack",
+        file: HW,
+        find: "        if !twi_transfer(transfer, &mut polls) {\n",
+        replace: "        while !twi_transfer(transfer, &mut polls) {}\n        if false {\n",
+        stage: Stage::Simulator,
+        expect: "addresses the bus again after a NACK",
+    },
 ];
 
 /// Runs the breakages named, or all of them with none named.
@@ -640,9 +691,17 @@ impl Scratch {
     /// Breaks the copy as `breakage` says, having put back whatever the last
     /// one broke, and checks `hex` refuses it for the reason it gives.
     fn refuses(&self, root: &Path, breakage: &Breakage) -> Result<String, String> {
+        // Written afresh rather than copied, and only if it differs, so it's
+        // newer than the last build. A copy can keep the file's old
+        // modification time (it does on macOS), which leaves cargo sure the
+        // last breakage's build of a library file is still fresh.
         for other in BREAKAGES {
             let file = Path::new(other.file);
-            fs::copy(root.join(file), self.dir.join(file)).map_err(at(file))?;
+            let original = fs::read(root.join(file)).map_err(at(file))?;
+            let copy = self.dir.join(file);
+            if fs::read(&copy).map_err(at(&copy))? != original {
+                fs::write(&copy, original).map_err(at(&copy))?;
+            }
         }
         let path = self.dir.join(breakage.file);
         let source = fs::read_to_string(&path).map_err(at(&path))?;
