@@ -173,8 +173,12 @@ impl Limits {
         // the battery ceiling fade it to the bottom first. Level 1 gets its
         // tick like every level above it, so it's last tick's level that
         // decides.
+        // A fault's fade has the battery ceiling heading for level 1, so a
+        // low cell during it can call itself flat from any level. The fault
+        // decides when that light goes out instead.
         let fault = self.fault && self.level <= 1;
-        let off = on && (fault || self.protection.flat());
+        let flat = !self.fault && self.protection.flat();
+        let off = on && (fault || flat);
         self.level = if on && !off {
             ui.min(thermal).min(battery)
         } else {
@@ -419,6 +423,30 @@ mod tests {
         run.ui = 50;
         assert_eq!(run.ticks(1), 50, "as if new, with no ceiling");
         assert_eq!(run.secs(30), 50);
+    }
+
+    #[test]
+    fn a_low_cell_during_a_faults_fade_still_fades_a_level_a_tick() {
+        // Under 3.00 V long enough for a step down, but a second of garbage
+        // makes it a fault first, and the step comes due during the fade.
+        // The battery ceiling is heading for level 1 then, so the step used to
+        // call the cell flat and cut the light out from wherever the fade had
+        // got to.
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.adc.voltage = voltage_reading(295);
+        run.secs(4);
+        run.adc.voltage = 0;
+        run.secs(1);
+        assert_eq!(run.limits.health(), Health::Fault);
+        run.adc.voltage = voltage_reading(295);
+        run.secs(5);
+        assert_eq!(run.offs, 1);
+        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        for level in 1..CEILING {
+            assert!(lit.contains(&level), "faded through {level}");
+        }
+        assert_eq!(lit.last(), Some(&1));
     }
 
     #[test]
