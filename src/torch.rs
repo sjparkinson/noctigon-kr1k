@@ -263,6 +263,8 @@ impl<T: Copy + PartialEq> Changes<T> {
 
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
     use crate::battery;
     use crate::button::{HOLD_TICKS, RELEASE_TICKS};
@@ -271,6 +273,7 @@ mod tests {
     use crate::testing::{Rig, Rng, examples, temperature_reading, voltage_reading};
     use crate::thermal;
     use crate::ui::{self, Mode, ON_LEVEL};
+    use std::vec::Vec;
 
     const UI_MD: &str = include_str!("../docs/ui.md");
 
@@ -963,6 +966,104 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_that_collapses_goes_out_at_once_and_is_flat_until_it_reads_charged() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.voltage = voltage_reading(battery::COLLAPSE_BELOW - 1);
+        let mut ticks = 0;
+        while torch.level() == CEILING {
+            torch.tick(false);
+            ticks += 1;
+        }
+        assert!(ticks <= 12, "{ticks} ticks");
+        // Straight from the top, with no fade, and the driver off.
+        assert_eq!(torch.level(), 0);
+        assert_eq!(torch.output(), Output::OFF);
+        assert_eq!(torch.ui.output_level(), 0, "the UI's off too");
+        assert_eq!(torch.torch.limits.health(), Health::Flat);
+        // It rests on the same pass, with nothing left for the ADC.
+        assert!(torch.resting());
+        assert_eq!(torch.convert(), None);
+        // Yellow for three seconds, as for any flat cell.
+        for _ in 0..SHOW_TICKS {
+            assert_eq!(torch.aux(), Aux::Yellow);
+            torch.tick(false);
+        }
+        assert_eq!(torch.aux(), Aux::Off);
+        // A click with the cell still down lights nothing.
+        click(&mut torch);
+        assert_eq!(torch.level(), 0);
+        assert_eq!(torch.aux(), Aux::Yellow);
+        // Nor does one that's rested, short of 3.60 V.
+        torch.adc.voltage = voltage_reading(battery::CHARGED_AT - 1);
+        click(&mut torch);
+        assert_eq!(torch.level(), 0);
+        // A cell that rests at 3.60 V lights at the next click, as if new.
+        torch.adc.voltage = voltage_reading(battery::CHARGED_AT);
+        click(&mut torch);
+        assert_eq!(torch.level(), ON_LEVEL);
+        assert_eq!(torch.torch.limits.ceilings().0, CEILING);
+    }
+
+    #[test]
+    fn a_dip_thats_gone_by_the_next_reading_changes_nothing() {
+        // On every tick of the ADC's round.
+        for at in 0..16 {
+            let mut torch = Rig::default();
+            at_the_top(&mut torch);
+            run(&mut torch, false, at);
+            torch.adc.voltage = voltage_reading(250);
+            torch.tick(false);
+            torch.adc.voltage = voltage_reading(380);
+            run(&mut torch, false, 10 * TICKS_PER_SECOND);
+            assert_eq!(torch.level(), CEILING, "at {at}");
+            assert_eq!(torch.torch.limits.health(), Health::Good, "at {at}");
+        }
+    }
+
+    /// The rows of docs/ui.md about a cell that collapses only say how the
+    /// light ends up. This holds them to the health and the aux they
+    /// describe as well.
+    #[test]
+    fn the_collapse_rows_in_docs_ui_md_end_as_they_describe() {
+        let rows = [
+            ("A cell that collapses", Health::Flat, Aux::Yellow),
+            ("A collapsed cell, 1C again", Health::Flat, Aux::Yellow),
+            (
+                "A collapsed cell that rests at 3.60 V or more, 1C",
+                Health::Good,
+                Aux::Off,
+            ),
+            (
+                "A dip under 2.80 V that's gone by the next reading",
+                Health::Good,
+                Aux::Off,
+            ),
+        ];
+        for (row, health, aux) in rows {
+            let example = examples(UI_MD)
+                .map(|example| example.unwrap())
+                .find(|example| example.row.action == row)
+                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let rig = Rig::play(example.actions());
+            assert_eq!(rig.torch.limits.health(), health, "{row}");
+            assert_eq!(rig.aux(), aux, "{row}");
+        }
+        // The first of them is out well inside its quarter of a second, and
+        // was at the top of the ramp until it was.
+        let collapses = examples(UI_MD)
+            .map(|example| example.unwrap())
+            .find(|example| example.row.action == "A cell that collapses")
+            .unwrap();
+        let mut levels = Vec::new();
+        Rig::play_with(collapses.actions(), |rig, _| levels.push(rig.level()));
+        let lit: Vec<u8> = levels.iter().copied().filter(|&l| l > 0).collect();
+        assert_eq!(lit.last(), Some(&CEILING), "no fade");
+        let dark = levels.iter().rev().take_while(|&&l| l == 0).count();
+        assert!(dark > 16 - 12, "{dark} ticks dark at the end");
+    }
+
+    #[test]
     fn the_pass_that_turns_the_light_off_has_already_rested() {
         let mut torch = Rig::default();
         click(&mut torch);
@@ -1463,14 +1564,15 @@ mod tests {
             }
         }
 
-        /// A cell that's good, middling, low, flat, or one the firmware
-        /// can't read.
+        /// A cell that's good, middling, low, flat, collapsed, or one the
+        /// firmware can't read.
         fn cell(rng: &mut Rng) -> Self {
             match rng.next_u16() % 16 {
                 0..=5 => Self::Steady(voltage_reading(between(rng, 340, 420))),
                 6..=7 => Self::Steady(voltage_reading(between(rng, 300, 339))),
                 8..=9 => Self::Steady(voltage_reading(between(rng, 291, 299))),
-                10..=11 => Self::Steady(voltage_reading(between(rng, 150, 289))),
+                10 => Self::Steady(voltage_reading(between(rng, 280, 289))),
+                11 => Self::Steady(voltage_reading(between(rng, 150, 279))),
                 12 => Self::Steady(match rng.next_u16() % 3 {
                     0 => 0,
                     1 => voltage_reading(60),
@@ -1513,6 +1615,29 @@ mod tests {
         check_in: u16,
         /// The tick the last check of the cell started, `0` for none yet.
         checked_at: u32,
+        /// Ticks in a row the light's been lit, as of the last tick.
+        lit_for: u32,
+        /// Plausible readings in a row under 2.80 V, each taken with the
+        /// light on and at least two ticks into it.
+        sagging: u8,
+    }
+
+    impl Model {
+        /// One voltage reading that came due with the UI on, from the raw
+        /// result the ADC gave. Returns whether it's the second in a row
+        /// under 2.80 V, a collapsed cell, which puts the light out.
+        fn loaded(&mut self, raw: u16) -> bool {
+            let volts = battery::centivolts(raw);
+            if self.lit_for <= 2 || !battery::PLAUSIBLE.contains(&volts) {
+                return false;
+            }
+            self.sagging = if volts < 280 { self.sagging + 1 } else { 0 };
+            if self.sagging < 2 {
+                return false;
+            }
+            self.sagging = 0;
+            true
+        }
     }
 
     impl Model {
@@ -1577,6 +1702,8 @@ mod tests {
         results_lost: u32,
         turned_on: u32,
         went_flat: u32,
+        collapsed: u32,
+        collapsed_mid_fade: u32,
         charged: u32,
         went_blind: u32,
         clicked_off_mid_fade: u32,
@@ -1631,6 +1758,8 @@ mod tests {
             cell_low: false,
             check_in: 0,
             checked_at: 0,
+            lit_for: 0,
+            sagging: 0,
         };
         // Slow torches start with the switch up half the time, so the first
         // tick's check gets a look in.
@@ -1641,10 +1770,12 @@ mod tests {
         let (mut lose, mut world_left) = (0, 0);
         // Ticks the switch has been up, and ticks since the fault.
         let (mut up, mut faulted_for) = (0_u32, 0_u32);
-        // The channels of the conversions started one and two ticks ago,
-        // and whether the light was lit two ticks ago. Two voltage
-        // conversions in a row are a turn, whose second is the reading.
-        let (mut converted, mut converted_before) = (None, None);
+        // The channels of the conversions started one, two and three ticks
+        // ago, and whether the light was lit two ticks ago. A voltage
+        // conversion straight after another is a reading. The second of a
+        // run is the four-a-second one, since the tick before a turn never
+        // starts a conversion, and any after it are the quick ones.
+        let (mut converted, mut converted_before, mut converted_first) = (None, None, None);
         let mut lit_before_last = false;
         // Ticks VDDIO2 still has to read missing for.
         let mut gone_left = 0_u16;
@@ -1728,13 +1859,23 @@ mod tests {
                     ignored = true;
                 }
             }
-            // The reading that came in this tick, if the last two ticks
-            // started a voltage turn's two conversions. It's the cell with
+            // The voltage reading that came in this tick, if there is one.
+            // With the UI on, it's one for the hard floor, the quick ones
+            // included, and the second in a row under it is a collapse.
+            let voltage = Some(Channel::Voltage);
+            let read = converted == voltage && converted_before == voltage;
+            let mut collapsed = false;
+            if model.mode != Mode::On {
+                model.sagging = 0;
+            } else if read {
+                collapsed = model.loaded(result.unwrap_or(0));
+            }
+            // The four-a-second reading, if the last two ticks started a
+            // voltage turn's two conversions. It's the cell with
             // nothing on it if the UI's off now and the light was out for
             // both conversions' ticks, and then it's what decides off's blue.
             let at_a_check = model.checked_at != 0 && t == model.checked_at + 2 && up >= 3;
-            let voltage = Some(Channel::Voltage);
-            if converted == voltage && converted_before == voltage {
+            if read && converted_first != voltage {
                 let unloaded = model.mode != Mode::On && level_before == 0 && !lit_before_last;
                 if unloaded {
                     let low = model.cell_low;
@@ -1751,9 +1892,18 @@ mod tests {
             } else {
                 check!(t, !at_a_check, "a check with no reading");
             }
+            converted_first = converted_before;
             converted_before = converted;
             converted = convert.map(|c| c.channel);
             lit_before_last = level_before > 0;
+            model.lit_for = if level > 0 { model.lit_for + 1 } else { 0 };
+            if collapsed {
+                check!(t, level == 0, "lit at {level} after a collapse");
+                check!(t, health != Health::Good, "{health:?} after a collapse");
+                check!(t, level_before > 0, "a collapse with the light out");
+                seen.collapsed += u32::from(health == Health::Flat);
+                seen.collapsed_mid_fade += u32::from(health == Health::Fault);
+            }
             if model.mode == Mode::On && level == 0 {
                 check!(t, health != Health::Good, "off with nothing wrong");
                 model.mode = Mode::Off;
@@ -1806,8 +1956,14 @@ mod tests {
                 | (Health::Flat, Health::Flat)
                 | (Health::Fault, Health::Fault) => {}
                 (Health::Good, Health::Flat) => {
-                    check!(t, level_before == 1, "flat from level {level_before}");
-                    seen.went_flat += 1;
+                    // From level 1 by the holds, or from anywhere by the
+                    // hard floor.
+                    check!(
+                        t,
+                        level_before == 1 || collapsed,
+                        "flat from level {level_before}"
+                    );
+                    seen.went_flat += u32::from(!collapsed);
                 }
                 (Health::Flat, Health::Good) => {
                     let volts = result.map(battery::centivolts);
@@ -1827,12 +1983,12 @@ mod tests {
             }
             if health_before == Health::Fault {
                 // Down a level a tick, then off, or off at a click, or off
-                // from anywhere with VDDIO2 missing.
+                // from anywhere with VDDIO2 missing or a collapse.
                 check!(t, level <= level_before, "{level_before} to {level}");
                 if level > 0 {
                     check!(t, moved == 1, "{level_before} to {level}");
                 } else if level_before > 0 {
-                    let out = click || level_before == 1 || !vddio2;
+                    let out = click || level_before == 1 || !vddio2 || collapsed;
                     check!(t, out, "out from {level_before}");
                     seen.clicked_off_mid_fade += u32::from(click);
                 }
@@ -2028,6 +2184,8 @@ mod tests {
             ("missing a result", seen.results_lost),
             ("turned on", seen.turned_on),
             ("gone flat", seen.went_flat),
+            ("collapsed", seen.collapsed),
+            ("collapsed in a fault's fade", seen.collapsed_mid_fade),
             ("charged", seen.charged),
             ("unable to read the cell", seen.went_blind),
             ("clicked off mid-fade", seen.clicked_off_mid_fade),

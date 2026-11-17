@@ -84,6 +84,8 @@ const MAIN: &str = "src/main.rs";
 const FIRST_LIGHT: &str = "examples/first_light.rs";
 const AW2016: &str = "src/aw2016.rs";
 const LIMITS: &str = "src/limits.rs";
+const BATTERY: &str = "src/battery.rs";
+const SENSORS: &str = "src/sensors.rs";
 
 /// The mistakes, each one a different alarm. Every one of them has been run
 /// and seen refused for the reason it gives, and `cargo xtask breakages`
@@ -542,6 +544,27 @@ const BREAKAGES: &[Breakage] = &[
         replace: "",
         stage: Stage::Simulator,
         expect: "tries the AW2016 again",
+    },
+    // A cell under the hard floor puts the light out within 12 ticks. This
+    // wants four readings in a row, which the worst tick of the round can't
+    // get inside that.
+    Breakage {
+        name: "collapse-waits",
+        file: BATTERY,
+        find: "pub const COLLAPSE_READINGS: u8 = 2;\n",
+        replace: "pub const COLLAPSE_READINGS: u8 = 4;\n",
+        stage: Stage::Simulator,
+        expect: "with a collapsing cell: the cell falls on tick",
+    },
+    // ... and reads the cell between the four-a-second samples to do it.
+    // This drops the quick readings, so it's down to those four.
+    Breakage {
+        name: "no-quick-readings",
+        file: SENSORS,
+        find: "        if channel == Channel::Voltage && step >= READING_STEP && lit {\n",
+        replace: "        if channel == Channel::Voltage && step >= READING_STEP && lit && false {\n",
+        stage: Stage::Simulator,
+        expect: "A cell that collapses: expected Off",
     },
     // ... and within an update, a NACK ends it. This tries each transfer
     // until it goes through.

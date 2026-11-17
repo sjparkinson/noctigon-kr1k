@@ -32,7 +32,13 @@
 //! stops the cell being run into the ground. The fuses have the brown-out
 //! detector off (from the backup of this torch), so a cell that sags far
 //! enough takes the MCU with it, with no reset to catch it
-//! (docs/safety.md).
+//! (docs/safety.md). The chip's voltage level monitor is no help, since it
+//! follows the brown-out detector and stays off with it (DS40002413B section
+//! 20.3.1). So while the light's on the cell is also read between the
+//! four-a-second samples, and two readings in a row under [`COLLAPSE_BELOW`]
+//! turn the light off at once ([`Protection::quick`]). That narrows the
+//! window and is no brown-out detector. A cell that collapses between two
+//! readings still gets through.
 
 use crate::TICKS_PER_SECOND;
 use crate::gradual::Ceiling;
@@ -160,6 +166,47 @@ pub const CHARGED_AT: u16 = 360;
 /// (DS40002413B table 38-18). The 1.024 V references want 2.5 V.
 const REFERENCE_MIN: u16 = 270;
 
+/// The hard floor. Under this many centivolts, in [`COLLAPSE_READINGS`]
+/// readings in a row with the light on, the light goes out at once, as a
+/// flat cell ([`Protection::quick`]).
+///
+/// It's for a cell that falls faster than the filter and the holds above can
+/// follow, and it's halfway between [`OFF_BELOW`] and [`REFERENCE_MIN`]. The
+/// tenth of a volt under [`OFF_BELOW`] is so that a cell running down in the
+/// ordinary way meets the steps and the fade first, and only one that's
+/// dropped a tenth of a volt inside the second or two those take gets here.
+/// The tenth over [`REFERENCE_MIN`] is all the margin there is for the
+/// reading. The 1.024 V reference it's read against is ±4 % (DS40002413B
+/// table 38-18), so one that's 4 % low reads 4 % high and puts this at about
+/// 2.69 V real, a shade under the 2.70 V the DAC's 2.5 V reference is
+/// specified from, and 0.19 V over the 2.50 V the ADC's own is. One that's
+/// 4 % high puts it at about 2.91 V real. [`OFF_BELOW`] is the same reading,
+/// so it moves the same way and the two never swap. Unmeasured.
+pub const COLLAPSE_BELOW: u16 = 280;
+
+/// How many readings in a row under [`COLLAPSE_BELOW`] turn the light off.
+///
+/// Two, where everything else in here wants a second or more, because by
+/// this voltage a second is too long. It isn't one, because what it does is
+/// abrupt, the light out with no fade and off until the cell reads as
+/// charged, and that's a lot to hang on a single sum of four conversions
+/// taken next to a boost converter nobody's put a scope on. The second
+/// reading costs one tick where the readings come a tick apart, and nothing
+/// where they don't, since the ten ticks a round the cell goes unread
+/// (`sensors::UNREAD_TICKS`) are the bigger gap either way. A dip that's
+/// gone by the next reading does nothing, and that's the price.
+///
+/// Two in a row isn't enough as the light comes on, though. A conversion
+/// starts just before its tick's output is set and samples for about 200 µs
+/// after, so the one started as PC1 rises and the one started as the DAC
+/// leaves zero each catch a load landing, one straight after the other.
+/// `limits::Limits` keeps both of those from the floor
+/// (`limits::LANDING_TICKS`). Unmeasured.
+pub const COLLAPSE_READINGS: u8 = 2;
+
+const _: () = assert!(REFERENCE_MIN < COLLAPSE_BELOW && COLLAPSE_BELOW < OFF_BELOW);
+const _: () = assert!(*PLAUSIBLE.start() < COLLAPSE_BELOW);
+const _: () = assert!(COLLAPSE_READINGS > 1);
 const _: () = assert!(REFERENCE_MIN < OFF_BELOW);
 const _: () = assert!(OFF_BELOW < STEP_DOWN_BELOW && STEP_DOWN_BELOW < RECOVER_AT);
 const _: () = assert!(RECOVER_AT < CHARGED_AT && CHARGED_AT < *PLAUSIBLE.end());
@@ -293,6 +340,14 @@ pub enum Verdict {
 /// flat cell can't hide behind the odd bad reading. More than [`GLITCHES`]
 /// in a row is [`Verdict::Blind`], on or off, since with no reading there's
 /// no low-voltage cut-off and this cell has no protection of its own.
+///
+/// All of that is slow on purpose, and too slow for a cell that collapses.
+/// So while the light's on the caller also hands every reading it has,
+/// those samples and the quick ones between them, to
+/// [`Protection::quick`], which is the one place a couple of readings act
+/// with no filter and no hold. [`COLLAPSE_READINGS`] in a row under
+/// [`COLLAPSE_BELOW`] latch [`Protection::flat`] there and then, from any
+/// level.
 #[derive(Clone, Debug)]
 pub struct Protection {
     /// The filtered voltage in sixteenths of a centivolt. Zero until the
@@ -301,6 +356,8 @@ pub struct Protection {
     low_samples: u16,
     flat_samples: u16,
     high_samples: u16,
+    /// Readings in a row under [`COLLAPSE_BELOW`] with the light on.
+    sagging: u8,
     /// Implausible samples in a row.
     implausible: u8,
     /// Turned off for a flat cell, and not yet read as charged.
@@ -323,6 +380,7 @@ impl Protection {
             low_samples: 0,
             flat_samples: 0,
             high_samples: 0,
+            sagging: 0,
             implausible: 0,
             flat: false,
             ceiling: Ceiling::new(DOWN_EVERY, UP_EVERY),
@@ -360,6 +418,7 @@ impl Protection {
     /// [`FORGET_TICKS`] have gone by.
     pub const fn rest(&mut self) {
         (self.low_samples, self.flat_samples, self.high_samples) = (0, 0, 0);
+        self.sagging = 0;
         self.implausible = 0;
         self.rested = self.rested.saturating_add(1);
         if self.rested >= FORGET_TICKS {
@@ -373,6 +432,52 @@ impl Protection {
             0 => None,
             filtered => Some(filtered >> 4),
         }
+    }
+
+    /// One reading for the hard floor, with `centivolts` from
+    /// [`centivolts`], taken with the light on and the load settled. The
+    /// caller hands it every one of those, the four-a-second samples as well
+    /// as the quick readings between them. Returns whether the cell has
+    /// collapsed, which means the light goes out this tick.
+    ///
+    /// That's the [`COLLAPSE_READINGS`]th in a row under [`COLLAPSE_BELOW`].
+    /// It latches [`Protection::flat`], whatever level the light was at, so
+    /// what comes after is a flat cell's lot. The light stays off until a
+    /// reading with it off is [`CHARGED_AT`] or more. A press takes one, so a
+    /// cell that rests that high lights again at the next click, from the
+    /// UI's own starting level with no ceiling, and one that rests lower
+    /// stays dark until it's charged. It turns the light off, where a low
+    /// level would have kept some light, because the MCU is the thing at
+    /// risk. Off is the one state the driver's known to be safe in if the
+    /// chip does go on to brown out, and no level is.
+    ///
+    /// A reading that isn't [`plausible`] neither counts nor starts the run
+    /// again. A dead ADC reads zero, and that's [`Verdict::Blind`]'s to
+    /// catch, which fades the light out as a fault. It never touches the
+    /// filter, the holds or the ceiling.
+    pub fn quick(&mut self, centivolts: u16) -> bool {
+        if !plausible(centivolts) {
+            return false;
+        }
+        if centivolts >= COLLAPSE_BELOW {
+            self.sagging = 0;
+            return false;
+        }
+        self.sagging = self.sagging.saturating_add(1);
+        if self.sagging < COLLAPSE_READINGS {
+            return false;
+        }
+        self.sagging = 0;
+        self.flat = true;
+        true
+    }
+
+    /// One tick with the light off, or too newly on for
+    /// [`Protection::quick`]. The run of readings under [`COLLAPSE_BELOW`]
+    /// starts again, so two only count as in a row within one stretch of
+    /// light.
+    pub const fn dark(&mut self) {
+        self.sagging = 0;
     }
 
     /// One voltage sample, with `centivolts` from [`centivolts`] and the level
@@ -961,6 +1066,126 @@ mod tests {
         assert!(!lvp.flat());
         assert!(follow(&mut lvp, 250, CEILING, secs(30)).contains(&Verdict::Flat));
         assert!(lvp.flat());
+    }
+
+    #[test]
+    fn the_hard_floor_sits_between_the_references_and_the_slow_cut_off() {
+        assert_eq!((REFERENCE_MIN, COLLAPSE_BELOW, OFF_BELOW), (270, 280, 290));
+        assert_eq!(COLLAPSE_READINGS, 2);
+        // Where a reference 4 % low, and one 4 % high, put it for real.
+        assert_eq!(COLLAPSE_BELOW * 100 / 104, 269);
+        assert_eq!(COLLAPSE_BELOW * 100 / 96, 291);
+    }
+
+    #[test]
+    fn two_readings_in_a_row_under_the_floor_are_a_collapse_from_any_level() {
+        let mut lvp = Protection::new();
+        run(&mut lvp, 380, CEILING, secs(10));
+        assert!(!lvp.quick(COLLAPSE_BELOW - 1));
+        assert!(!lvp.flat(), "one does nothing");
+        assert!(lvp.quick(COLLAPSE_BELOW - 1));
+        assert!(lvp.flat());
+        // And the run starts again from there.
+        assert!(!lvp.quick(*PLAUSIBLE.start()));
+        assert!(lvp.quick(*PLAUSIBLE.start()));
+    }
+
+    #[test]
+    fn exactly_the_floor_is_not_under_it() {
+        let mut lvp = Protection::new();
+        for _ in 0..1000 {
+            assert!(!lvp.quick(COLLAPSE_BELOW));
+        }
+        assert!(!lvp.flat());
+    }
+
+    #[test]
+    fn a_reading_back_over_the_floor_starts_the_run_again() {
+        let mut lvp = Protection::new();
+        for _ in 0..1000 {
+            assert!(!lvp.quick(250));
+            assert!(!lvp.quick(COLLAPSE_BELOW));
+        }
+        assert!(!lvp.flat());
+    }
+
+    #[test]
+    fn garbage_neither_counts_towards_a_collapse_nor_starts_the_run_again() {
+        let garbage = [0, 99, 441, centivolts(MAX_READING), u16::MAX];
+        let mut lvp = Protection::new();
+        for _ in 0..1000 {
+            for cv in garbage {
+                assert!(!lvp.quick(cv), "{cv}");
+            }
+        }
+        assert!(!lvp.flat(), "a dead ADC is no collapse");
+        // A low reading either side of a bad one is still two in a row.
+        for cv in garbage {
+            let mut lvp = Protection::new();
+            assert!(!lvp.quick(250));
+            assert!(!lvp.quick(cv), "{cv}");
+            assert!(lvp.quick(250), "{cv}");
+        }
+    }
+
+    #[test]
+    fn the_light_going_out_or_a_rest_starts_the_run_again() {
+        let mut lvp = Protection::new();
+        for _ in 0..1000 {
+            assert!(!lvp.quick(250));
+            lvp.dark();
+            assert!(!lvp.quick(250));
+            lvp.rest();
+        }
+        assert!(!lvp.flat());
+    }
+
+    #[test]
+    fn every_reading_twice_running_is_a_collapse_only_under_the_floor() {
+        let mut collapses = 0_u32;
+        for raw in 0..=MAX_READING {
+            let cv = centivolts(raw);
+            let mut lvp = Protection::new();
+            assert!(!lvp.quick(cv), "raw {raw}");
+            let collapsed = lvp.quick(cv);
+            assert_eq!(collapsed, plausible(cv) && cv < COLLAPSE_BELOW, "raw {raw}");
+            assert_eq!(lvp.flat(), collapsed, "raw {raw}");
+            collapses += u32::from(collapsed);
+        }
+        assert!(collapses > 0);
+    }
+
+    #[test]
+    fn a_collapse_is_flat_until_a_reading_with_the_light_off_says_its_charged() {
+        let mut lvp = Protection::new();
+        run(&mut lvp, 380, CEILING, secs(10));
+        assert!(!lvp.quick(250));
+        assert!(lvp.quick(250));
+        // Rested, but not charged, and with the light on nothing counts.
+        assert_eq!(lvp.sample(CHARGED_AT - 1, 0), NONE);
+        assert_eq!(lvp.sample(400, 1), NONE);
+        assert!(lvp.flat());
+        assert_eq!(lvp.sample(CHARGED_AT, 0), NONE);
+        assert!(!lvp.flat());
+        assert_eq!(lvp.ceiling(), CEILING);
+    }
+
+    /// The hard floor is the only thing its readings feed. The filter, the
+    /// holds and the ceiling only ever see [`Protection::sample`].
+    #[test]
+    fn quick_readings_never_reach_the_filter_the_holds_or_the_ceiling() {
+        let mut lvp = Protection::new();
+        run(&mut lvp, 295, 100, secs(5) - 1);
+        for _ in 0..1000 {
+            // Over the floor and under every other threshold, then high
+            // enough to recover on.
+            lvp.quick(COLLAPSE_BELOW);
+            lvp.quick(400);
+        }
+        assert_eq!(lvp.centivolts(), Some(295));
+        assert_eq!(lvp.ceiling(), CEILING);
+        // The step down is still due at the next sample, five seconds in.
+        assert_eq!(lvp.sample(295, 100), Verdict::Ceiling(100 - STEP));
     }
 
     #[test]

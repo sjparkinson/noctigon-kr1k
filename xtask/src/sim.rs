@@ -161,12 +161,15 @@
 //!    (`oscillator_stops`). A tick lost with the oscillator still running ends
 //!    in a watchdog reset instead, which can't run here.
 //! 5. An ADC that never finishes a conversion, from a click to ten seconds
-//!    later, when the light has to be off (`adc_never_answers`). Twenty
-//!    thousand ticks with the switch held down from the first
-//!    (`switch_stuck`). VDDIO2 missing, so the light never comes on
-//!    (`vddio2_missing`), and VDDIO2 going at the top of the ramp, straight
-//!    after the firmware's look, so the light has to be off a tick and a pass
-//!    later and stay off (`vddio2_drops`). The AW2016 never answering, SDA held low and SCL
+//!    later, when the light has to be off (`adc_never_answers`). The cell
+//!    falling under the hard floor with the light at the top of the ramp, on
+//!    each tick of the ADC's round, when PC1 has to be low within 12 ticks
+//!    (`cell_collapses`). Twenty thousand ticks with the switch held down
+//!    from the first (`switch_stuck`). VDDIO2 missing, so the light never
+//!    comes on (`vddio2_missing`), and VDDIO2 going at the top of the ramp,
+//!    straight after the firmware's look, so the light has to be off a tick
+//!    and a pass later and stay off (`vddio2_drops`). The AW2016 never
+//!    answering, SDA held low and SCL
 //!    held low (`bad_bus`).
 //! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
 //! 7. Twenty thousand ticks of random clicks and holds.
@@ -198,9 +201,10 @@ use std::ops::Range;
 use std::thread;
 
 use kr1k::TICKS_PER_SECOND;
+use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
-use kr1k::ramp::{Output, Vref};
-use kr1k::sensors::Channel;
+use kr1k::ramp::{CEILING, Output, Vref};
+use kr1k::sensors::{CYCLE_TICKS, Channel};
 use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{CLOCK_HZ, FEED_TICKS, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
@@ -486,12 +490,12 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     };
     // The clock, stuck-input and supply faults, every example, then the
     // random switching, each example and the switching with and without
-    // interrupts landing mid-pass, then the faults on the AW2016's bus. Each
-    // is its own chip, so they run side by side, because the long ones take
-    // minutes of simulated time. Errors come back in this order, whichever
-    // thread finishes first. The bus faults come last since they click
-    // through most of the UI, so they'd catch many a mistake as a wrong output
-    // before the run that names it.
+    // interrupts landing mid-pass, then the collapsing cell and the faults on
+    // the AW2016's bus. Each is its own chip, so they run side by side,
+    // because the long ones take minutes of simulated time. Errors come back
+    // in this order, whichever thread finishes first. The last four come last
+    // since they ramp and click through the UI with the light on, so they'd
+    // catch many a mistake as a wrong output before the run that names it.
     let faults: [(FaultCheck, &str); 5] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
@@ -499,9 +503,10 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
-    // VDDIO2 going while lit comes last too, since it holds the switch down
-    // with the light on.
-    let late_faults: [(FaultCheck, &str); 4] = [
+    // VDDIO2 going while lit, and the collapsing cell, come last too, since
+    // they hold the light on and ramp it.
+    let late_faults: [(FaultCheck, &str); 5] = [
+        (cell_collapses, "with a collapsing cell"),
         (aw2016_absent, "with the AW2016 never answering"),
         (sda_held_low, "with SDA held low"),
         (scl_held_low, "with SCL held low"),
@@ -720,6 +725,119 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
         return Err(format!(
             "the light isn't out and staying out from 4 s after it came on ({:?} at {out})",
             levels.get(out)
+        ));
+    }
+    Ok(())
+}
+
+/// The most ticks from the one the cell falls under the hard floor on to the
+/// one PC1 is low on, counting both, for a light that's been on a while:
+/// 12 ticks, 188 ms, which is docs/ui.md's promise and H6's. It's typed as a
+/// number rather than worked out from the library's constants, so a change
+/// to those that breaks the promise fails here. The sum it comes from is the
+/// cell unread for `sensors::UNREAD_TICKS` at worst, then
+/// `battery::COLLAPSE_READINGS` in a row, the last due a tick after its
+/// conversion starts.
+const COLLAPSE_TICKS: usize = 12;
+
+/// The cell falling under `battery::COLLAPSE_BELOW` with the light at the top
+/// of the ramp, once on each of the 16 ticks of the ADC's round, firmware and
+/// library in step. Each time the light has to be out within
+/// `COLLAPSE_TICKS`, straight from the top with no fade, as a flat cell and
+/// not a fault, and a click with the cell still down has to light nothing.
+/// The cell then reads 3.80 V again, so the next click lights it for the
+/// next round.
+///
+/// `in_step` holds PC1, DAC0 and the paths to the library on every tick, so
+/// the library's level going to 0 is PC1 going low. The cell's reading is
+/// scripted, and it changes between two ticks, so this is the timetable and
+/// the firmware's sums and nothing about a real cell, whose voltage falls
+/// as it pleases.
+fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
+    let rounds = u16::from(CYCLE_TICKS);
+    let script = (0..rounds).flat_map(|round| {
+        [
+            Action::Cell(380),
+            Action::Clicks(1),
+            // To the top of the ramp, and a tick longer each round, so the
+            // cell falls on each tick of the ADC's round in turn.
+            Action::Hold {
+                clicks: 0,
+                ticks: 2 * TICKS_PER_SECOND + round,
+            },
+            Action::Cell(COLLAPSE_BELOW - 1),
+            Action::Wait(TICKS_PER_SECOND),
+            Action::Clicks(1),
+            Action::Wait(TICKS_PER_SECOND),
+        ]
+    });
+    // Each tick's cell, and the library's level and aux after it.
+    let ticks = std::cell::RefCell::new(Vec::new());
+    let mut shadow = Rig::default();
+    let samples = testing::samples(script).inspect(|sample| {
+        shadow.tick_in(sample.pressed, &sample.scene);
+        ticks
+            .borrow_mut()
+            .push((sample.scene.cell, shadow.level(), shadow.aux()));
+    });
+    let end = in_step(&mut sim, samples, report)?;
+    let ticks = ticks.into_inner();
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    let good = |tick: &(u16, u8, Aux)| tick.0 >= COLLAPSE_BELOW;
+    let mut slowest = 0;
+    let mut falls = 0;
+    for fell in 1..ticks.len() {
+        if !good(&ticks[fell - 1]) || good(&ticks[fell]) {
+            continue;
+        }
+        falls += 1;
+        let at = |e: String| format!("the cell falls on tick {fell}: {e}");
+        if ticks[fell - 1].1 != CEILING {
+            return Err(at("the light isn't at the top of the ramp".into()));
+        }
+        // Until the cell's good again, or the script ends.
+        let down = ticks[fell..].iter().take_while(|tick| !good(tick)).count();
+        let lit = ticks[fell..fell + down]
+            .iter()
+            .take_while(|tick| tick.1 > 0)
+            .count();
+        if lit >= COLLAPSE_TICKS {
+            return Err(at(format!(
+                "PC1 is still high {lit} ticks on; it has {COLLAPSE_TICKS}"
+            )));
+        }
+        if let Some(faded) = ticks[fell..fell + lit]
+            .iter()
+            .find(|tick| tick.1 != CEILING)
+        {
+            return Err(at(format!(
+                "the light went to level {} on its way out, where a collapse is off at once",
+                faded.1
+            )));
+        }
+        if ticks[fell + lit].2 != Aux::Yellow {
+            return Err(at(format!(
+                "the aux show {:?} as it goes out, not a flat cell's yellow",
+                ticks[fell + lit].2
+            )));
+        }
+        if let Some(relit) = ticks[fell + lit..fell + down].iter().position(|t| t.1 > 0) {
+            return Err(at(format!(
+                "lit again {relit} ticks after it went out, with the cell still down"
+            )));
+        }
+        slowest = slowest.max(lit + 1);
+    }
+    if falls != usize::from(rounds) {
+        return Err(format!("the cell fell {falls} times, not {rounds}"));
+    }
+    // One of the 16 ticks is the worst, so it's been run.
+    if slowest != COLLAPSE_TICKS {
+        return Err(format!(
+            "the slowest took {slowest} ticks, not the {COLLAPSE_TICKS} the worst tick of the \
+             round should, so this didn't reach it"
         ));
     }
     Ok(())

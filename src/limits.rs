@@ -21,6 +21,14 @@
 //! left holding the enable to fade with, and the light's level is 0 on the
 //! tick that reads it missing ([`Limits::tick`]).
 //!
+//! One thing does snap it out. While the light's on, every voltage reading
+//! the schedule has, the four-a-second ones and the quick ones between them,
+//! also goes to `battery::Protection::quick`, and two in a row under
+//! `battery::COLLAPSE_BELOW` turn the light off that tick, as a flat cell,
+//! with no fade and whatever else is going on, a fault's fade included. VDD
+//! is the cell and nothing resets the chip as it sags, so by then a fade is
+//! time the MCU may not have. The quick readings go nowhere else.
+//!
 //! Garbage readings fail safe. Each side has its own idea of a reading that
 //! can't be real (`battery::plausible`, `thermal::plausible`) and lets a few
 //! go. After that a garbage voltage is a fault, and a garbage temperature
@@ -32,6 +40,21 @@ use crate::selftest::Faults;
 use crate::sensors::{Convert, Reading, Schedule};
 use crate::temp::Calibration;
 use crate::thermal::Thermal;
+
+/// How many ticks of a stretch of light start a conversion that
+/// `battery::Protection::quick` never sees, the first two.
+///
+/// A conversion starts just before its tick's output is set and samples for
+/// about 200 µs after it. The first tick of a light raises PC1 with the DAC
+/// at zero, and the second brings the DAC up to the level, so the
+/// conversions those two start each run across a load landing on the cell.
+/// What the boost converter draws as it starts on this board is unmeasured,
+/// and a sag as a load lands isn't a cell collapsing, so neither reading
+/// counts. From the third tick the load's been there for a whole tick,
+/// 15.6 ms, by the time a conversion starts. The ramp and the ceilings only
+/// ever move a level a tick after that, which is a small step each time, and
+/// those readings count. Unmeasured.
+pub const LANDING_TICKS: u8 = 2;
 
 /// Whether the light may come on at all.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,6 +95,9 @@ pub struct Limits {
     /// before that tick's output is set, so a reading that comes due now
     /// ran across the two.
     lit_before: bool,
+    /// How many ticks in a row the light's been lit, as of the last tick,
+    /// for [`LANDING_TICKS`]. It stops counting at 255.
+    lit_for: u8,
     convert: Option<Convert>,
     /// A self-test failed, the cell couldn't be read, or VDDIO2 went missing.
     fault: bool,
@@ -90,6 +116,7 @@ impl Limits {
             on: false,
             level: 0,
             lit_before: false,
+            lit_for: 0,
             convert: None,
             fault: faults.any(),
         }
@@ -143,6 +170,7 @@ impl Limits {
         self.convert = None;
         self.on = false;
         self.level = 0;
+        self.lit_for = 0;
     }
 
     /// One tick. `ui` is the level the UI wants (`0` for off), `result` the
@@ -188,16 +216,29 @@ impl Limits {
 
         let (reading, convert) = self.schedule.tick(result, on);
         self.convert = convert;
+        // Whether a voltage reading that's due now is one for the hard
+        // floor, taken with the light on and the load already there as its
+        // conversion started.
+        let settled = on && self.lit_for > LANDING_TICKS;
+        if !settled {
+            self.protection.dark();
+        }
         let mut unloaded = None;
+        let mut collapsed = false;
         match reading {
-            Some(Reading::Voltage(raw)) => {
+            Some(Reading::Voltage(raw) | Reading::Quick(raw)) => {
                 let centivolts = battery::centivolts(raw);
-                if level == 0 && self.level == 0 && !self.lit_before {
-                    unloaded = Some(centivolts);
+                // Only the four-a-second reading is a sample for the filter
+                // and the holds, and for the aux.
+                if matches!(reading, Some(Reading::Voltage(_))) {
+                    if level == 0 && self.level == 0 && !self.lit_before {
+                        unloaded = Some(centivolts);
+                    }
+                    if self.protection.sample(centivolts, level) == Verdict::Blind {
+                        self.fault = true;
+                    }
                 }
-                if self.protection.sample(centivolts, level) == Verdict::Blind {
-                    self.fault = true;
-                }
+                collapsed = settled && self.protection.quick(centivolts);
             }
             Some(Reading::Temperature(raw)) => {
                 let sixteenths = self.calibration.sixteenths(raw);
@@ -231,12 +272,18 @@ impl Limits {
         // decides when that light goes out instead.
         let fault = self.fault && (cut || self.level <= 1);
         let flat = !self.fault && self.protection.flat();
-        let off = on && (fault || flat);
+        // A collapse doesn't wait for a fault's fade. It's the one thing
+        // that turns the light off from any level, at once.
+        let off = on && (fault || flat || collapsed);
         self.lit_before = self.level > 0;
         self.level = if on && !off {
             ui.min(thermal).min(battery)
         } else {
             0
+        };
+        self.lit_for = match self.level {
+            0 => 0,
+            _ => self.lit_for.saturating_add(1),
         };
         Step {
             level: self.level,
@@ -253,7 +300,7 @@ mod tests {
     use super::*;
     use crate::TICKS_PER_SECOND;
     use crate::ramp::LEVELS;
-    use crate::sensors::CYCLE_TICKS;
+    use crate::sensors::{CYCLE_TICKS, UNREAD_TICKS};
     use crate::testing::{Adc, CALIBRATION, temperature_reading, voltage_reading};
     use crate::thermal::{self, FLOOR};
     use std::vec::Vec;
@@ -482,6 +529,234 @@ mod tests {
         run.ui = 50;
         assert_eq!(run.ticks(1), 50, "as if new, with no ceiling");
         assert_eq!(run.secs(30), 50);
+    }
+
+    /// The most ticks from the one the cell falls under the floor on to the
+    /// one the light's out on, counting both, for a light that's been on a
+    /// while. The cell can go unread for `UNREAD_TICKS`, then it takes
+    /// `COLLAPSE_READINGS` in a row, and the last of them comes due a tick
+    /// after its conversion starts.
+    const COLLAPSE_TICKS: usize = UNREAD_TICKS as usize + battery::COLLAPSE_READINGS as usize;
+
+    #[test]
+    fn a_collapsing_cell_puts_the_light_out_within_twelve_ticks_wherever_in_the_round_it_falls() {
+        assert_eq!(COLLAPSE_TICKS, 12);
+        let mut took = Vec::new();
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ui = CEILING;
+            assert_eq!(run.ticks(64 + at), CEILING);
+            run.adc.voltage = voltage_reading(battery::COLLAPSE_BELOW - 1);
+            let fell = run.levels.len();
+            run.ticks(COLLAPSE_TICKS as u32);
+            let lit = run.levels[fell..].iter().take_while(|&&l| l > 0).count();
+            assert!(lit < COLLAPSE_TICKS, "at {at}: still lit after {lit} ticks");
+            // Out from the top in one tick, with no fade, and as a flat cell.
+            assert!(run.levels[fell..fell + lit].iter().all(|&l| l == CEILING));
+            assert!(run.levels[fell + lit..].iter().all(|&l| l == 0), "at {at}");
+            assert_eq!(run.offs, 1, "at {at}");
+            assert_eq!(run.limits.health(), Health::Flat, "at {at}");
+            took.push(lit + 1);
+        }
+        // Two readings a tick apart at best, and the whole of the gap at
+        // worst.
+        assert_eq!(took.iter().min(), Some(&3));
+        assert_eq!(took.iter().max(), Some(&COLLAPSE_TICKS));
+    }
+
+    #[test]
+    fn one_reading_under_the_floor_does_nothing() {
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ui = 100;
+            run.ticks(64 + at);
+            // Low for the one conversion, if this tick starts one.
+            run.adc.voltage = voltage_reading(250);
+            run.ticks(1);
+            run.adc.voltage = voltage_reading(380);
+            assert_eq!(run.secs(10), 100, "at {at}");
+            assert_eq!(run.offs, 0, "at {at}");
+            assert_eq!(run.limits.ceilings().0, CEILING, "at {at}");
+        }
+    }
+
+    #[test]
+    fn exactly_2_80_volts_is_left_to_the_filter_and_the_holds() {
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.secs(2);
+        run.adc.voltage = voltage_reading(battery::COLLAPSE_BELOW);
+        assert_eq!(run.secs(2), CEILING, "not a collapse");
+        run.secs(20);
+        assert_eq!(run.offs, 1);
+        // Faded the whole way down, where one count lower snaps out.
+        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        assert_eq!(lit.last(), Some(&1));
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.secs(2);
+        run.adc.voltage = voltage_reading(battery::COLLAPSE_BELOW - 1);
+        run.secs(2);
+        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        assert_eq!(lit.last(), Some(&CEILING));
+    }
+
+    #[test]
+    fn a_collapsed_cell_stays_off_until_it_reads_as_charged() {
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.secs(2);
+        run.adc.voltage = voltage_reading(270);
+        run.ticks(COLLAPSE_TICKS as u32);
+        assert_eq!(run.offs, 1);
+        assert_eq!(run.limits.health(), Health::Flat);
+        // Asked again, it won't light, not even for a tick.
+        run.ui = CEILING;
+        assert_eq!(run.ticks(1), 0);
+        assert_eq!(run.offs, 2);
+        // A cell that rests under 3.60 V stays flat.
+        run.adc.voltage = voltage_reading(battery::CHARGED_AT - 1);
+        run.secs(10);
+        assert_eq!(run.limits.health(), Health::Flat);
+        // One that rests at 3.60 V, read with the light off as a press
+        // reads it, lights again with no ceiling.
+        run.adc.voltage = voltage_reading(battery::CHARGED_AT);
+        run.ticks(u32::from(CYCLE_TICKS));
+        assert_eq!(run.limits.health(), Health::Good);
+        run.ui = 50;
+        assert_eq!(run.ticks(1), 50);
+        assert_eq!(run.limits.ceilings().0, CEILING);
+    }
+
+    /// The conversions started on a light's first two ticks run across PC1
+    /// rising and the DAC coming up, and a sag there is a load landing and
+    /// not a cell collapsing.
+    #[test]
+    fn the_load_landing_as_the_light_comes_on_is_no_collapse() {
+        assert_eq!(LANDING_TICKS, 2);
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ticks(32 + at);
+            run.ui = 50;
+            run.adc.voltage = voltage_reading(250);
+            run.ticks(u32::from(LANDING_TICKS));
+            run.adc.voltage = voltage_reading(380);
+            assert_eq!(run.secs(5), 50, "on at {at}");
+            assert_eq!(run.offs, 0, "on at {at}");
+        }
+    }
+
+    #[test]
+    fn a_cell_that_stays_down_after_the_load_lands_is_a_collapse() {
+        let mut took = Vec::new();
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ticks(32 + at);
+            run.ui = 50;
+            run.adc.voltage = voltage_reading(250);
+            let on = run.levels.len();
+            run.ticks(u32::from(LANDING_TICKS) + COLLAPSE_TICKS as u32);
+            let lit = run.levels[on..].iter().take_while(|&&l| l > 0).count();
+            assert_eq!(*run.levels.last().unwrap(), 0, "on at {at}");
+            assert_eq!(run.limits.health(), Health::Flat, "on at {at}");
+            took.push(lit);
+        }
+        // Never before the third and fourth ticks' conversions are both in.
+        assert_eq!(took.iter().min(), Some(&4));
+    }
+
+    #[test]
+    fn a_collapse_does_not_wait_for_a_faults_fade() {
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.secs(2);
+        run.adc.voltage = 0;
+        while run.limits.health() == Health::Good {
+            run.tick();
+        }
+        run.adc.voltage = voltage_reading(270);
+        run.ticks(COLLAPSE_TICKS as u32);
+        assert_eq!(run.offs, 1);
+        assert_eq!(*run.levels.last().unwrap(), 0);
+        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        let last = *lit.last().unwrap();
+        assert!(
+            last > CEILING - 20,
+            "out from {last}, well short of the bottom"
+        );
+        // Still a fault, which outranks a flat cell.
+        assert_eq!(run.limits.health(), Health::Fault);
+        run.adc.voltage = voltage_reading(400);
+        run.secs(10);
+        assert_eq!(run.limits.health(), Health::Fault);
+    }
+
+    /// A collapse and VDDIO2 going both put the light out on the tick
+    /// they're seen. Together, it's out that tick, and VDDIO2's fault
+    /// outranks the collapse's flat cell, so a charged cell doesn't bring it
+    /// back. A collapse after VDDIO2's gone finds the light already out.
+    #[test]
+    fn vddio2_missing_outranks_a_collapse_and_both_are_out_at_once() {
+        for gap in 0..3 {
+            let mut run = Run::new();
+            run.ui = CEILING;
+            run.secs(2);
+            run.adc.voltage = voltage_reading(270);
+            // Up to the tick before the collapse would come due.
+            while run.limits.health() == Health::Good {
+                let mut ahead = run.limits.clone();
+                let step = ahead.tick(run.ui, run.adc.clone().result(), true);
+                if step.off {
+                    break;
+                }
+                run.tick();
+            }
+            for _ in 0..gap {
+                run.tick();
+            }
+            run.vddio2 = false;
+            assert_eq!(run.ticks(1), 0, "gap {gap}");
+            assert_eq!(run.limits.health(), Health::Fault, "gap {gap}");
+            run.vddio2 = true;
+            run.adc.voltage = voltage_reading(400);
+            run.secs(2);
+            run.ui = 50;
+            assert_eq!(run.ticks(1), 0, "gap {gap}: charged, still a fault");
+            assert_eq!(run.limits.health(), Health::Fault, "gap {gap}");
+        }
+    }
+
+    #[test]
+    fn the_floor_does_nothing_with_the_light_off() {
+        let mut run = Run::new();
+        run.adc.voltage = voltage_reading(250);
+        // Off but still read, as it is while the switch is held down.
+        assert_eq!(run.secs(60), 0);
+        assert_eq!(run.limits.health(), Health::Good);
+        assert_eq!(run.offs, 0);
+    }
+
+    /// The quick readings feed the hard floor and nothing else. A reading
+    /// that's low for one conversion moves the filter only if that
+    /// conversion is the four-a-second one, started on the round's second
+    /// tick.
+    #[test]
+    fn only_the_four_a_second_reading_reaches_the_filter() {
+        let mut moved = Vec::new();
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ui = 100;
+            run.ticks(64 + at);
+            assert_eq!(run.limits.protection.centivolts(), Some(380));
+            run.adc.voltage = voltage_reading(300);
+            run.ticks(1);
+            run.adc.voltage = voltage_reading(380);
+            run.ticks(1);
+            if run.limits.protection.centivolts() != Some(380) {
+                moved.push(at);
+            }
+        }
+        assert_eq!(moved, [1]);
     }
 
     #[test]
