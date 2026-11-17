@@ -168,7 +168,7 @@ None exist yet, and they should stay on a throwaway branch, because they aren't 
 
 **T3, a hang on demand.** A build that stops feeding the watchdog after a long hold from on, so a real bite can be seen once. **Spare chip only**, and there's no spare AVR DD chip yet, so it waits.
 
-**T4, power-down after a feed.** `watchdog::Feeder::power_down` returning `resting` alone, dropping the `&& !self.fed`. Only to find out if the idle on the tick after a feed can go.
+**T4, power-down after a feed.** `watchdog::Feeder::power_down` returning `resting` alone, dropping the `&& !self.fed`. Only to find out if the idle on the tick after a feed can go. Since the 1 Hz tick at rest, `watchdog::Pacer` feeds at rest on trips back to 64 Hz that idle after the feed too, so a T4 build that leaves those alone tests the lit feeds' idle at rest only until the tick slows, about a second after the light goes out.
 
 ## What this kit can't do
 

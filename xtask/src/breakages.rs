@@ -267,7 +267,7 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "no-tick-deadline",
         file: HW,
-        find: "                if periods == 0 {\n                    break false;\n",
+        find: "                if periods == 0 {\n                    break None;\n",
         replace: "                if periods == 0 {\n                    \
                   periods = TICK_DEADLINE_PERIODS;\n",
         stage: Stage::Simulator,
@@ -370,10 +370,62 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "watchdog-fed-every-tick",
         file: MAIN,
-        find: "        if feeder.tick() {\n",
-        replace: "        if feeder.tick() || true {\n",
+        find: "        if end.feed {\n",
+        replace: "        if end.feed || true {\n",
         stage: Stage::Simulator,
         expect: "closed window",
+    },
+    // The lit setting goes back before the light can come on. This never
+    // writes it after a rest, so the light comes on under the rest setting.
+    Breakage {
+        name: "lit-watchdog-never-restored",
+        file: MAIN,
+        find: "            hw::set_watchdog(setting);\n",
+        replace: "            if setting == kr1k::watchdog::Setting::Rest {\n                \
+                  hw::set_watchdog(setting);\n            }\n",
+        stage: Stage::Simulator,
+        expect: "raises PC1 with WDT.CTRLA at 0x0b",
+    },
+    // A write to WDT.CTRLA syncs before the sleep or the `wdr` that follows
+    // it. The pass that goes to rest powers down after its write, and that's
+    // refused first.
+    Breakage {
+        name: "watchdog-write-not-waited-for",
+        file: MAIN,
+        find: "        if end.synced {\n            hw::watchdog_synced();\n        }\n",
+        replace: "",
+        stage: Stage::Simulator,
+        expect: "powers down with WDT.STATUS.SYNCBUSY still set",
+    },
+    // A feed at rest is a trip back to the fast tick, never on the pass that
+    // changes the PIT's period, whose sleep can be power-down.
+    Breakage {
+        name: "fed-as-the-pit-changes",
+        file: MAIN,
+        find: "        if end.feed {\n",
+        replace: "        if end.feed || end.pit.is_some() {\n",
+        stage: Stage::Simulator,
+        expect: "the library feeds the watchdog 0 times on this tick, but the firmware 1",
+    },
+    // The PIT goes back to 64 Hz whenever the torch isn't at rest. This
+    // never puts it back.
+    Breakage {
+        name: "pit-left-slow",
+        file: MAIN,
+        find: "        if let Some(pit) = end.pit {\n",
+        replace: "        if let Some(pit @ kr1k::watchdog::Pit::Slow) = end.pit {\n",
+        stage: Stage::Simulator,
+        expect: "the library has the PIT Fast, but the firmware Slow",
+    },
+    // With the PIT slow, a switch edge runs a pass on the press. This sleeps
+    // through it until the next slow tick.
+    Breakage {
+        name: "switch-wake-dropped",
+        file: HW,
+        find: "            if switch_wakes {\n",
+        replace: "            if switch_wakes && false {\n",
+        stage: Stage::Simulator,
+        expect: "the firmware ran 0 passes on this tick, but the library 1",
     },
     // 16-bit registers go low byte first.
     Breakage {
@@ -452,7 +504,7 @@ const BREAKAGES: &[Breakage] = &[
         name: "first-light-sei",
         file: FIRST_LIGHT,
         find: "        hw::init_pins();\n",
-        replace: "        hw::init_pins();\n        let _ = hw::wait_for_tick(false);\n",
+        replace: "        hw::init_pins();\n        let _ = hw::wait_for_tick(false, false);\n",
         stage: Stage::Simulator,
         expect: "sets SREG.I",
     },

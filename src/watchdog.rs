@@ -28,6 +28,14 @@
 //!
 //! The watchdog can't catch its own oscillator stopping, since the tick stops
 //! with it. [`TICK_DEADLINE_PERIODS`] is for that, and only with the light on.
+//!
+//! At rest the tick slows to 1 Hz and the watchdog goes to normal mode with
+//! an 8 s timeout ([`Pacer`]), fed every [`FEED_SLOW_TICKS`] seconds. The lit
+//! window is back, with a `wdr` behind it, before the light can come on, and
+//! the simulator refuses PC1 rising under anything else. Nobody's seen any
+//! of that on a real chip either. The errata, DS80001026D, list nothing for
+//! the RTC or the WDT (only the device, NVMCTRL, TCD and USART), which isn't
+//! the same as there being nothing.
 
 use crate::TICKS_PER_SECOND;
 
@@ -368,7 +376,9 @@ enum State {
 ///
 /// That's the 64 Hz tick and the lit watchdog setting whenever there's
 /// anything to do, and a 1 Hz tick with a long watchdog timeout at rest, so
-/// a torch that's off wakes once a second, not 64 times. The torch is quiet when it's [resting](crate::torch::Torch::resting), with
+/// a torch that's off wakes once a second, not 64 times.
+///
+/// The torch is quiet when it's [resting](crate::torch::Torch::resting), with
 /// nothing timed for more than a slow tick (`torch::Torch::quiet_for`) and
 /// the aux settled (`aw2016::Aw2016::settled`). After [`SETTLE_TICKS`] quiet
 /// passes in a row it waits for a lit feed, and the pass after that writes
@@ -386,11 +396,12 @@ enum State {
 /// [`EXIT_PASSES`] passes after the press, long before the press can light
 /// anything.
 ///
-/// The first PIT period after a change of period is anything from next to
-/// nothing to a whole one (§26.5.2.2), so a slow tick can stand for more
-/// time than went by. The five-minute check of the cell can come up to a
-/// second or so early for each slow stretch, and nothing on this page counts
-/// on it being late.
+/// The first PIT period after a change of period could be anything from next
+/// to nothing to a whole one, likely on the prescaler's own edge
+/// (§26.5.2.2), so a slow tick can stand for a little more or less time than
+/// went by. The five-minute check of the cell and `battery::FORGET_TICKS` can
+/// drift by up to a second or so for each feed at rest, and nothing counts on
+/// either being exact.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Pacer {
     state: State,

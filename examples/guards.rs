@@ -46,17 +46,17 @@ mod guards {
         hw::set_output(Output::STARTING);
         // Idle for the warm-up tick, so only the LIT_TICKS below ask for
         // power-down with PC1 high.
-        if !hw::wait_for_tick(false) {
+        if hw::wait_for_tick(false, false).is_none() {
             hw::halt();
         }
         hw::set_output(ramp::output(ramp::CEILING));
         for _ in 0..LIT_TICKS {
-            if !hw::wait_for_tick(true) {
+            if hw::wait_for_tick(true, false).is_none() {
                 hw::halt();
             }
         }
         hw::set_output(Output::OFF);
-        if !hw::wait_for_tick(true) {
+        if hw::wait_for_tick(true, false).is_none() {
             hw::halt();
         }
         guards_done()

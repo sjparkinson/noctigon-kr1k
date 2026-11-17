@@ -32,7 +32,7 @@ use kr1k::ramp::{DAC_MAX, Output, Vref};
 use kr1k::selftest::Fuses;
 use kr1k::sensors::{Channel, Convert};
 use kr1k::temp::Calibration;
-use kr1k::watchdog::{CLOCK_HZ, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
+use kr1k::watchdog::{CLOCK_HZ, Pit, Setting, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS, Wake};
 
 use crate::regs::{self, addr as reg};
 
@@ -82,10 +82,42 @@ const TWI_POLLS: u16 = 900;
 
 // The window `start_watchdog` sets is the one `kr1k::watchdog` counts on.
 // WDT.CTRLA's fields count 8 << (n - 1) WDT clocks, and these are n = 3.
+// The rest setting is n = 11, normal mode.
 const _: () = {
-    use kr1k::watchdog::{CLOSED_CLOCKS, OPEN_CLOCKS};
+    use kr1k::watchdog::{CLOSED_CLOCKS, OPEN_CLOCKS, REST_CLOCKS};
     assert!(8 << ((regs::WDT_WINDOW_32CLK >> 4) - 1) == CLOSED_CLOCKS);
     assert!(8 << (regs::WDT_PERIOD_32CLK - 1) == OPEN_CLOCKS);
+    assert!(8 << (regs::WDT_PERIOD_8KCLK - 1) == REST_CLOCKS);
+};
+
+/// WDT.CTRLA for each of `kr1k::watchdog`'s settings.
+const fn watchdog_setting(setting: Setting) -> u8 {
+    match setting {
+        Setting::Lit => regs::WDT_WINDOW_32CLK | regs::WDT_PERIOD_32CLK,
+        Setting::Rest => regs::WDT_PERIOD_8KCLK,
+    }
+}
+
+/// RTC.PITCTRLA for each of the PIT's periods, on.
+const fn pit_setting(pit: Pit) -> u8 {
+    match pit {
+        Pit::Fast => regs::RTC_PERIOD_CYC512 | regs::RTC_PITEN,
+        Pit::Slow => regs::RTC_PERIOD_CYC32768 | regs::RTC_PITEN,
+    }
+}
+
+/// Cycles of the 32 kHz clock in a PIT period, 2 << n for PERIOD n (section
+/// 26.13.12's table).
+const fn pit_cycles(value: u8) -> u32 {
+    2 << (value >> regs::RTC_PERIOD.trailing_zeros())
+}
+
+// The slow period is 64 fast ones, `watchdog::SLOW_TICKS`.
+const _: () = {
+    let slow = kr1k::watchdog::SLOW_TICKS;
+    assert!(pit_cycles(regs::RTC_PERIOD_CYC512) == 512);
+    assert!(pit_cycles(regs::RTC_PERIOD_CYC32768) == 512 << slow.trailing_zeros());
+    assert!(slow.is_power_of_two());
 };
 
 // Every peripheral (the ports, the timers, the clock controller) exposes
@@ -277,11 +309,21 @@ pub fn init() {
     // oscillator (RTC.CLKSEL's reset value) divided by 512, which is 64 Hz,
     // with its interrupt on. RTC.CTRLA stays at its reset value.
     write(reg::RTC_PITINTCTRL, regs::RTC_PI);
+    set_pit(Pit::Fast);
+}
+
+/// Gives the PIT `pit`'s period, 64 Hz or 1 Hz, waiting for any write still
+/// syncing first (section 26.13.12) and for this one after. The sleep after
+/// it can be power-down, and the datasheet doesn't say the write finishes
+/// syncing with the peripheral clock stopped. If it didn't, there'd be no
+/// ticks, so it's seen through.
+///
+/// The first period after a change of period could be anything up to a
+/// whole one, by the prescaler's phase (section 26.5.2.2), and likely lands
+/// on the prescaler's own edge. `kr1k::watchdog` counts on neither.
+pub fn set_pit(pit: Pit) {
     while read(reg::RTC_PITSTATUS) & regs::RTC_CTRLBUSY != 0 {}
-    write(reg::RTC_PITCTRLA, regs::RTC_PERIOD_CYC512 | regs::RTC_PITEN);
-    // The first sleep can be power-down, and the datasheet doesn't say this
-    // write finishes syncing with the peripheral clock stopped. If it didn't,
-    // there'd be no ticks, so see it through.
+    write(reg::RTC_PITCTRLA, pit_setting(pit));
     while read(reg::RTC_PITSTATUS) & regs::RTC_CTRLBUSY != 0 {}
 }
 
@@ -364,6 +406,10 @@ const TICK: u8 = 1 << 0;
 /// else lives in GPR1, so the handler writes it whole.
 const PERIOD: u8 = 1 << 0;
 
+/// What [`portd_port`] writes to GPR2 on an edge on the switch. Nothing else
+/// lives in GPR2, so the handler writes it whole.
+const SWITCHED: u8 = 1 << 0;
+
 /// Writes `SLPCTRL.CTRLA` with a `nop` before it, errata 2.2.3's workaround.
 fn sleep_mode(value: u8) {
     // SAFETY: a `nop`, then one store to SLPCTRL.CTRLA. Touches no memory
@@ -380,7 +426,7 @@ fn sleep_mode(value: u8) {
 }
 
 /// Sets up the sleep that [`wait_for_tick`] goes on to do. `rest` is
-/// `watchdog::Feeder::power_down`.
+/// `watchdog::End::power_down`.
 ///
 /// Power-down stops the main clock, and with it TCB0 and the tick deadline,
 /// and DAC0 (sections 24.3.6 and 34.3.3), so it only happens with PC1 low. If
@@ -407,14 +453,20 @@ fn prepare_sleep(rest: bool) {
     sleep_mode(mode | regs::SLPCTRL_SEN);
 }
 
-/// Sleeps until the next 64 Hz tick, in power-down if `rest` allows it. The
-/// PIT carries on in there (section 26.9), so the loop runs every tick, on or
-/// off, and that's how it sees the switch.
+/// Sleeps until the next tick, in power-down if `rest` allows it, and says
+/// what ended the sleep. The PIT carries on in there (section 26.9), so the
+/// loop runs every tick, on or off, 64 times a second, or once a second
+/// with the PIT slowed for a rest (`kr1k::watchdog::Pacer`).
 ///
-/// A press on PD4 wakes the chip too, through PORTD's interrupt, which this
-/// loop treats like any other wake that isn't a tick. The loop only looks at
-/// the switch once a tick, so a press that comes and goes between two ticks is
-/// still missed. Nobody's measured how short a press this switch can give.
+/// A press on PD4 wakes the chip too, through PORTD's interrupt, which sets
+/// [`SWITCHED`]. With `switch_wakes`, which `main` only asks for with the PIT
+/// slow, that ends the wait as [`Wake::Switch`], and the loop runs a pass on
+/// the press rather than up to a second later. Otherwise it's cleared and
+/// slept through, as any other wake that isn't a tick, so at 64 Hz the loop
+/// looks at the switch once a tick and a press that comes and goes between
+/// two ticks is still missed. Nobody's measured how short a press this switch
+/// can give. A tick that's due as well wins, and its pass reads the switch
+/// anyway.
 ///
 /// The PIT interrupt sets [`TICK`]; this checks and clears it with interrupts
 /// off, so a tick can't land between the check and the clear. If it isn't set
@@ -426,33 +478,41 @@ fn prepare_sleep(rest: bool) {
 /// the main oscillator. The tick and the watchdog share the 32 kHz
 /// oscillator, so if that stopped with the light on, nothing else would ever
 /// turn it off. After `watchdog::TICK_DEADLINE_PERIODS` of those flags and no
-/// tick, 103 to 104 ms, this gives up and returns false, and `main` calls
+/// tick, 103 to 104 ms, this gives up and returns `None`, and `main` calls
 /// [`halt`]. It counts flags, not wakes, so a bouncing switch can't run the
-/// deadline down. src/watchdog.rs has the sums.
+/// deadline down. src/watchdog.rs has the sums. The PIT is never slow with
+/// the light on.
 ///
 /// With PC1 low there's no deadline, since there's no light to turn off.
 /// TCB0 is stopped then. A dead oscillator leaves the chip asleep, in idle or
 /// power-down, whichever `rest` chose, with the driver off, until the cell
-/// comes out.
+/// comes out or, with `switch_wakes`, until a press runs a pass, which finds
+/// a tick that never comes.
 ///
 /// Interrupts are on when it returns, either way.
-pub fn wait_for_tick(rest: bool) -> bool {
+pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
     prepare_sleep(rest);
     let mut periods = TICK_DEADLINE_PERIODS;
-    let ticked = loop {
+    let woke = loop {
         // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a
         // compiler barrier, so the GPR reads can't move above it.
         unsafe { asm!("cli", options(nostack)) };
         if read(reg::GPR_GPR0) & TICK != 0 {
             out!(reg::GPR_GPR0, 0);
-            break true;
+            break Some(Wake::Tick);
+        }
+        if read(reg::GPR_GPR2) != 0 {
+            out!(reg::GPR_GPR2, 0);
+            if switch_wakes {
+                break Some(Wake::Switch);
+            }
         }
         if read(reg::GPR_GPR1) != 0 {
             out!(reg::GPR_GPR1, 0);
             if lit() {
                 periods = periods.saturating_sub(1);
                 if periods == 0 {
-                    break false;
+                    break None;
                 }
             }
         }
@@ -462,7 +522,7 @@ pub fn wait_for_tick(rest: bool) -> bool {
     };
     // SAFETY: `sei` only sets SREG.I.
     unsafe { asm!("sei", options(nostack)) };
-    ticked
+    woke
 }
 
 /// Turns the light off and stops for good. `main` calls this when
@@ -528,11 +588,13 @@ pub extern "avr-interrupt" fn tcb0_int() {
     out!(reg::GPR_GPR1, PERIOD);
 }
 
-/// PORTD_PORT, an edge on PD4. It clears the flag and nothing more. The wake
-/// is the point, and the loop reads the switch on the next tick.
+/// PORTD_PORT, an edge on PD4. It clears the flag and sets [`SWITCHED`],
+/// which [`wait_for_tick`] reads with interrupts off. The wake is the point,
+/// and the loop reads the switch itself.
 #[unsafe(no_mangle)]
 pub extern "avr-interrupt" fn portd_port() {
     out!(reg::VPORTD_INTFLAGS, 1 << SWITCH);
+    out!(reg::GPR_GPR2, SWITCHED);
 }
 
 /// Points the ADC at `channel`, with that channel's reference, turning it on
@@ -638,11 +700,27 @@ pub fn temperature_calibration() -> Calibration {
 /// this point, so that's where it stays. Never set WDT.STATUS.LOCK, and never
 /// touch the WDTCFG fuse.
 pub fn start_watchdog() {
-    while read(reg::WDT_STATUS) & regs::WDT_SYNCBUSY != 0 {}
-    protected_write(
-        reg::WDT_CTRLA,
-        regs::WDT_WINDOW_32CLK | regs::WDT_PERIOD_32CLK,
-    );
+    set_watchdog(Setting::Lit);
+    watchdog_synced();
+}
+
+/// Writes one of `kr1k::watchdog`'s settings to WDT.CTRLA, once any write
+/// before it has synced (section 22.3.6), and returns while this one syncs.
+/// [`watchdog_synced`] waits for it. `kr1k::watchdog::Pacer` only asks for
+/// this at the start of a pass a tick after the last `wdr`, which has long
+/// synced by then. Whether the write restarts the count isn't in the
+/// datasheet, and the pacer doesn't count on it. Never 0, which turns the
+/// watchdog off, and never WDT.STATUS.LOCK.
+pub fn set_watchdog(setting: Setting) {
+    watchdog_synced();
+    protected_write(reg::WDT_CTRLA, watchdog_setting(setting));
+}
+
+/// Waits for a write to WDT.CTRLA to sync. The WDT shares its oscillator
+/// with the PIT, so if that's dead this never ends, and neither would the
+/// wait for the next tick, which has no deadline with the light off. The
+/// light's always off when it runs.
+pub fn watchdog_synced() {
     while read(reg::WDT_STATUS) & regs::WDT_SYNCBUSY != 0 {}
 }
 

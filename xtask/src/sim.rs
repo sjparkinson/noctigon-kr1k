@@ -57,11 +57,14 @@
 //!   and the first conversion after a change of input reads 0. Reading RES
 //!   clears RESRDY (§33.5.12). Power-down wants no conversion running and
 //!   the ADC off (§33.3.8).
-//! - RTC.PITCTRLA isn't written while PITSTATUS.CTRLBUSY is set (§26.13.12).
-//!   The PIT's flag goes up once a period of simulated time, in every sleep
-//!   mode (§26.9). A run can stretch the period to the slowest the two
-//!   oscillators' limits allow, or stop the 32 kHz oscillator, which stops
-//!   the PIT and the watchdog together.
+//! - RTC.PITCTRLA isn't written while PITSTATUS.CTRLBUSY is set (§26.13.12),
+//!   and only takes 512 cycles, 64 Hz, or 32,768, 1 Hz. The PIT's flag goes
+//!   up once a period of simulated time, in every sleep mode (§26.9), on the
+//!   prescaler's 64 Hz grid, a slow one on every 64th edge. Where the first
+//!   tick after a change of period lands isn't stated (§26.5.2.2), so a run
+//!   picks aligned, early or late (`testing::PitPhase`). A run can stretch
+//!   the period to the slowest the two oscillators' limits allow, or stop
+//!   the 32 kHz oscillator, which stops the PIT and the watchdog together.
 //! - Every port pin senses asynchronously, so any sense configured in ISC
 //!   wakes the chip from power-down (§18.3.3.1, table 13-4), and so does the
 //!   PIT. TCB0 doesn't, since it's halted. A switch edge raises PD4's flag
@@ -79,10 +82,12 @@
 //!   (§13.3.1), which is `hw::halt`, and it wants SREG.I clear as well
 //!   (`avr.rs`).
 //! - The watchdog's WDT.CTRLA takes the CCP key and isn't written while
-//!   SYNCBUSY is set (§22.3.6), and nothing may change it once it's on. A
-//!   `wdr` in the closed window, or on its edge, fails, and so does running
-//!   out the open window, as the real chip would reset either way (§22.3.3).
-//!   Nothing here resets the chip, so a bite is the firmware failing.
+//!   SYNCBUSY is set (§22.3.6), nor ever written 0, and power-down waits for
+//!   it to sync. It's timed in WDT clocks, with the worst case taken where
+//!   the datasheet is silent (`Wdt` has the list). A `wdr` in the closed
+//!   window, or within a clock of it, fails, and so does running out the
+//!   open window, as the real chip would reset either way (§22.3.3). Nothing
+//!   here resets the chip, so a bite is the firmware failing.
 //! - CRCSCAN runs CRC-16-CCITT over all of flash and sets STATUS.OK if it
 //!   comes to 0, which is what a correct checksum in the last two bytes does
 //!   (§30.3.2, `crc.rs`). The firmware runs on the image `cargo xtask hex`
@@ -106,7 +111,10 @@
 //!   and at 0, its reference at 1.024 V, and every power path low. It only
 //!   falls with DAC0 at 0 and its reference back at 1.024 V, which is the
 //!   stock firmware's off order. It's low at the first register write after
-//!   a start that finds it high, and low in power-down.
+//!   a start that finds it high, and low in power-down. It only rises with
+//!   the PIT at 64 Hz and, once the watchdog's on, the lit window in force
+//!   and a `wdr` since it was written, and the PIT is never slowed with it
+//!   high.
 //! - DAC0 only goes above 0 with PC1 high, at least 8 ms after it rose, which
 //!   is the stock firmware's wait for the boost converter (the only figure
 //!   with any history on this board), and at least 2 µs after its reference
@@ -176,15 +184,19 @@
 //!    answering, SDA held low and SCL
 //!    held low (`bad_bus`).
 //! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
+//!    Then long rests between presses, so the tick slows to 1 Hz, once in
+//!    each of the PIT's phases (`resting`).
 //! 7. Twenty thousand ticks of random clicks and holds.
 //! 8. Both of those again with a switch bounce, and a TCB0 period ending
 //!    while the light's on, landing on every instruction the main loop
 //!    reaches (`Sim::land`), each as far as the first run kept reaching new
 //!    code, and a little past (`both_ways`).
 //!
-//! All but the first two drive `kr1k::torch` alongside the firmware and check
-//! PC1, DAC0, its reference and the paths show the library's output on every
-//! tick, the fourth until the oscillator stops. So does the last part of the
+//! All but the first two drive the library's loop alongside the firmware
+//! (`testing::Paced`, the torch, the AW2016's steps and the pacer), and check
+//! the firmware runs a pass exactly where it does, with the same feeds, PIT
+//! period and sleep, and that PC1, DAC0, its reference and the paths show its
+//! output on every tick, the fourth until the oscillator stops. So does the last part of the
 //! second, until the forced interrupt. Those runs hold the AW2016 to the
 //! library's `torch.aux()` too, at the end of every pass (`AuxWatch`): the
 //! colour through the board's channel map, dim or bright, never a wrong one,
@@ -209,9 +221,12 @@ use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
 use kr1k::sensors::{CYCLE_TICKS, Channel, SUPPLIES_AT, Supplies};
-use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
+use kr1k::testing::{self, Action, Example, Paced, PitPhase, Rig, Sample, Scene};
 use kr1k::ui::Aux;
-use kr1k::watchdog::{CLOCK_HZ, FEED_TICKS, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
+use kr1k::watchdog::{
+    CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, TICK_DEADLINE_PERIODS,
+    TIMER_PERIOD_CLOCKS,
+};
 
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_two_words, ldi};
 use crate::crc;
@@ -279,9 +294,6 @@ const CLK_PER: u32 = 4_000_000;
 const _: () = assert!(CLOCK_HZ == CLK_PER);
 /// Main clocks in TCB0's period, as the library counts on.
 const TIMER_PERIOD: u64 = TIMER_PERIOD_CLOCKS as u64;
-/// Reads of WDT.STATUS that report SYNCBUSY after a write to CTRLA, like
-/// `PIT_SYNC_READS`.
-const WDT_SYNC_READS: u8 = 2;
 /// WDT clocks in a tick. The PIT divides the same 32 kHz oscillator by 512,
 /// and the WDT runs at 1.024 kHz (§22.3.2).
 const WDT_CLOCKS_PER_TICK: u32 = 16;
@@ -504,12 +516,13 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     };
     // The clock, stuck-input and supply faults, every example, then the
     // random switching, each example and the switching with and without
-    // interrupts landing mid-pass, then the collapsing cell and the faults on
-    // the AW2016's bus. Each is its own chip, so they run side by side,
-    // because the long ones take minutes of simulated time. Errors come back
-    // in this order, whichever thread finishes first. The last four come last
-    // since they ramp and click through the UI with the light on, so they'd
-    // catch many a mistake as a wrong output before the run that names it.
+    // interrupts landing mid-pass, then the collapsing cell, the faults on
+    // the AW2016's bus and the long rests in each of the PIT's phases. Each
+    // is its own chip, so they run side by side, because the long ones take
+    // minutes of simulated time. Errors come back in this order, whichever
+    // thread finishes first. The late ones come last since they ramp and
+    // click through the UI, so they'd catch many a mistake as a wrong output
+    // before the run that names it.
     let faults: [(FaultCheck, &str); 7] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
@@ -520,13 +533,16 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (vddio2_missing, "with VDDIO2 missing"),
     ];
     // VDDIO2 going while lit, and the collapsing cell, come last too, since
-    // they hold the light on and ramp it.
-    let late_faults: [(FaultCheck, &str); 5] = [
+    // they hold the light on and ramp it, and the rests after them.
+    let late_faults: [(FaultCheck, &str); 8] = [
         (cell_collapses, "with a collapsing cell"),
         (aw2016_absent, "with the AW2016 never answering"),
         (sda_held_low, "with SDA held low"),
         (scl_held_low, "with SCL held low"),
         (vddio2_drops, "with VDDIO2 going while lit"),
+        (resting_aligned, "resting, the PIT aligned"),
+        (resting_early, "resting, the PIT's first tick early"),
+        (resting_late, "resting, the PIT's first tick late"),
     ];
     let power_on = &power_on;
     let reports: Vec<Result<Report, String>> = thread::scope(|scope| {
@@ -685,7 +701,8 @@ const _: () = assert!(4 * SLOWEST_TICK_CYCLES < DEADLINE_CYCLES);
 /// Two seconds lit with every tick as slow as the oscillators' limits allow.
 /// `hw::wait_for_tick`'s deadline mustn't trip, because that stops the chip for
 /// good, which `Sim::tick` fails. Only the PIT's period changes. The model's
-/// watchdog counts PIT periods, so it's none the wiser.
+/// watchdog counts WDT clocks off the same oscillator, so it's none the
+/// wiser.
 fn slow_ticks(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.tick_cycles = SLOWEST_TICK_CYCLES;
     lit(&mut sim, 2 * TICKS_PER_SECOND, report)
@@ -1101,6 +1118,63 @@ fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
+/// Long rests between presses, each long enough for the tick to slow to
+/// 1 Hz and feed the watchdog at rest a few times, with presses landing
+/// mid-second, a light on and off, lockout's five seconds of red and a hold,
+/// in step with the library throughout. The PIT's first tick after each
+/// change of period lands as `phase` says. It has to have ticked slow for
+/// most of the rests, and lit the light.
+fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), String> {
+    sim.chip.pit_phase = phase;
+    let second = TICKS_PER_SECOND;
+    let script = [
+        Action::Wait(20 * second),
+        Action::Clicks(1),
+        Action::Wait(3 * second),
+        Action::Clicks(1),
+        Action::Wait(12 * second + 17),
+        Action::Clicks(3),
+        Action::Wait(14 * second),
+        Action::Clicks(3),
+        Action::Wait(9 * second + 40),
+        Action::Hold {
+            clicks: 0,
+            ticks: 2 * second,
+        },
+        Action::Wait(10 * second + 5),
+        Action::Clicks(1),
+        Action::Wait(6 * second),
+        Action::Clicks(1),
+        Action::Wait(second),
+    ];
+    let end = in_step(&mut sim, testing::samples(script), report)?;
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    if sim.chip.slow_ticks < 40 {
+        return Err(format!(
+            "only {} slow ticks in over a minute of rests, so this checked little",
+            sim.chip.slow_ticks
+        ));
+    }
+    if sim.chip.pc1_rises < 2 {
+        return Err("the light didn't come on twice, so this checked nothing".into());
+    }
+    Ok(())
+}
+
+fn resting_aligned(sim: Sim, report: &mut Report) -> Result<(), String> {
+    resting(sim, PitPhase::Aligned, report)
+}
+
+fn resting_early(sim: Sim, report: &mut Report) -> Result<(), String> {
+    resting(sim, PitPhase::Early, report)
+}
+
+fn resting_late(sim: Sim, report: &mut Report) -> Result<(), String> {
+    resting(sim, PitPhase::Late, report)
+}
+
 /// The AW2016 never acknowledges its address.
 fn aw2016_absent(sim: Sim, report: &mut Report) -> Result<(), String> {
     bad_bus(sim, Fault::Absent, report)
@@ -1262,9 +1336,9 @@ fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
     // A pass that feeds leaves the count lower than the pass before it did.
     let mut fed = false;
     for _ in 0..=FEED_TICKS {
-        let before = sim.chip.wdt.ticks;
+        let before = sim.chip.wdt.feeds;
         sim.tick(false)?;
-        if sim.chip.wdt.ticks < before {
+        if sim.chip.wdt.feeds > before {
             fed = true;
             break;
         }
@@ -1354,9 +1428,11 @@ fn in_step(
     if sim.chip.wdt_open() == 0 {
         return Err("hw::start_watchdog never turned the watchdog on".into());
     }
-    let mut rig = Rig::new(power_on.faults());
+    // The first pass runs on the grid edge that ended `hw::init`'s wait.
+    let mut rig = Paced::new(power_on.faults(), sim.chip.grid);
+    rig.phase = sim.chip.pit_phase;
+    rig.bus_fails = sim.chip.twi.fault != Fault::None;
     let mut was_resting = false;
-    let mut feeder = Feeder::new();
     let mut finished = true;
     let mut aux = AuxWatch::default();
     for (tick, sample) in samples.enumerate() {
@@ -1379,8 +1455,41 @@ fn in_step(
             vddio2: sim.chip.vddio2_ok(),
             ..sample.scene
         };
-        let power_downs = sim.chip.power_downs;
+        let (power_downs, reads, feeds, bounces) = (
+            sim.chip.power_downs,
+            sim.chip.switch_reads,
+            sim.chip.wdt.feeds,
+            sim.bounces,
+        );
         let took = sim.tick(sample.pressed).map_err(at)?;
+        // The library's passes on this grid point, which is none at all with
+        // the PIT slow and the switch alone, and the firmware's, one per read
+        // of the switch.
+        let mut ends: Vec<End> = rig.sample(sample.pressed, &scene).into_iter().collect();
+        let passes = (sim.chip.switch_reads - reads) as usize;
+        // A bounce landed mid-pass wakes a slow sleep with nothing to see,
+        // which the library has to be told about.
+        while passes > ends.len() && sim.bounces > bounces {
+            match rig.bounce(&scene) {
+                Some(end) => ends.push(end),
+                None => break,
+            }
+        }
+        if passes != ends.len() {
+            return Err(at(format!(
+                "the firmware ran {passes} passes on this tick, but the library {}",
+                ends.len()
+            )));
+        }
+        let Some(&end) = ends.last() else {
+            // Asleep the whole tick, as it should be, or woken by the switch
+            // with the PIT fast and straight back to sleep.
+            if sim.chip.wdt.feeds != feeds {
+                return Err(at("fed the watchdog with no pass to run".into()));
+            }
+            sim.chip.shows(rig.output()).map_err(at)?;
+            continue;
+        };
         // Interrupts landed on purpose run their handlers on top of the
         // pass, which a real tick never sees that many of.
         if !landing {
@@ -1388,25 +1497,36 @@ fn in_step(
         }
         let powered_down = sim.chip.power_downs > power_downs;
         // Only a pass that started off resting, which is what a torch that's
-        // off spends every tick.
+        // off spends every tick it's awake.
         if powered_down && was_resting {
             report.off_instructions = report.off_instructions.max(took);
         }
-        rig.tick_in(sample.pressed, &scene);
-        sim.chip.shows(rig.torch.output()).map_err(at)?;
+        sim.chip.shows(rig.output()).map_err(at)?;
         if !sim.chip.aux_unwired {
-            aux.tick(&sim.chip.twi, rig.torch.aux()).map_err(at)?;
+            aux.tick(&sim.chip.twi, rig.aux()).map_err(at)?;
         }
-        was_resting = rig.torch.resting();
-        // `main`'s feeder, ticked at the end of each pass as it is there. The
-        // sleep that ended this pass was the firmware's answer to the state
-        // the pass left behind.
-        feeder.tick();
-        let power_down = feeder.power_down(was_resting);
-        if powered_down != power_down {
+        was_resting = rig.resting();
+        // The sleep that ended the pass was the firmware's answer to the
+        // state the pass left behind, and so were its feeds and the PIT. A
+        // firmware that never feeds at all is the bite's to catch.
+        let fed = ends.iter().filter(|end| end.feed).count();
+        if sim.chip.wdt.feeds > 0 && (sim.chip.wdt.feeds - feeds) as usize != fed {
+            return Err(at(format!(
+                "the library feeds the watchdog {fed} times on this tick, but the firmware {}",
+                sim.chip.wdt.feeds - feeds
+            )));
+        }
+        if sim.chip.pit() != rig.pit() {
+            return Err(at(format!(
+                "the library has the PIT {:?}, but the firmware {:?}",
+                rig.pit(),
+                sim.chip.pit()
+            )));
+        }
+        if powered_down != end.power_down {
             return Err(at(format!(
                 "the library says {}, but the firmware {}",
-                if power_down { "power down" } else { "idle" },
+                if end.power_down { "power down" } else { "idle" },
                 if powered_down {
                     "powered down"
                 } else {
@@ -2014,6 +2134,8 @@ struct Sim {
     landed: u32,
     /// Handlers so far that landed with a 16-bit access half done.
     mid_access: u32,
+    /// Switch bounces `land` has put up so far.
+    bounces: u32,
 }
 
 /// What `Sim::land` does the first time the main loop reaches an instruction
@@ -2058,6 +2180,7 @@ impl Sim {
             last_new: 0,
             landed: 0,
             mid_access: 0,
+            bounces: 0,
         })
     }
 
@@ -2092,6 +2215,7 @@ impl Sim {
             if let Landing::Until(_) = self.landing {
                 if bounce {
                     chip.portd_flags |= SWITCH;
+                    self.bounces += 1;
                 }
                 if period && !chip.tcb.capt {
                     chip.tcb.capt = true;
@@ -2151,6 +2275,9 @@ impl Sim {
             let landing = matches!(self.landing, Landing::Until(_));
             if !landing || handling.is_none() || self.abandoned {
                 self.counted += 1;
+            }
+            if self.chip.wdt.polling {
+                self.chip.wdt_waits += 1;
             }
             self.chip.elapse()?;
         }
@@ -2296,17 +2423,26 @@ impl Sim {
         ))
     }
 
-    /// One pass of the main loop with the switch as given, run until the
-    /// next tick. Returns how many instructions the pass took, which stops
-    /// when the firmware first goes to sleep, counting handlers' unless
-    /// they're landing on purpose (`Sim::counted`). A firmware that stops for good
-    /// (`hw::halt`) with ticks still coming has failed.
+    /// One point of the 64 Hz grid with the switch as given, run until the
+    /// next. That's a pass of the main loop if the PIT ticked, or with the
+    /// PIT slow if the switch moved, and otherwise the chip sleeping on.
+    /// Returns how many instructions the pass took, which stops when the
+    /// firmware first goes to sleep, counting handlers' unless they're
+    /// landing on purpose (`Sim::counted`). A wait for WDT.STATUS.SYNCBUSY to
+    /// clear lasts as long as the sync, in time, however long each of its
+    /// instructions takes, so those count a quarter each against the budget,
+    /// which takes every other instruction at four clocks. A firmware that
+    /// stops for good (`hw::halt`) with ticks still coming has failed.
     fn tick(&mut self, pressed: bool) -> Result<u64, String> {
         self.chip.set_switch(pressed)?;
-        let (start, ticks) = (self.counted, self.chip.ticks);
+        let (start, grid) = ((self.counted, self.chip.wdt_waits), self.chip.grid);
         self.chip.tick_polled = false;
         let mut pass_end = None;
-        while self.chip.ticks == ticks {
+        let ran = |end: (u64, u64)| {
+            let waited = end.1 - start.1;
+            end.0 - start.0 - waited + waited / 4
+        };
+        while self.chip.grid == grid {
             self.step()?;
             if self.chip.down {
                 return Err(
@@ -2316,17 +2452,16 @@ impl Sim {
                 );
             }
             if self.chip.tick_polled {
-                pass_end.get_or_insert(self.counted);
+                pass_end.get_or_insert((self.counted, self.chip.wdt_waits));
             }
-            let ran = pass_end.unwrap_or(self.counted) - start;
-            if ran > TICK_BUDGET {
+            if ran(pass_end.unwrap_or((self.counted, self.chip.wdt_waits))) > TICK_BUDGET {
                 return Err(format!(
                     "a pass of the main loop ran past {TICK_BUDGET} instructions, \
                      so it hangs or misses 64 Hz ticks"
                 ));
             }
         }
-        Ok(pass_end.unwrap_or(self.counted) - start)
+        Ok(ran(pass_end.unwrap_or((self.counted, self.chip.wdt_waits))))
     }
 }
 
@@ -2336,18 +2471,51 @@ const fn senses(isc: u8) -> bool {
     matches!(isc, ISC_BOTHEDGES | ISC_RISING | ISC_FALLING | ISC_LEVEL)
 }
 
-/// The watchdog, as the firmware can see it. Its settings are in
-/// `io[WDT_CTRLA]`. It's timed in PIT periods, not instructions, since the two
-/// share an oscillator, so a period is always 16 WDT clocks.
+/// The watchdog, as the firmware can see it. The setting in force is in
+/// `io[WDT_CTRLA]`. It's timed in WDT clocks, a sixteenth of a 64 Hz PIT
+/// period, since the two share an oscillator (§22.3.2, §26.4.1.1), so a slow
+/// oscillator stretches both alike.
+///
+/// Where the datasheet is silent, this takes the worst case. A write to
+/// CTRLA takes `SYNC_CLOCKS` WDT clocks to sync, and SYNCBUSY reads set until
+/// then, the old setting in force meanwhile with the stricter of the two
+/// timeouts counted. It doesn't restart the count, so the new setting applies
+/// to the time since the last `wdr`. A new window only starts with the next
+/// `wdr` (§22.3.3.2). A `wdr` takes two to three WDT clocks to sync (§22.3.6),
+/// so two of them can land a clock nearer or further apart than they ran,
+/// and the windows are judged a clock tighter each side. Whether SYNCBUSY
+/// covers a `wdr`'s sync isn't stated, so CTRLA isn't written within three
+/// WDT clocks of one.
 #[derive(Default)]
 struct Wdt {
-    /// Ticks since the last `wdr`, or since CTRLA was written.
-    ticks: u32,
+    /// When the last `wdr` ran, or the watchdog was turned on.
+    since: u64,
     /// Whether a `wdr` has started window mode's closed windows.
     windowed: bool,
-    /// Reads of WDT.STATUS that still report SYNCBUSY after a CTRLA write.
-    busy: u8,
+    /// A write to CTRLA still syncing, and when it lands.
+    pending: Option<(u8, u64)>,
+    /// When the last `wdr` ran.
+    fed_at: Option<u64>,
+    /// The firmware has read SYNCBUSY set and is waiting for the write to
+    /// land.
+    polling: bool,
+    /// `wdr`s so far, while it's on.
+    feeds: u32,
 }
+
+/// WDT clocks a write to WDT.CTRLA takes to sync here, the library's
+/// worst case.
+const WDT_SYNC_CLOCKS: u64 = SYNC_CLOCKS as u64;
+/// WDT clocks two `wdr`s' syncs can differ by, three less two (§22.3.6).
+const WDR_SPREAD: u32 = 1;
+/// WDT clocks after a `wdr` before CTRLA may be written.
+const WDR_SYNC_CLOCKS: u64 = 3;
+/// WDT.CTRLA with the window the library counts on while the light can be on.
+const WDT_LIT: u8 = regs::WDT_WINDOW_32CLK | regs::WDT_PERIOD_32CLK;
+const _: () = {
+    assert!(wdt_clocks(WDT_LIT & WDT_PERIOD) == OPEN_CLOCKS as u32);
+    assert!(wdt_clocks((WDT_LIT & WDT_WINDOW) >> 4) == CLOSED_CLOCKS as u32);
+};
 
 /// WDT clocks in a WDT.CTRLA PERIOD or WINDOW setting, 0 for off.
 const fn wdt_clocks(setting: u8) -> u32 {
@@ -2540,6 +2708,20 @@ struct Chip {
     down: bool,
     /// PIT periods so far with the PIT on.
     ticks: u32,
+    /// Of those, the ones with the PIT slow.
+    slow_ticks: u32,
+    /// Edges of the 64 Hz grid so far, the prescaler's bit for 512 cycles,
+    /// whatever the PIT's period. A slow PIT ticks on every 64th
+    /// (`testing::next_slow`), the prescaler's bit for 32,768.
+    grid: u32,
+    /// The grid edge the PIT next ticks on.
+    pit_next: u32,
+    /// Where the first tick after a change of period lands.
+    pit_phase: PitPhase,
+    /// Reads of VPORTD.IN by the main loop, which reads it once a pass.
+    switch_reads: u32,
+    /// Instructions the main loop has spent waiting on WDT.STATUS.SYNCBUSY.
+    wdt_waits: u64,
     /// Whether the firmware's gone to sleep since this was cleared.
     tick_polled: bool,
     tcb: Tcb,
@@ -2620,6 +2802,12 @@ impl Chip {
             osc32k_stopped: false,
             down: false,
             ticks: 0,
+            slow_ticks: 0,
+            grid: 0,
+            pit_next: 0,
+            pit_phase: PitPhase::Aligned,
+            switch_reads: 0,
+            wdt_waits: 0,
             tick_polled: false,
             tcb: Tcb::default(),
             dac: Dac::default(),
@@ -2869,16 +3057,52 @@ impl Chip {
         while self.now >= self.next_pit {
             self.next_pit += self.tick_cycles;
             if self.osc32k_stopped {
+                // The WDT's count stops with its clock.
+                self.wdt.since += self.tick_cycles;
                 continue;
             }
-            if self.io[reg::RTC_PITCTRLA] & RTC_PITEN != 0 {
+            self.grid += 1;
+            if self.io[reg::RTC_PITCTRLA] & RTC_PITEN != 0 && self.grid >= self.pit_next {
                 self.pit_flag = true;
                 self.ticks += 1;
+                self.pit_next = match self.pit() {
+                    Pit::Fast => self.grid + 1,
+                    Pit::Slow => {
+                        self.slow_ticks += 1;
+                        testing::next_slow(self.grid)
+                    }
+                };
             }
-            self.wdt_period()?;
+            self.wdt_check()?;
+        }
+        if let Some((value, at)) = self.wdt.pending
+            && self.now >= at
+        {
+            // The count carries on from the last `wdr`, and a window only
+            // starts with the next one.
+            self.wdt_check()?;
+            self.io[reg::WDT_CTRLA] = value;
+            self.wdt.pending = None;
+            self.wdt.polling = false;
+            self.wdt.windowed = false;
+            self.wdt_check()?;
         }
         self.plan_next_event();
         Ok(())
+    }
+
+    /// The PIT's period, from RTC.PITCTRLA.
+    fn pit(&self) -> Pit {
+        if self.io[reg::RTC_PITCTRLA] & regs::RTC_PERIOD == regs::RTC_PERIOD_CYC32768 {
+            Pit::Slow
+        } else {
+            Pit::Fast
+        }
+    }
+
+    /// Main clocks in `clocks` WDT clocks.
+    const fn wdt_time(&self, clocks: u64) -> u64 {
+        clocks * self.tick_cycles / WDT_CLOCKS_PER_TICK as u64
     }
 
     /// The open window in WDT clocks, which is the whole timeout in normal
@@ -2897,35 +3121,64 @@ impl Chip {
         }
     }
 
+    /// Whether the watchdog's on, or turning on.
+    fn wdt_on(&self) -> bool {
+        self.wdt_open() > 0 || self.wdt.pending.is_some()
+    }
+
+    /// The timeout in WDT clocks from the last `wdr`, 0 with the WDT off.
+    /// While a write syncs, the shorter of the setting in force and the open
+    /// window of the one coming, since which counts meanwhile isn't stated.
+    fn wdt_timeout(&self) -> u32 {
+        let now = self.wdt_closed() + self.wdt_open();
+        match self.wdt.pending {
+            Some((value, _)) => {
+                let coming = wdt_clocks(value & WDT_PERIOD);
+                if now == 0 { coming } else { now.min(coming) }
+            }
+            None => now,
+        }
+    }
+
+    /// WDT clocks since the last `wdr`, rounded down.
+    const fn wdt_elapsed(&self) -> u64 {
+        (self.now - self.wdt.since) * WDT_CLOCKS_PER_TICK as u64 / self.tick_cycles
+    }
+
+    /// When the watchdog bites if nothing feeds it, a clock early for a
+    /// `wdr` that synced fast, or `None` with it off.
+    fn wdt_bite_at(&self) -> Option<u64> {
+        let timeout = self.wdt_timeout();
+        (timeout > 0)
+            .then(|| self.wdt.since + self.wdt_time(u64::from(timeout.saturating_sub(WDR_SPREAD))))
+    }
+
     /// PIT periods that can still go by without a `wdr` before the watchdog
     /// bites, up to `DOWN_PERIODS`, which is all of them with it off.
     fn wdt_periods_left(&self) -> u64 {
-        let timeout = self.wdt_closed() + self.wdt_open();
-        if timeout == 0 {
-            return DOWN_PERIODS;
+        match self.wdt_bite_at() {
+            None => DOWN_PERIODS,
+            Some(bite) if bite <= self.next_pit => 0,
+            Some(bite) => ((bite - 1 - self.next_pit) / self.tick_cycles + 1).min(DOWN_PERIODS),
         }
-        let last_safe = (timeout - 1) / WDT_CLOCKS_PER_TICK;
-        u64::from(last_safe.saturating_sub(self.wdt.ticks)).min(DOWN_PERIODS)
     }
 
-    /// A PIT period's worth of WDT clocks, while the watchdog's on. It runs
-    /// in every sleep mode (§22.3.4), so this counts asleep too. Nothing here
-    /// resets the chip, so running out is the firmware failing.
-    fn wdt_period(&mut self) -> Result<(), String> {
-        if self.wdt_open() == 0 {
+    /// The watchdog, checked on every grid edge and as a write lands. It runs
+    /// in every sleep mode (§22.3.4). A stopped 32 kHz oscillator stops it.
+    /// Nothing here resets the chip, so running out is the firmware failing.
+    fn wdt_check(&self) -> Result<(), String> {
+        if self.osc32k_stopped {
             return Ok(());
         }
-        self.wdt.ticks += 1;
-        let clocks = self.wdt.ticks * WDT_CLOCKS_PER_TICK;
-        let timeout = self.wdt_closed() + self.wdt_open();
-        if clocks >= timeout {
-            return Err(format!(
-                "the watchdog went {} ticks ({clocks} WDT clocks) without wdr, against a \
-                 {timeout}-clock timeout, so the chip would have reset",
-                self.wdt.ticks
-            ));
+        match self.wdt_bite_at() {
+            Some(bite) if self.now >= bite => Err(format!(
+                "the watchdog went {} WDT clocks without wdr, against a {}-clock timeout, so \
+                 the chip would have reset",
+                self.wdt_elapsed(),
+                self.wdt_timeout()
+            )),
+            _ => Ok(()),
         }
-        Ok(())
     }
 
     /// CRCSCAN.STATUS as a read sees it now.
@@ -3059,6 +3312,9 @@ impl Chip {
         } else {
             self.next_pit
         };
+        if let Some((_, at)) = self.wdt.pending {
+            self.next_event = self.next_event.min(at);
+        }
     }
 
     /// One instruction's worth of time.
@@ -3218,6 +3474,13 @@ impl Chip {
                     .into(),
             );
         }
+        if self.wdt.pending.is_some() {
+            return Err(
+                "powers down with WDT.STATUS.SYNCBUSY still set, and the datasheet doesn't \
+                 say the write finishes syncing with CLK_PER stopped"
+                    .into(),
+            );
+        }
         Ok(())
     }
 
@@ -3365,6 +3628,33 @@ impl Chip {
                     "raises PC1 with power paths {:#04x} on: they're low whenever PC1 rises",
                     self.paths()
                 ));
+            }
+            // The watchdog's lit setting, synced and started by a `wdr`, so a
+            // hang with the light on bites within its window. A firmware with
+            // no watchdog at all, examples/guards.rs and first light, is
+            // held to the rest.
+            if self.wdt_on()
+                && (self.io[reg::WDT_CTRLA] != WDT_LIT
+                    || self.wdt.pending.is_some()
+                    || !self.wdt.windowed)
+            {
+                return Err(format!(
+                    "raises PC1 with WDT.CTRLA at {:#04x}{}: the light only comes on with the \
+                     lit window in force and a wdr since it was written",
+                    self.io[reg::WDT_CTRLA],
+                    if self.wdt.pending.is_some() {
+                        " and a write still syncing"
+                    } else {
+                        ""
+                    }
+                ));
+            }
+            if self.pit() == Pit::Slow {
+                return Err(
+                    "raises PC1 with the PIT slow, so the light's protection would run once \
+                     a second"
+                        .into(),
+                );
             }
             self.twi.catch_up(self.now, false)?;
             if self.twi.aw2016.lit() {
@@ -3765,22 +4055,27 @@ impl Bus for Chip {
         if self.bare {
             return Err("runs `wdr`, and first light has no watchdog".into());
         }
+        if self.wdt.pending.is_some() {
+            return Err("wdr before the WDT.CTRLA write has synced".into());
+        }
         if self.wdt_open() == 0 {
             return Ok(());
         }
-        if self.wdt.busy > 0 {
-            return Err("wdr before the WDT.CTRLA write has synced".into());
-        }
-        let clocks = self.wdt.ticks * WDT_CLOCKS_PER_TICK;
+        self.wdt_check()?;
         let closed = self.wdt_closed();
-        if closed > 0 && clocks <= closed {
+        // A clock tighter, for a `wdr` that synced slow after one that synced
+        // fast.
+        let edge = self.wdt.since + self.wdt_time(u64::from(closed + WDR_SPREAD));
+        if closed > 0 && self.now <= edge {
             return Err(format!(
-                "wdr {} ticks ({clocks} WDT clocks) after the last, in or on the edge of \
-                 the {closed}-clock closed window, so the chip would have reset",
-                self.wdt.ticks
+                "wdr {} WDT clocks after the last, in or within a clock of the {closed}-clock \
+                 closed window, so the chip would have reset",
+                self.wdt_elapsed()
             ));
         }
-        self.wdt.ticks = 0;
+        self.wdt.since = self.now;
+        self.wdt.fed_at = Some(self.now);
+        self.wdt.feeds += 1;
         self.wdt.windowed = self.io[reg::WDT_CTRLA] & WDT_WINDOW != 0;
         Ok(())
     }
@@ -3923,6 +4218,9 @@ impl Bus for Chip {
                             .into(),
                     );
                 }
+                if !self.in_handler {
+                    self.switch_reads += 1;
+                }
                 Ok(if self.pressed { !SWITCH } else { 0xFF })
             }
             reg::VPORTD_INTFLAGS => Ok(self.portd_flags),
@@ -3944,9 +4242,8 @@ impl Bus for Chip {
             }
             reg::TCB0_INTFLAGS => Ok(if self.tcb.capt { TCB_CAPT } else { 0 }),
             reg::WDT_STATUS => {
-                let busy = self.wdt.busy > 0;
-                self.wdt.busy = self.wdt.busy.saturating_sub(1);
-                Ok(if busy { WDT_SYNCBUSY } else { 0 })
+                self.wdt.polling = self.wdt.pending.is_some();
+                Ok(if self.wdt.polling { WDT_SYNCBUSY } else { 0 })
             }
             reg::CRCSCAN_STATUS => Ok(self.crc_status()),
             reg::RSTCTRL_RSTFR => Ok(self.rstfr),
@@ -4183,7 +4480,30 @@ impl Bus for Chip {
                         name(a)
                     ));
                 }
+                let slow = regs::RTC_PERIOD_CYC32768 | RTC_PITEN;
+                if value != regs::RTC_PERIOD_CYC512 | RTC_PITEN && value != slow {
+                    return Err(format!(
+                        "writes {value:#04x} to {}; the simulator only models the PIT on at \
+                         512 cycles, 64 Hz, or 32,768, 1 Hz",
+                        name(a)
+                    ));
+                }
+                if value == slow && self.enabled_high() {
+                    return Err(
+                        "slows the PIT with PC1 high, so the light's protection runs once a \
+                         second and the tick deadline's sums don't hold"
+                            .into(),
+                    );
+                }
+                let was_on = self.io[a] & RTC_PITEN != 0;
+                let old = self.pit();
                 self.io[a] = value;
+                let pit = self.pit();
+                if !was_on {
+                    self.pit_next = self.grid + 1;
+                } else if pit != old {
+                    self.pit_next = self.pit_phase.first(self.grid, pit);
+                }
                 self.pit_busy = PIT_SYNC_READS;
             }
             reg::RTC_PITINTFLAGS => {
@@ -4196,16 +4516,10 @@ impl Bus for Chip {
             }
             reg::WDT_CTRLA => {
                 self.take_protected_write(a)?;
-                if self.wdt.busy > 0 {
+                if self.wdt.pending.is_some() {
                     return Err("writes WDT.CTRLA while WDT.STATUS.SYNCBUSY is set, which \
                                 the datasheet doesn't allow (section 22.3.6)"
                         .into());
-                }
-                if self.wdt_open() > 0 {
-                    return Err(format!(
-                        "writes {value:#04x} to WDT.CTRLA with the watchdog already on, \
-                         which the simulator doesn't model, and off isn't allowed"
-                    ));
                 }
                 if value & WDT_PERIOD > WDT_PERIOD_MAX || (value & WDT_WINDOW) >> 4 > WDT_PERIOD_MAX
                 {
@@ -4213,11 +4527,26 @@ impl Bus for Chip {
                         "writes {value:#04x} to WDT.CTRLA: a reserved WDT period or window"
                     ));
                 }
-                self.io[a] = value;
-                self.wdt = Wdt {
-                    busy: WDT_SYNC_READS,
-                    ..Wdt::default()
-                };
+                if value & WDT_PERIOD == 0 {
+                    return Err(format!(
+                        "writes {value:#04x} to WDT.CTRLA, which turns the watchdog off, and \
+                         the firmware never does"
+                    ));
+                }
+                if let Some(fed) = self.wdt.fed_at
+                    && self.now < fed + self.wdt_time(WDR_SYNC_CLOCKS)
+                {
+                    return Err(
+                        "writes WDT.CTRLA within three WDT clocks of a wdr, which may still be \
+                         syncing, and the datasheet doesn't say SYNCBUSY covers that"
+                            .into(),
+                    );
+                }
+                if !self.wdt_on() {
+                    self.wdt.since = self.now;
+                }
+                self.wdt.pending = Some((value, self.now + self.wdt_time(WDT_SYNC_CLOCKS)));
+                self.plan_next_event();
             }
             reg::WDT_STATUS => {
                 return Err(if value & WDT_LOCK != 0 {
@@ -5067,17 +5396,29 @@ mod tests {
         start(&mut chip).unwrap();
     }
 
+    /// Lets a write to WDT.CTRLA land.
+    fn synced(chip: &mut Chip) {
+        let at = chip.wdt.pending.unwrap().1;
+        chip.advance_to(at).unwrap();
+        assert!(chip.wdt.pending.is_none());
+    }
+
     /// A chip whose watchdog runs 32 WDT clocks closed and 32 open, two ticks
     /// each, and has synced.
     fn watched() -> Chip {
         let mut chip = Chip::new(Vec::new());
-        unlocked(&mut chip, reg::WDT_CTRLA, 0x33).unwrap();
-        chip.wdt.busy = 0;
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
+        synced(&mut chip);
         chip
     }
 
     fn ticks(chip: &mut Chip, n: u64) -> Result<(), String> {
         chip.advance_to(chip.now + n * TICK_CYCLES)
+    }
+
+    /// Main clocks in `n` WDT clocks at the usual speed.
+    fn clocks(n: u64) -> u64 {
+        n * TICK_CYCLES / 16
     }
 
     #[test]
@@ -5088,6 +5429,27 @@ mod tests {
         chip.wdr().unwrap();
         ticks(&mut chip, 1).unwrap();
         assert!(chip.wdr().unwrap_err().contains("closed window"));
+    }
+
+    /// Each `wdr` syncs in two to three clocks, so the windows are a clock
+    /// tighter either side.
+    #[test]
+    fn a_feed_within_a_clock_of_either_edge_bites() {
+        let mut chip = watched();
+        chip.wdr().unwrap();
+        chip.advance_to(chip.now + clocks(33)).unwrap();
+        assert!(chip.wdr().unwrap_err().contains("closed window"));
+        let mut chip = watched();
+        chip.wdr().unwrap();
+        chip.advance_to(chip.now + clocks(34)).unwrap();
+        chip.wdr().unwrap();
+        let mut chip = watched();
+        chip.wdr().unwrap();
+        chip.advance_to(chip.now + clocks(62)).unwrap();
+        chip.wdr().unwrap();
+        let err = ticks(&mut chip, 4).unwrap_err();
+        assert!(err.contains("without wdr"), "{err}");
+        assert_eq!(chip.wdt_bite_at(), Some(chip.wdt.since + clocks(63)));
     }
 
     #[test]
@@ -5101,12 +5463,122 @@ mod tests {
     fn the_watchdog_wont_be_turned_off_or_fed_before_it_syncs() {
         let mut chip = watched();
         let err = unlocked(&mut chip, reg::WDT_CTRLA, 0).unwrap_err();
-        assert!(err.contains("already on"), "{err}");
+        assert!(err.contains("turns the watchdog off"), "{err}");
         let mut chip = Chip::new(Vec::new());
-        unlocked(&mut chip, reg::WDT_CTRLA, 0x33).unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
         assert!(chip.wdr().unwrap_err().contains("synced"));
-        let err = unlocked(&mut chip, reg::WDT_CTRLA, 0x33).unwrap_err();
+        let err = unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap_err();
         assert!(err.contains("SYNCBUSY is set"), "{err}");
+        assert_eq!(
+            chip.read(reg::WDT_STATUS as u16).unwrap(),
+            WDT_SYNCBUSY,
+            "busy for three WDT clocks"
+        );
+        chip.advance_to(clocks(3) - 1).unwrap();
+        assert_eq!(chip.read(reg::WDT_STATUS as u16).unwrap(), WDT_SYNCBUSY);
+        chip.advance_to(clocks(3)).unwrap();
+        assert_eq!(chip.read(reg::WDT_STATUS as u16).unwrap(), 0);
+    }
+
+    /// A new setting goes on counting from the last `wdr`, and its window
+    /// only starts with the next.
+    #[test]
+    fn a_new_setting_counts_from_the_last_feed() {
+        // From rest to lit a tick after a feed, fed a tick after that.
+        let mut chip = Chip::new(Vec::new());
+        unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
+        synced(&mut chip);
+        chip.wdr().unwrap();
+        ticks(&mut chip, 1).unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
+        synced(&mut chip);
+        assert!(!chip.wdt.windowed);
+        chip.wdr().unwrap();
+        assert!(chip.wdt.windowed, "the first wdr starts the window");
+        // The same write two ticks after the feed finds 32 clocks gone of the
+        // 32 the open window alone allows.
+        let mut chip = Chip::new(Vec::new());
+        unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
+        synced(&mut chip);
+        chip.wdr().unwrap();
+        ticks(&mut chip, 2).unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
+        let at = chip.wdt.pending.unwrap().1;
+        let err = chip.advance_to(at).unwrap_err();
+        assert!(err.contains("32-clock timeout"), "{err}");
+    }
+
+    #[test]
+    fn ctrla_waits_three_wdt_clocks_after_a_feed() {
+        let mut chip = watched();
+        chip.wdr().unwrap();
+        ticks(&mut chip, 3).unwrap();
+        chip.wdr().unwrap();
+        chip.advance_to(chip.now + clocks(3) - 1).unwrap();
+        let err = unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap_err();
+        assert!(err.contains("within three WDT clocks of a wdr"), "{err}");
+        chip.elapse().unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
+    }
+
+    #[test]
+    fn power_down_waits_for_the_watchdog_to_sync() {
+        let mut chip = dark();
+        chip.pit_busy = 0;
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
+        let err = chip.ready_for_power_down().unwrap_err();
+        assert!(err.contains("SYNCBUSY"), "{err}");
+        synced(&mut chip);
+        chip.ready_for_power_down().unwrap();
+    }
+
+    /// The PIT at 64 Hz or 1 Hz, slow ticks on every 64th grid edge, and the
+    /// light never on with it slow.
+    #[test]
+    fn the_pit_ticks_slow_on_every_64th_edge_and_never_with_pc1_high() {
+        let mut chip = Chip::new(Vec::new());
+        chip.pit_busy = 0;
+        let fast = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
+        let slow = regs::RTC_PERIOD_CYC32768 | RTC_PITEN;
+        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
+        chip.pit_busy = 0;
+        ticks(&mut chip, 3).unwrap();
+        assert_eq!(chip.ticks, 3);
+        poke(&mut chip, reg::RTC_PITCTRLA, slow).unwrap();
+        chip.pit_busy = 0;
+        ticks(&mut chip, 63).unwrap();
+        assert_eq!((chip.ticks, chip.slow_ticks, chip.grid), (4, 1, 66));
+        ticks(&mut chip, 64).unwrap();
+        assert_eq!((chip.ticks, chip.slow_ticks), (5, 2));
+        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
+        chip.pit_busy = 0;
+        ticks(&mut chip, 1).unwrap();
+        assert_eq!(chip.ticks, 6);
+        let err = refused(&mut chip, reg::RTC_PITCTRLA, RTC_PITEN);
+        assert!(err.contains("only models the PIT"), "{err}");
+        let mut chip = lit();
+        chip.pit_busy = 0;
+        let err = refused(&mut chip, reg::RTC_PITCTRLA, slow);
+        assert!(err.contains("slows the PIT with PC1 high"), "{err}");
+    }
+
+    /// PC1 only rises with the lit window in force, synced and started.
+    #[test]
+    fn pc1_rises_only_under_the_lit_watchdog() {
+        let mut chip = dark();
+        unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
+        synced(&mut chip);
+        let err = refused(&mut chip, reg::VPORTC_OUT, ENABLE);
+        assert!(err.contains("WDT.CTRLA at 0x0b"), "{err}");
+        chip.advance_to(chip.now + clocks(4)).unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
+        let err = refused(&mut chip, reg::VPORTC_OUT, ENABLE);
+        assert!(err.contains("still syncing"), "{err}");
+        synced(&mut chip);
+        let err = refused(&mut chip, reg::VPORTC_OUT, ENABLE);
+        assert!(err.contains("a wdr since"), "{err}");
+        chip.wdr().unwrap();
+        poke(&mut chip, reg::VPORTC_OUT, ENABLE).unwrap();
     }
 
     #[test]
@@ -5168,13 +5640,14 @@ mod tests {
 
     #[test]
     fn the_pits_setup_waits_for_ctrlbusy() {
+        let fast = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
         let mut chip = Chip::new(Vec::new());
-        let err = refused(&mut chip, reg::RTC_PITCTRLA, RTC_PITEN);
+        let err = refused(&mut chip, reg::RTC_PITCTRLA, fast);
         assert!(err.contains("CTRLBUSY is set"), "{err}");
         while chip.read(reg::RTC_PITSTATUS as u16).unwrap() != 0 {}
-        poke(&mut chip, reg::RTC_PITCTRLA, RTC_PITEN).unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
         // Busy again after the write.
-        assert!(poke(&mut chip, reg::RTC_PITCTRLA, RTC_PITEN).is_err());
+        assert!(poke(&mut chip, reg::RTC_PITCTRLA, fast).is_err());
     }
 
     #[test]
@@ -5899,9 +6372,14 @@ mod tests {
         poke(&mut chip, reg::RTC_PITINTCTRL, RTC_PI).unwrap();
         chip.pit_busy = 0;
         let pit = step(&mut chip);
-        poke(&mut chip, reg::RTC_PITCTRLA, RTC_PITEN).unwrap();
+        poke(
+            &mut chip,
+            reg::RTC_PITCTRLA,
+            regs::RTC_PERIOD_CYC512 | RTC_PITEN,
+        )
+        .unwrap();
         let watchdog = step(&mut chip);
-        unlocked(&mut chip, reg::WDT_CTRLA, 0x33).unwrap();
+        unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
 
         let boot = &chip.boot;
         assert_eq!(boot.flags_cleared, Some(flags));
@@ -5914,17 +6392,19 @@ mod tests {
         boot.in_order().unwrap();
     }
 
-    /// The least a firmware can be and still tick. It sleeps in idle, and its
-    /// PIT handler clears the flag with r16, which is set up beforehand so
-    /// the handler has nothing to give back. The chip is left as `hw::init`
-    /// would have it, the light off, with a watchdog too long to need feeding
-    /// here.
+    /// The least a firmware can be and still tick. It reads the switch once a
+    /// pass, as the firmware does, and sleeps in idle, and its PIT handler
+    /// clears the flag with r16, which is set up beforehand so the handler
+    /// has nothing to give back. The chip is left as `hw::init` would have
+    /// it, the light off, with a watchdog too long to need feeding here.
     fn ticking() -> Sim {
         let handler = sts_r16(reg::RTC_PITINTFLAGS).into_iter().chain([RETI]);
         let mut words = handled_by(VECTOR_RTC_PIT, &handler.collect::<Vec<_>>());
-        // `sleep`, then back to it.
-        words[1] = SLEEP;
-        words[2] = SPIN - 1;
+        // `lds r17, VPORTD.IN`, `sleep`, then back to the `lds`.
+        words[1] = 0x9110;
+        words[2] = reg::VPORTD_IN as u16;
+        words[3] = SLEEP;
+        words[4] = SPIN - 3;
         let mut sim = sim(words);
         sim.cpu.r[16] = RTC_PI;
         let mut chip = dark();
@@ -5939,6 +6419,7 @@ mod tests {
         .unwrap();
         poke(&mut chip, reg::SLPCTRL_CTRLA, SLEEP_IDLE | SLPCTRL_SEN).unwrap();
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_PERIOD_MAX).unwrap();
+        synced(&mut chip);
         chip.flash = std::mem::take(&mut sim.chip.flash);
         // A few instructions that never drive the aux.
         chip.aux_unwired = true;
@@ -6011,7 +6492,7 @@ mod tests {
             sim.tick(false).unwrap();
         }
         let err = sim.tick(false).unwrap_err();
-        assert!(err.starts_with("asleep: the watchdog went 4"), "{err}");
+        assert!(err.starts_with("asleep: the watchdog went 6"), "{err}");
     }
 
     #[test]

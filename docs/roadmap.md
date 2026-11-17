@@ -25,8 +25,9 @@ This repo started as TS26 firmware and is being ported to the KR1K, so the TS26'
 
 A tick here means the firmware does it for the AVR32DD20 and it runs on the simulator. That isn't the torch being safe. [breakout.md](breakout.md) is what would show that.
 
-- [ ] Sleep when off, in power-down, with PC1 low, the DAC at zero and every path low first. The PIT wakes it every tick and the loop samples PD4
+- [ ] Sleep when off, in power-down, with PC1 low, the DAC at zero and every path low first. The PIT wakes it every tick, once a second at rest, and the loop samples PD4
 - [ ] Test power-down straight after a watchdog feed on a real light (T4 in [breakout.md](breakout.md#test-builds)), then drop the idle on the tick after a feed if a resting torch doesn't reset
+- [x] A 1 Hz tick at rest, with the watchdog in normal mode at 8 s and fed every four seconds, back to 64 Hz on a press and the lit window back before the light can come on (`watchdog::Pacer`). Simulator only, and the rest current it saves is an estimate
 - [ ] Battery voltage from VDD through the ADC's VDDDIV10 input against 1.024 V, with the stock firmware's slope of 1014. Then check it against a multimeter
 - [ ] Low-voltage protection on that reading. The cell is unprotected, so the firmware's the only thing between it and over-discharge
 - [ ] Thermal regulation from the internal temperature sensor, with the AVR32DD20's `SIGROW` calibration

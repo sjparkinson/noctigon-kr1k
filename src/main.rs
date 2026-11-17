@@ -1,5 +1,5 @@
 //! The firmware. Sample the switch, step the UI, set the output, 64 times a
-//! second.
+//! second, or once a second at rest (`kr1k::watchdog::Pacer`).
 //!
 //! On the host this builds to a stub, so `cargo test` and `cargo clippy`
 //! work across the workspace. `cargo xtask hex` builds the real thing.
@@ -48,7 +48,7 @@ extern "C" fn main() -> ! {
     use kr1k::aw2016::Aw2016;
     use kr1k::selftest::{self, Faults};
     use kr1k::torch::{Changes, Torch};
-    use kr1k::watchdog::Feeder;
+    use kr1k::watchdog::{End, Pacer};
 
     // PC1 floats from reset until it's an output.
     hw::hold_enable_low();
@@ -69,17 +69,26 @@ extern "C" fn main() -> ! {
     let mut torch = Torch::new(hw::temperature_calibration(), faults);
     let mut output_changes = Changes::new();
     let mut aux = Aw2016::new();
-    let mut feeder = Feeder::new();
+    let mut pacer = Pacer::new();
+    let mut end = End::start(torch.resting());
 
     loop {
-        // Power-down or idle, by `Feeder::power_down`'s rule, which the
-        // simulator holds this loop to. False means the light's on and no
-        // tick came in about 103 ms, so the 32 kHz oscillator has most likely
-        // stopped, and the watchdog with it. The light goes off and stays off
-        // until a reset.
-        if !hw::wait_for_tick(feeder.power_down(torch.resting())) {
+        // Power-down or idle, and whether a switch edge ends it, as the last
+        // pass's end says, which the simulator holds this loop to. `None`
+        // means the light's on and no tick came in about 103 ms, so the
+        // 32 kHz oscillator has most likely stopped, and the watchdog with
+        // it. The light goes off and stays off until a reset.
+        let Some(wake) = hw::wait_for_tick(end.power_down, end.switch_wakes) else {
             hw::halt();
+        };
+
+        // A slow tick stands for a second of resting ticks, and a watchdog
+        // setting to change goes in now, to sync while the pass runs.
+        let begin = pacer.begin(wake);
+        if let Some(setting) = begin.watchdog {
+            hw::set_watchdog(setting);
         }
+        torch.rest_for(begin.rested);
 
         // VDDIO2 is read again on every pass, since PC1 is on it and lets go
         // of the driver's enable without it. The library puts the light out
@@ -108,9 +117,21 @@ extern "C" fn main() -> ! {
             hw::set_output(output);
         }
 
-        // The only place the running torch feeds the watchdog.
-        if feeder.tick() {
+        // The only place the running torch feeds the watchdog, after the
+        // setting written at the start has synced, and before the PIT
+        // changes period.
+        end = pacer.end(
+            torch.resting(),
+            torch.can_slow() && aux.settled(torch.aux()),
+        );
+        if end.synced {
+            hw::watchdog_synced();
+        }
+        if end.feed {
             hw::feed_watchdog();
+        }
+        if let Some(pit) = end.pit {
+            hw::set_pit(pit);
         }
     }
 }
