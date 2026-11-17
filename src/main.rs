@@ -96,7 +96,7 @@ extern "C" fn main() -> ! {
         // unless the watchdog's lit window is in force, whatever the UI asks
         // for, so it never counts a light it isn't showing.
         torch.tick(
-            hw::switch_pressed(),
+            hw::take_switch(),
             hw::adc_result(),
             hw::vddio2_ok(),
             pacer.lit(),

@@ -466,7 +466,7 @@ fn prepare_sleep(rest: bool) {
 /// looks at the switch once a tick and a press that comes and goes between
 /// two ticks is still missed. Nobody's measured how short a press this switch
 /// can give. A tick that's due as well wins, and its pass reads the switch
-/// anyway.
+/// anyway, through [`take_switch`], which clears [`SWITCHED`] as it reads.
 ///
 /// The PIT interrupt sets [`TICK`]; this checks and clears it with interrupts
 /// off, so a tick can't land between the check and the clear. If it isn't set
@@ -914,6 +914,28 @@ fn twi_idle(polls: &mut u16) -> bool {
 /// measured it.
 pub fn switch_pressed() -> bool {
     read(reg::VPORTD_IN) & (1 << SWITCH) == 0
+}
+
+/// [`switch_pressed`] for a pass of the loop, which also clears
+/// [`SWITCHED`], with interrupts off so no edge lands between the two.
+///
+/// An edge before the read is one this read already shows. Left up, it
+/// would end the next slow sleep at once, for a press the pass has had, and
+/// cost a trip back to 64 Hz, and an edge that came while a tick was already
+/// due did just that, since [`wait_for_tick`] takes the tick first. An edge
+/// after the read sets it again, and ends the next slow sleep as it should,
+/// so a press that comes during the pass isn't left for the next slow tick.
+/// One held off by the `cli` runs its handler straight after the `sei`, so
+/// it counts as after.
+pub fn take_switch() -> bool {
+    // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a
+    // compiler barrier, so the clear and the read stay after it.
+    unsafe { asm!("cli", options(nostack)) };
+    out!(reg::GPR_GPR2, 0);
+    let pressed = switch_pressed();
+    // SAFETY: `sei` only sets SREG.I, and is a compiler barrier too.
+    unsafe { asm!("sei", options(nostack)) };
+    pressed
 }
 
 /// Spins for about `loops` × 3 main clocks, 0.75 µs a loop at 4 MHz.
