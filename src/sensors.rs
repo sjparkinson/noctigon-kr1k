@@ -54,9 +54,11 @@
 //!
 //! It starts on tick 2 rather than 3 because the torch rests as soon as no
 //! conversion is running, and a check of the cell at rest has to stay awake
-//! for it. So a check is four ticks awake rather than two, and the VDDIO2
-//! conversion starts two ticks, 31 ms, after the cell's. It's decided on tick
-//! 2, and once started it finishes, light or not. A light that comes on
+//! for it. So a check is five passes rather than three, ticks 0 to 4, which
+//! keeps the chip out of power-down for the four ticks between them rather
+//! than two, and the VDDIO2 conversion starts two ticks, 31 ms, after the
+//! cell's. It's decided on tick 2, and once started it finishes, light or
+//! not. A light that comes on
 //! partway through gets no quick readings until the next round, since the
 //! ADC is no longer on the voltage.
 //!
@@ -71,7 +73,7 @@
 //!
 //! Ticks 14 and 15 start nothing. Ground's turn only comes round while the
 //! torch is awake that long, which is while the light's on or a press is
-//! being counted. A check of the cell at rest is ticks 0 to 2 and then rests
+//! being counted. A check of the cell at rest is ticks 0 to 4 and then rests
 //! again (`torch::Torch`), so it never gets to tick 11, and that's on
 //! purpose. Garbage at rest is never a fault (docs/ui.md), so a ground
 //! reading there would have nothing to feed, and it would keep the chip
@@ -147,9 +149,10 @@ pub enum Reading {
 
 /// Where the firmware keeps the last [`Supplies`], a data-space address.
 ///
-/// It's for `cargo xtask peek` to read. It's the start of SRAM, where the
-/// linker puts the firmware's only static, and xtask's simulator checks the
-/// ELF has it there.
+/// It's for `cargo xtask peek` to read. It's the start of SRAM, and what
+/// pins it there is link.x's `.supplies` section, which comes first in RAM
+/// and holds the one static, so it stays put whatever else the firmware gets.
+/// xtask's simulator checks the ELF has it there.
 pub const SUPPLIES_AT: usize = crate::regs::mem::INTERNAL_SRAM_START;
 
 /// The last raw reading of the cell (VDD / 10) and of VDDIO2 / 10, both

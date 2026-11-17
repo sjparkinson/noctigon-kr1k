@@ -176,7 +176,7 @@ impl Limits {
     /// result (DS40002413B §33.3.8). So a battery ceiling only climbs once
     /// readings start again, and a long rest forgets the last ones
     /// (`battery::FORGET_TICKS`). The torch's checks of the cell at rest
-    /// (`torch::CHECK_TICKS`) are ordinary ticks with the UI off, three of
+    /// (`torch::CHECK_TICKS`) are ordinary ticks with the UI off, five of
     /// them, between runs of these.
     ///
     /// Nothing looks at VDDIO2 here either. At rest PORT has PC1 low, DAC0 is
