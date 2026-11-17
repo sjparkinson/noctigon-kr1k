@@ -31,7 +31,7 @@ multiple_unsafe_ops_per_block = "warn"
 
 [package]
 name = "kr1k"
-description = "Firmware for the Wurkkos TS26 torch."
+description = "Firmware for the Noctigon KR1K torch."
 readme = "README.md"
 edition.workspace = true
 authors.workspace = true
@@ -63,21 +63,17 @@ bench = false
 [lints]
 workspace = true
 
-# Panics can't unwind on AVR. Size beats speed on 16 KB of flash, and debug
-# info only lands in the ELF, never in the hex.
+# Panics can't unwind on AVR. Debug info only lands in the ELF, never in the
+# hex.
 [profile.release]
 panic = "abort"
 opt-level = "s"
 lto = true
 codegen-units = 1
 debug = true
-# Every sum, difference, product and negation LLVM can't prove fits, and every
-# shift by too many bits, then links a panic, and `no_panics` in
-# xtask/src/layout.rs fails `cargo xtask hex` on any panic machinery. Together
-# they prove none of those wraps by accident. Wrapping on purpose takes
-# `wrapping_*`, which says so where it happens. Bits shifted out of the top and
-# truncating casts are never checked, so those rest on the clippy denies and on
-# reading.
+# Arithmetic LLVM can't prove fits then links a panic, which `no_panics` in
+# xtask/src/layout.rs refuses, so nothing wraps by accident. Truncating casts
+# and bits shifted out of the top aren't checked.
 overflow-checks = true
 
 [profile.dev]

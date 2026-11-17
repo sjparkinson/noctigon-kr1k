@@ -2,7 +2,23 @@
 
 Rust firmware for the Noctigon KR1K torch with the Lume X1-C boost driver, an AVR32DD20 setting the LED current through its DAC. It has zero crate dependencies and is deliberately small.
 
-It started as firmware for the Wurkkos TS26 and is being ported, so parts of it still describe that light. Nothing has run on a KR1K yet. [docs/hardware.md](docs/hardware.md) has what's known about the board, [docs/safety.md](docs/safety.md) what could go wrong, and [docs/roadmap.md](docs/roadmap.md) where the port has got to.
+It runs on one KR1K so far, where clicks, the ramp, lockout and the aux LEDs have been seen working. Thermal regulation, the low-voltage steps and standby current haven't been measured there, so it isn't proven firmware. [docs/hardware.md](docs/hardware.md) has what's known about the board and [docs/safety.md](docs/safety.md) what could go wrong.
+
+## Using it
+
+The notation is Anduril's, so 1C is one click, 3C three quick clicks and 1H press and hold.
+
+| From | Action | Does |
+|---|---|---|
+| Off | 1C | On, at level 52 of 150 |
+| Off | 3C | Lockout |
+| On | 1C | Off |
+| On | 1H | Ramp, up the first time and the other way each time after, between levels 13 and 120 |
+| Lockout | 3C | Unlock |
+
+Nothing is remembered between uses. The aux LEDs are dim blue when off, bright red for five seconds after a press in lockout, and dark while the light's on.
+
+A low cell steps the light down and then turns it off, and heat fades it down. A flat cell or a fault keeps it off, with the aux yellow or white for three seconds after a press. `src/testing/examples.rs` has every case, and they run as tests.
 
 ## Building
 
@@ -17,13 +33,16 @@ See [docs/toolchain.md](docs/toolchain.md) for how it builds and links.
 
 ## Flashing
 
-The KR1K's driver has three UPDI pads, labelled `+ - U` on this torch. Take the cell out, check the pads with a meter, put a plain 4.5 V serial UPDI programmer on them, and `cargo xtask` does the rest. Never a high-voltage programmer, and never write fuses. [docs/flashing.md](docs/flashing.md) has the whole procedure, and the first flash is a first-light image, not this.
+The KR1K's driver has three UPDI pads, labelled `+ - U` on this torch. Pad order differs between lights, so check yours with a meter first. Take the cell out, put a plain 4.5 V serial UPDI programmer on the pads, and `cargo xtask` does the rest. Never a high-voltage programmer, and never write fuses, since either can cost the torch. Back up before the first flash.
 
 ```sh
 cargo xtask ping /dev/cu.usbserial-XXXX
 cargo xtask backup /dev/cu.usbserial-XXXX backup/torch
 cargo xtask flash /dev/cu.usbserial-XXXX
+cargo xtask restore /dev/cu.usbserial-XXXX backup/torch
 ```
+
+If the link fails, lift the probe and re-seat it. `flash` only checks the signature and verifies the write, which doesn't prove the firmware runs.
 
 ## Acknowledgements
 
