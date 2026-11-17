@@ -360,13 +360,11 @@ mod tests {
     use crate::ramp::CEILING;
     use crate::sensors::Channel;
     use crate::testing::{
-        GROUND_READING, Rig, Rng, examples, temperature_reading, voltage_reading,
+        EXAMPLES, GROUND_READING, Rig, Rng, example, temperature_reading, voltage_reading,
     };
     use crate::thermal;
     use crate::ui::{self, Mode, ON_LEVEL};
     use std::vec::Vec;
-
-    const UI_MD: &str = include_str!("../docs/ui.md");
 
     /// Ticks a check of the cell stays awake, the cell's two conversions and
     /// VDDIO2's two.
@@ -405,31 +403,25 @@ mod tests {
     /// Every row's example, played the way `cargo xtask simulate` and the
     /// firmware's run in `cargo xtask hex` play it.
     #[test]
-    fn every_example_in_docs_ui_md_holds() {
-        let mut found = false;
-        for example in examples(UI_MD) {
-            let example = example.unwrap_or_else(|e| panic!("docs/ui.md:{}: {e}", e.line));
+    fn every_example_holds() {
+        for example in EXAMPLES {
             let level = Rig::play(example.actions()).level();
             assert!(
                 example.expect.holds(level),
-                "docs/ui.md:{}: {}: expected {:?}, but it ends at level {level}",
-                example.line,
-                example.row,
+                "{}: expected {:?}, but it ends at level {level}",
+                example.name,
                 example.expect
             );
-            found = true;
         }
-        assert!(found, "docs/ui.md has no examples");
     }
 
     /// Every row's example again, paced the way the firmware's loop is, with
     /// a 1 Hz tick at rest, in each of the PIT's phases.
     #[test]
-    fn every_example_in_docs_ui_md_holds_paced() {
+    fn every_example_holds_paced() {
         use crate::testing::{Paced, PitPhase, Scene, samples};
         for phase in [PitPhase::Aligned, PitPhase::Early, PitPhase::Late] {
-            for example in examples(UI_MD) {
-                let example = example.unwrap();
+            for example in EXAMPLES {
                 let mut script = samples(example.actions()).peekable();
                 let power_on = script.peek().map_or(Scene::NORMAL, |s| s.scene);
                 let mut paced = Paced::new(power_on.faults(), 0);
@@ -439,9 +431,8 @@ mod tests {
                 }
                 assert!(
                     example.expect.holds(paced.level()),
-                    "docs/ui.md:{}: {} {phase:?}: ends at level {}",
-                    example.line,
-                    example.row,
+                    "{} {phase:?}: ends at level {}",
+                    example.name,
                     paced.level()
                 );
             }
@@ -1031,25 +1022,14 @@ mod tests {
             ("A cell it can't read, at rest", Aux::Off),
         ];
         for (row, aux) in rows {
-            let example = examples(UI_MD)
-                .map(|example| example.unwrap())
-                .find(|example| example.row.action == row)
-                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let example = example(row);
             let rig = Rig::play(example.actions());
             assert_eq!(rig.aux(), aux, "{row}");
             assert_eq!(rig.torch.limits.health(), Health::Good, "{row}");
         }
         // "Low cell, at rest" ends lit, so its dark blue is before the 1C,
         // and after it's clicked off again.
-        let mut low = Rig::play(
-            examples(UI_MD)
-                .find_map(|e| {
-                    let e = e.unwrap();
-                    (e.row.action == "Low cell, at rest").then(|| e.actions())
-                })
-                .unwrap()
-                .take(2),
-        );
+        let mut low = Rig::play(example("Low cell, at rest").actions().take(2));
         assert_eq!(low.aux(), Aux::Off, "dark before the 1C");
         low.adc.voltage = voltage_reading(320);
         click(&mut low);
@@ -1058,15 +1038,7 @@ mod tests {
         assert_eq!(low.aux(), Aux::Off, "and once it's off again");
         // "A cell it can't read, at rest" ends lit too, so the blue it
         // keeps through the garbage is before the 1C.
-        let garbage = Rig::play(
-            examples(UI_MD)
-                .find_map(|e| {
-                    let e = e.unwrap();
-                    (e.row.action == "A cell it can't read, at rest").then(|| e.actions())
-                })
-                .unwrap()
-                .take(2),
-        );
+        let garbage = Rig::play(example("A cell it can't read, at rest").actions().take(2));
         assert_eq!(garbage.aux(), Aux::Blue, "blue through the garbage");
         assert_eq!(garbage.torch.limits.health(), Health::Good, "no fault yet");
     }
@@ -1328,10 +1300,7 @@ mod tests {
             "An ADC stuck on one reading",
             "An ADC stuck on one reading, at rest",
         ] {
-            let example = examples(UI_MD)
-                .map(|example| example.unwrap())
-                .find(|example| example.row.action == row)
-                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let example = example(row);
             let rig = Rig::play(example.actions());
             assert_eq!(rig.torch.limits.health(), Health::Fault, "{row}");
             // It lit, then faded out, a level a tick.
@@ -1341,10 +1310,7 @@ mod tests {
             assert_eq!(lit.last(), Some(&1), "{row}");
         }
         // Fifteen minutes stuck at rest is no fault, and blue's still lit.
-        let rest = examples(UI_MD)
-            .map(|example| example.unwrap())
-            .find(|example| example.row.action == "An ADC stuck on one reading, at rest")
-            .unwrap();
+        let rest = example("An ADC stuck on one reading, at rest");
         let rig = Rig::play(rest.actions().take(2));
         assert_eq!(rig.torch.limits.health(), Health::Good);
         assert_eq!(rig.aux(), Aux::Blue);
@@ -1385,20 +1351,14 @@ mod tests {
             ),
         ];
         for (row, health, aux) in rows {
-            let example = examples(UI_MD)
-                .map(|example| example.unwrap())
-                .find(|example| example.row.action == row)
-                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let example = example(row);
             let rig = Rig::play(example.actions());
             assert_eq!(rig.torch.limits.health(), health, "{row}");
             assert_eq!(rig.aux(), aux, "{row}");
         }
         // The first of them is out well inside its quarter of a second, and
         // was at the top of the ramp until it was.
-        let collapses = examples(UI_MD)
-            .map(|example| example.unwrap())
-            .find(|example| example.row.action == "A cell that collapses")
-            .unwrap();
+        let collapses = example("A cell that collapses");
         let mut levels = Vec::new();
         Rig::play_with(collapses.actions(), |rig, _| levels.push(rig.level()));
         let lit: Vec<u8> = levels.iter().copied().filter(|&l| l > 0).collect();
@@ -1794,20 +1754,14 @@ mod tests {
             ),
         ];
         for (row, health, aux) in rows {
-            let example = examples(UI_MD)
-                .map(|example| example.unwrap())
-                .find(|example| example.row.action == row)
-                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let example = example(row);
             let rig = Rig::play(example.actions());
             assert_eq!(rig.torch.limits.health(), health, "{row}");
             assert_eq!(rig.aux(), aux, "{row}");
         }
         // "VDDIO2 lost with the light on" is out on the first tick after
         // the word, not some way down a fade by the end of its wait.
-        let lost = examples(UI_MD)
-            .map(|example| example.unwrap())
-            .find(|example| example.row.action == "VDDIO2 lost with the light on")
-            .unwrap();
+        let lost = example("VDDIO2 lost with the light on");
         // The last lit level, and the ticks dark after it.
         let (mut last_lit, mut dark_after) = (0, 0);
         Rig::play_with(lost.actions(), |rig, _| {

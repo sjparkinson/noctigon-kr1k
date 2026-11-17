@@ -223,7 +223,7 @@ use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
 use kr1k::sensors::{CYCLE_TICKS, Channel, SUPPLIES_AT, Supplies};
-use kr1k::testing::{self, Action, Example, Paced, PitPhase, Rig, Sample, Scene};
+use kr1k::testing::{self, Action, EXAMPLES, Example, Paced, PitPhase, Rig, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{
     CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, TICK_DEADLINE_PERIODS,
@@ -234,7 +234,6 @@ use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_two_words, ldi};
 use crate::crc;
 use crate::elf::{DATA_SPACE, Elf, SRAM};
 use crate::layout::{self, jmp_target, word};
-use crate::spec;
 use crate::stamp;
 use crate::switching::RandomSwitching;
 use crate::twi::{Fault, Twi};
@@ -511,11 +510,7 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     .map_err(|e| format!("start-up order: {e}"))?;
     unhandled_interrupt(power_on()?)
         .map_err(|e| format!("with an interrupt that has no handler: {e}"))?;
-    let examples = if examples {
-        spec::examples(spec::UI_MD)?
-    } else {
-        Vec::new()
-    };
+    let examples = if examples { EXAMPLES } else { &[] };
     // The clock, stuck-input and supply faults, every example, then the
     // random switching, each example and the switching with and without
     // interrupts landing mid-pass, then the collapsing cell, the faults on
@@ -629,7 +624,7 @@ fn run(
     let mut report = Report::default();
     let result = match example {
         Some(example) => {
-            ui_example(sim, example, &mut report).map_err(|e| format!("{}: {e}", example.row))
+            ui_example(sim, example, &mut report).map_err(|e| format!("{}: {e}", example.name))
         }
         None => against_the_library(sim, &mut report).map_err(|e| format!("random switching: {e}")),
     };
@@ -3716,9 +3711,7 @@ impl Chip {
             self.twi.catch_up(self.now, false)?;
             if self.twi.aw2016.lit() {
                 return Err(
-                    "raises PC1 with the aux lit: they go out before the main LED comes on \
-                     (docs/ui.md)"
-                        .into(),
+                    "raises PC1 with the aux lit: they go out before the main LED comes on".into(),
                 );
             }
             self.pc1_rose_at = self.now;
@@ -6568,15 +6561,12 @@ mod tests {
             format!("with interrupts mid-pass: random switching: tick 4: {failed}")
         );
 
-        let example = spec::examples(spec::UI_MD)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        let err = run(&power_on, Some(&example), Landing::Watch)
-            .err()
-            .unwrap();
-        assert!(err.starts_with(&format!("{}: tick ", example.row)), "{err}");
+        let example = &EXAMPLES[0];
+        let err = run(&power_on, Some(example), Landing::Watch).err().unwrap();
+        assert!(
+            err.starts_with(&format!("{}: tick ", example.name)),
+            "{err}"
+        );
     }
 
     /// The forced vector has to be one the firmware leaves unhandled, or the

@@ -18,7 +18,6 @@ mod lints;
 mod serial;
 mod sim;
 mod simulate;
-mod spec;
 mod stamp;
 mod switching;
 mod terminal;
@@ -44,8 +43,8 @@ commands:
                           stack, loop and handler use, then write the
                           first-light image, also simulated, to
                           target/noctigon-kr1k-first-light.hex
-  hex --no-examples       the same, leaving docs/ui.md's examples out of the
-                          simulator run, for a breakout test build (T1)
+  hex --no-examples       the same, leaving the UI examples out of the
+                          simulator run, for a test build they'd fail
   breakages [name...]     check hex refuses copies of the firmware, each broken on
                           purpose in one way, and leave the checkout alone
   ping <port>           check the programmer can see the chip, writing nothing,
