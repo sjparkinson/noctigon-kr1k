@@ -35,7 +35,7 @@ The stock firmware's hardware definition calls the board a "40W Boost Driver wit
 | PF6 | nRST | Input only on this chip (DS40002413B §3.1) |
 | PF7 | UPDI | The programming pin |
 | VDD | MCU supply | The cell, through a P-channel FET for reverse polarity |
-| VDDIO2 | Supply for PC1 to PC3 | Present on programmer power (`MVIO.STATUS` reads 1). What feeds it is unknown, see [The boost enable](#the-boost-enable-pc1) |
+| VDDIO2 | Supply for PC1 to PC3 | Present on programmer power (`MVIO.STATUS` reads 1), and reads within 0.07 V of VDD there with no load. Very likely tied to VDD, unconfirmed, and unmeasured on the cell, see [The boost enable](#the-boost-enable-pc1) |
 
 That table, PA1's row aside, is confirmed as what the stock firmware's hardware definition says, and nothing more. The pins themselves are confirmed by the datasheet's multiplexing table (DS40002413B §3.1), which has DAC0's output on PD6, TWI0's host-capable SDA and SCL on PA2 and PA3, RESET on PF6 and UPDI on PF7.
 
@@ -48,6 +48,8 @@ PA1 is where the build on this torch parts from the source. The stock source's b
 PC1 raises the boost converter and the amplifier together. Before firmware drives it, after any reset, every output is tri-stated (DS40002413B §18.3.1), and that floating enable lasts at least as long as `SUT` on every power-up, with nothing firmware can do about it. This torch's `SUT` is 0 ms (see [Fuses](#fuses)), so the window is short, but the BOD is off too, so a slowly rising or bouncing cell can start the chip below its safe range. Nothing public says whether the board holds the enable low. The stock firmware never gives PC1 a pull-up (the line's commented out). Confirmed from source.
 
 PC1 is one of the three pins on the VDDIO2 supply. The datasheet's power-domain figure puts PC1 to PC3 on VDDIO2 and every other port pin on VDD (DS40002413B §5.1, figure 5-1), and says that when either domain loses power, "the MVIO I/O pins are tri-stated" (§19.3.2.1). Confirmed for the chip. The stock firmware asks for the `MVSYSCFG` fuse at dual supply (which is also the factory default, and what this torch reads) with the comment "enable MVIO because VDDIO2 pin isn't connected". Confirmed as what the comment says. Those two don't fit together. A PC1 with no supply can't drive anything, and the stock firmware does turn the light on with it. So either VDDIO2 is connected to something after all (VDD, or another rail), or the comment means something else. Nobody has measured the pin. On 2026-11-16 `cargo xtask peek`, with the cell out and the kit's 4.5 V on the pads, read `MVIO.STATUS` as 0x01, so `VDDIO2S` is set and the chip sees VDDIO2 as present (DS40002413B §19.5.3). Confirmed on this torch, on programmer power. So VDDIO2 is connected to something, most likely VDD, and the stock comment means something other than what it says. Whether it's still present on the cell, under load and as the cell sags, is likely and unmeasured. The firmware checks it at power-on (`selftest::Faults::supply`), not after. Which rail feeds it is still an open question.
+
+On 2026-11-17 `cargo xtask peek`, with firmware `bb9ee76` resting, the cell out and the kit's supply on the pads, read VDD as 4.43 V (raw 7157) and VDDIO2 as 4.50 V (raw 7269), a difference of +0.07 V (raw +112). So VDDIO2 reads within 0.07 V (1.6 %) of VDD. Confirmed on this torch, on programmer power with no load ([breakout.md](breakout.md#results), row 4.8). That's consistent with VDDIO2 tied to VDD, which is now very likely, and not confirmed. Each reading goes through its own divide-by-ten input (`VDDDIV10` and `VDDIO2DIV10`, DS40002413B §33.5.7), and `peek` converts VDDIO2's with VDD's slope of 1014, so a couple of percent between them is within what the two inputs could explain. A separate rail sitting close to the kit's 4.5 V would read the same. It says nothing about VDDIO2 on the cell, under load or as the cell sags.
 
 ### Turning on and off
 
@@ -177,7 +179,7 @@ This torch's fuses read `00 00 00 FF FF D0 08 00 00`, in the order `WDTCFG`, `BO
 
 ## Open questions
 
-- What feeds VDDIO2? It reads present on programmer power. Does it stay present on the cell, under load, and does anything hold the boost enable if it drops?
+- What feeds VDDIO2? It reads present on programmer power, within 0.07 V of VDD with no load (2026-11-17), so very likely VDD. Is it VDD, and does it stay present on the cell, under load, and does anything hold the boost enable if it drops?
 - Does anything on the board pull PC1 low through reset, and through a power-up with the BOD off?
 - What does the amplifier do with the DAC at zero, and does PD6 need the board to pull it down? What does PD6 float to in power-down?
 - Which order is safe on this board, enable then current or current then enable, and what's the 8 ms for?
