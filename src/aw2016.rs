@@ -319,10 +319,17 @@ impl Aw2016 {
     }
 
     /// Whether [`Aw2016::step`] would send nothing for `want`, so the aux
-    /// need no more ticks.
+    /// need no more ticks. That's showing it already, standby for
+    /// [`Aux::Off`], or having given up on it after a failed step, which
+    /// [`Aw2016::shown`] alone wouldn't count. Written out rather than by
+    /// calling `step`, which is bigger, and a test holds the two to each
+    /// other in every state.
     pub const fn settled(&self, want: Aux) -> bool {
-        let mut next = *self;
-        next.step(want).is_none()
+        match self.state {
+            State::Standby => matches!(want, Aux::Off),
+            State::Showing(colour) | State::Failed(colour) => same(colour, want),
+            State::Unknown | State::Awake => false,
+        }
     }
 
     /// The last step's transfers didn't all go through, so its colour is
@@ -417,6 +424,32 @@ mod tests {
         }
         assert_eq!(aw.shown(), Some(want));
         ticks
+    }
+
+    /// `settled` is exactly whether `step` would send nothing, in every state
+    /// the driver can be in and for every colour.
+    #[test]
+    fn settled_is_step_sending_nothing_in_every_state() {
+        let colours = COLOURS
+            .into_iter()
+            .flat_map(|colour| [State::Showing(colour), State::Failed(colour)]);
+        let states = [State::Unknown, State::Standby, State::Awake]
+            .into_iter()
+            .chain(colours);
+        for state in states {
+            for want in COLOURS {
+                let aw = Aw2016 {
+                    state,
+                    want: Aux::Off,
+                };
+                let mut next = aw;
+                assert_eq!(
+                    aw.settled(want),
+                    next.step(want).is_none(),
+                    "{state:?} wanting {want:?}"
+                );
+            }
+        }
     }
 
     #[test]
