@@ -566,6 +566,28 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "A cell that collapses: expected Off",
     },
+    // An ADC that reads ground as anything but near zero is a fault. This
+    // lets any ground reading through, so an ADC stuck on a good cell's
+    // reading hides a flat cell for good.
+    Breakage {
+        name: "ground-ignored",
+        file: SENSORS,
+        find: "        if raw <= GROUND_MAX {\n",
+        replace: "        if raw <= GROUND_MAX || true {\n",
+        stage: Stage::Simulator,
+        expect: "with the ADC stuck on one reading",
+    },
+    // ... and ground is the GND input. This reads the cell for it, which
+    // the simulator's ADC answers as the cell, so every ground reading is
+    // well off zero and a good torch faults.
+    Breakage {
+        name: "ground-reads-the-cell",
+        file: HW,
+        find: "        Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_GND),\n",
+        replace: "        Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),\n",
+        stage: Stage::Simulator,
+        expect: "but the library says",
+    },
     // ... and within an update, a NACK ends it. This tries each transfer
     // until it goes through.
     Breakage {

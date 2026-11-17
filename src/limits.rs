@@ -13,8 +13,11 @@
 //! the cell comes out. A fault is a failed power-on self-test, a cell that
 //! can't be read (`battery::Verdict::Blind`), since with no reading there's
 //! no low-voltage cut-off, and this cell has no protection of its own, or
-//! VDDIO2 going missing. A cell that can't be read with the light on fades it
-//! down the ramp first, so it doesn't snap out in someone's hand.
+//! VDDIO2 going missing. An ADC that reads ground as anything but near zero
+//! (`sensors::Ground`) can't read the cell either, however believable its
+//! voltage readings look, so that's the same fault as a cell it can't read.
+//! A cell that can't be read with the light on fades it down the ramp first,
+//! so it doesn't snap out in someone's hand.
 //!
 //! VDDIO2 going missing is the one fault with no fade. PC1, the driver's
 //! enable, is on that supply and tri-stated without it, so there's nothing
@@ -37,7 +40,7 @@
 use crate::battery::{self, Protection, Verdict};
 use crate::ramp::CEILING;
 use crate::selftest::Faults;
-use crate::sensors::{Convert, Reading, Schedule};
+use crate::sensors::{Convert, Ground, Reading, Schedule};
 use crate::temp::Calibration;
 use crate::thermal::Thermal;
 
@@ -87,6 +90,7 @@ pub struct Limits {
     calibration: Calibration,
     protection: Protection,
     thermal: Thermal,
+    ground: Ground,
     /// Whether the UI was on last tick.
     on: bool,
     /// The level the light's at, as of the last tick.
@@ -113,6 +117,7 @@ impl Limits {
             calibration,
             protection: Protection::new(),
             thermal: Thermal::new(),
+            ground: Ground::new(),
             on: false,
             level: 0,
             lit_before: false,
@@ -167,6 +172,7 @@ impl Limits {
     pub const fn rest(&mut self) {
         self.schedule.rest();
         self.protection.rest();
+        self.ground.rest();
         self.convert = None;
         self.on = false;
         self.level = 0;
@@ -244,6 +250,13 @@ impl Limits {
                 let sixteenths = self.calibration.sixteenths(raw);
                 if on {
                     self.thermal.sample(sixteenths, level);
+                }
+            }
+            // An ADC that's stuck can't read the cell, whatever it says, so
+            // it's the same fault as a cell it can't read.
+            Some(Reading::Ground(raw)) => {
+                if self.ground.reading(raw) {
+                    self.fault = true;
                 }
             }
             None => {}
@@ -899,11 +912,63 @@ mod tests {
         assert_eq!(run.offs, 1);
     }
 
-    /// A known gap, docs/safety.md H5 and H15. A reading that's stuck at a
-    /// good-looking 3.8 V is the same to the firmware as a good cell, so
-    /// nothing here ever steps the light down. Only a reading that can't be
-    /// real gets caught. This pins it down so that if the gap is ever closed,
-    /// this is the test that has to change.
+    /// An ADC stuck on a good-looking 3.8 V for every channel reads ground as
+    /// 3.8 V too, which no working ADC does, so it's a fault and the light
+    /// fades out.
+    #[test]
+    fn an_adc_stuck_on_a_plausible_voltage_is_a_fault() {
+        for at in 0..u32::from(CYCLE_TICKS) {
+            let mut run = Run::new();
+            run.ui = 100;
+            run.ticks(64 + at);
+            let raw = run.adc.voltage;
+            run.adc.stuck(raw);
+            // Two ground readings a round apart. If it sticks just after a
+            // good one started, the second is due 33 ticks on.
+            run.ticks(2 * u32::from(CYCLE_TICKS));
+            if run.limits.health() == Health::Good {
+                run.ticks(1);
+            }
+            assert_eq!(run.limits.health(), Health::Fault, "at {at}");
+            assert_eq!(run.secs(3), 0, "at {at}");
+            assert_eq!(run.offs, 1, "at {at}");
+            let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+            assert_eq!(lit.last(), Some(&1), "faded out, at {at}");
+        }
+    }
+
+    #[test]
+    fn one_bad_ground_reading_is_no_fault() {
+        let mut run = Run::new();
+        run.ui = 100;
+        for _ in 0..60 {
+            run.adc.ground = 6140;
+            run.ticks(u32::from(CYCLE_TICKS));
+            run.adc.ground = crate::testing::GROUND_READING;
+            run.ticks(u32::from(CYCLE_TICKS));
+        }
+        assert_eq!(run.limits.health(), Health::Good);
+        assert_eq!(*run.levels.last().unwrap(), 100);
+    }
+
+    #[test]
+    fn a_stuck_adc_with_the_light_off_and_the_switch_down_is_a_fault_too() {
+        let mut run = Run::new();
+        run.adc.stuck(voltage_reading(380));
+        // Off but still read, as it is while the switch is held down.
+        run.secs(1);
+        assert_eq!(run.limits.health(), Health::Fault);
+        run.ui = CEILING;
+        assert_eq!(run.ticks(1), 0);
+    }
+
+    /// A known gap, docs/safety.md H5 and H15. A reading that's steady at a
+    /// good-looking 3.8 V, from an ADC that still reads ground as ground, is
+    /// the same to the firmware as a good cell, so nothing here ever steps
+    /// the light down. That's a cell really sitting at 3.8 V, or an ADC
+    /// that's wrong in a way ground can't show, such as a reference that's
+    /// drifted. This pins it down so that if the gap is ever closed, this is
+    /// the test that has to change.
     #[test]
     fn a_plausible_voltage_that_never_changes_keeps_the_light_on() {
         let mut run = Run::new();

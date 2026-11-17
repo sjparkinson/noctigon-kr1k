@@ -195,6 +195,11 @@ impl Torch {
         self.limits.level()
     }
 
+    /// Whether the light may come on, and if not, why not.
+    pub const fn health(&self) -> Health {
+        self.limits.health()
+    }
+
     /// The conversion to start on the ADC after this tick, if any.
     pub const fn convert(&self) -> Option<Convert> {
         self.limits.convert()
@@ -270,7 +275,9 @@ mod tests {
     use crate::button::{HOLD_TICKS, RELEASE_TICKS};
     use crate::ramp::CEILING;
     use crate::sensors::Channel;
-    use crate::testing::{Rig, Rng, examples, temperature_reading, voltage_reading};
+    use crate::testing::{
+        GROUND_READING, Rig, Rng, examples, temperature_reading, voltage_reading,
+    };
     use crate::thermal;
     use crate::ui::{self, Mode, ON_LEVEL};
     use std::vec::Vec;
@@ -865,7 +872,10 @@ mod tests {
             assert_eq!(torch.aux(), Aux::Off, "{down}");
             torch.adc.voltage = voltage_reading(380);
             torch.tick(true);
-            let running = torch.convert().is_some();
+            // Ground's turn is read too, but it doesn't move the aux.
+            let running = torch
+                .convert()
+                .is_some_and(|c| c.channel == Channel::Voltage);
             assert_eq!(torch.tick(false), Some(Event::Release { clicks: 0 }));
             run(&mut torch, false, 2);
             assert!(torch.resting(), "{down}");
@@ -1019,6 +1029,52 @@ mod tests {
             assert_eq!(torch.level(), CEILING, "at {at}");
             assert_eq!(torch.torch.limits.health(), Health::Good, "at {at}");
         }
+    }
+
+    /// The stuck ADC rows of docs/ui.md only say how the light ends up. This
+    /// holds them to the fault and the white they describe, and to there
+    /// being none before the press at rest.
+    #[test]
+    fn the_stuck_adc_rows_in_docs_ui_md_end_as_they_describe() {
+        for row in [
+            "An ADC stuck on one reading",
+            "An ADC stuck on one reading, at rest",
+        ] {
+            let example = examples(UI_MD)
+                .map(|example| example.unwrap())
+                .find(|example| example.row.action == row)
+                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let rig = Rig::play(example.actions());
+            assert_eq!(rig.torch.limits.health(), Health::Fault, "{row}");
+            // It lit, then faded out, a level a tick.
+            let mut levels = Vec::new();
+            Rig::play_with(example.actions(), |rig, _| levels.push(rig.level()));
+            let lit: Vec<u8> = levels.iter().copied().filter(|&l| l > 0).collect();
+            assert_eq!(lit.last(), Some(&1), "{row}");
+        }
+        // Fifteen minutes stuck at rest is no fault, and blue's still lit.
+        let rest = examples(UI_MD)
+            .map(|example| example.unwrap())
+            .find(|example| example.row.action == "An ADC stuck on one reading, at rest")
+            .unwrap();
+        let rig = Rig::play(rest.actions().take(2));
+        assert_eq!(rig.torch.limits.health(), Health::Good);
+        assert_eq!(rig.aux(), Aux::Blue);
+    }
+
+    #[test]
+    fn a_stuck_adc_at_rest_is_never_a_fault() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, 3);
+        torch.adc.stuck(voltage_reading(380));
+        for _ in 0..12 {
+            next_check(&mut torch);
+            assert_eq!(torch.torch.limits.health(), Health::Good);
+            assert_eq!(torch.aux(), Aux::Blue);
+        }
+        // A second's hold reads ground four times, and that's a fault.
+        run(&mut torch, true, TICKS_PER_SECOND);
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
     }
 
     /// The rows of docs/ui.md about a cell that collapses only say how the
@@ -1828,6 +1884,12 @@ mod tests {
                 .start_with(rig.torch.convert(), |channel| match channel {
                     Channel::Voltage => cell.read(rng),
                     Channel::Temperature => head.read(rng),
+                    // An ADC that reads garbage for the cell reads it for
+                    // ground too. Otherwise ground's near zero.
+                    Channel::Ground => match cell {
+                        Source::Garbage => cell.read(rng),
+                        _ => GROUND_READING,
+                    },
                 });
             let health = rig.torch.limits.health();
             let level = rig.level();

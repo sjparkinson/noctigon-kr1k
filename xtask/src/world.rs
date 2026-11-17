@@ -139,6 +139,7 @@ mod tests {
             corrupt_flash: true,
             adc_dead: true,
             vddio2: false,
+            adc_stuck: Some(6140),
         };
         let world = World::from(scene);
         assert_eq!(world.scene, scene);

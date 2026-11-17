@@ -161,7 +161,9 @@
 //!    (`oscillator_stops`). A tick lost with the oscillator still running ends
 //!    in a watchdog reset instead, which can't run here.
 //! 5. An ADC that never finishes a conversion, from a click to ten seconds
-//!    later, when the light has to be off (`adc_never_answers`). The cell
+//!    later, when the light has to be off (`adc_never_answers`). One stuck
+//!    on a good cell's reading for every input, ground included, when the
+//!    light has to fade out as a fault (`adc_stuck`). The cell
 //!    falling under the hard floor with the light at the top of the ramp, on
 //!    each tick of the ADC's round, when PC1 has to be low within 12 ticks
 //!    (`cell_collapses`). Twenty thousand ticks with the switch held down
@@ -225,12 +227,13 @@ use crate::world::{CALIBRATION, FUSE_NAMES, World};
 // ATDF does, never with the firmware. Only the ones the ATDF names go here,
 // since anything hand-written in src/regs.rs is the firmware's choice.
 use kr1k::regs::{
-    self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10, ADC_PRESC,
-    ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN, ADC_SAMPNUM, ADC_SAMPNUM_ACC4,
-    ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, CRCSCAN_SRC_FLASH, DAC_ENABLE, DAC_OUTEN,
-    MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN, RSTCTRL_PORF, RTC_CTRLBUSY, RTC_PI,
-    RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE, VREF_REFSEL_1V024, VREF_REFSEL_2V048,
-    VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY, WDT_WINDOW, addr as reg,
+    self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_GND, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10,
+    ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN, ADC_SAMPNUM,
+    ADC_SAMPNUM_ACC4, ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, CRCSCAN_SRC_FLASH,
+    DAC_ENABLE, DAC_OUTEN, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN, RSTCTRL_PORF,
+    RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE, VREF_REFSEL_1V024,
+    VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY, WDT_WINDOW,
+    addr as reg,
 };
 
 const CCP_IOREG: u8 = regs::CPU_CCP_IOREG;
@@ -496,10 +499,11 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     // in this order, whichever thread finishes first. The last four come last
     // since they ramp and click through the UI with the light on, so they'd
     // catch many a mistake as a wrong output before the run that names it.
-    let faults: [(FaultCheck, &str); 5] = [
+    let faults: [(FaultCheck, &str); 6] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
         (adc_never_answers, "with a dead ADC"),
+        (adc_stuck, "with the ADC stuck on one reading"),
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
@@ -838,6 +842,59 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         return Err(format!(
             "the slowest took {slowest} ticks, not the {COLLAPSE_TICKS} the worst tick of the \
              round should, so this didn't reach it"
+        ));
+    }
+    Ok(())
+}
+
+/// The ADC stuck on the cell's 3.80 V reading for every input, ground
+/// included, a second after a click lights the torch, then a second click
+/// once the light's out, firmware and library in step. Every voltage reading
+/// from then on looks like a good cell, so only ground can tell. The light
+/// has to fade out as a fault, and stay out through the second click, which
+/// the library has to agree is a fault too.
+fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
+    let seconds = |s: usize| s * usize::from(TICKS_PER_SECOND);
+    let script = [
+        Action::Clicks(1),
+        Action::Wait(TICKS_PER_SECOND),
+        Action::AdcStuck,
+        Action::Wait(5 * TICKS_PER_SECOND),
+        Action::Clicks(1),
+        Action::Wait(2 * TICKS_PER_SECOND),
+    ];
+    let ticks = std::cell::RefCell::new(Vec::new());
+    let mut shadow = Rig::default();
+    let samples = testing::samples(script).inspect(|sample| {
+        shadow.tick_in(sample.pressed, &sample.scene);
+        let fault = shadow.health() == kr1k::limits::Health::Fault;
+        ticks
+            .borrow_mut()
+            .push((sample.scene.adc_stuck.is_some(), shadow.level(), fault));
+    });
+    let mut sim = sim;
+    let end = in_step(&mut sim, samples, report)?;
+    let ticks = ticks.into_inner();
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    let stuck = ticks
+        .iter()
+        .position(|tick| tick.0)
+        .ok_or("the ADC never stuck")?;
+    if ticks[stuck - 1].1 == 0 || ticks[..stuck].iter().any(|tick| tick.2) {
+        return Err("the light wasn't on and well before the ADC stuck".into());
+    }
+    // Two ground readings, then a fade from level 52, a level a tick.
+    let out = stuck + seconds(2);
+    if !ticks
+        .get(out..)
+        .is_some_and(|t| t.iter().all(|t| t.1 == 0 && t.2))
+    {
+        return Err(format!(
+            "the light isn't out as a fault and staying so from 2 s after the ADC stuck \
+             ({:?} at {out})",
+            ticks.get(out)
         ));
     }
     Ok(())
@@ -2854,6 +2911,10 @@ impl Chip {
         let muxpos = io(reg::ADC0_MUXPOS);
         let channel = match (muxpos, reference) {
             (ADC_MUXPOS_VDDDIV10, VREF_REFSEL_1V024) => Channel::Voltage,
+            // Section 33.5.7 names the input and says nothing more about it.
+            // It reads `testing::GROUND_READING`, the worst offset table
+            // 38-24 allows, since a single-ended result can't go under 0.
+            (ADC_MUXPOS_GND, VREF_REFSEL_1V024) => Channel::Ground,
             (ADC_MUXPOS_TEMPSENSE, VREF_REFSEL_2V048) => {
                 // Section 33.3.3.8 wants at least 25 µs of INITDLY and 28 µs
                 // of SAMPLEN, in ADC clocks.
@@ -2871,8 +2932,8 @@ impl Chip {
             _ => {
                 return Err(format!(
                     "converts MUXPOS {muxpos:#04x} against VREF.ADC0REF {reference:#04x}; the \
-                     simulator only models VDD / 10 against 1.024 V and the temperature \
-                     sensor against 2.048 V"
+                     simulator only models VDD / 10 and ground against 1.024 V and the \
+                     temperature sensor against 2.048 V"
                 ));
             }
         };
@@ -4783,15 +4844,38 @@ mod tests {
         for (muxpos, channel) in [
             (ADC_MUXPOS_VDDDIV10, Channel::Voltage),
             (ADC_MUXPOS_TEMPSENSE, Channel::Temperature),
+            (ADC_MUXPOS_GND, Channel::Ground),
         ] {
             let mut chip = adc_ready(muxpos);
             assert_eq!(convert(&mut chip), UNSETTLED);
             assert_eq!(convert(&mut chip), World::NORMAL.reading(channel));
         }
-        // 3.8 V and 25 °C, as the library's tests have them.
+        // 3.8 V and 25 °C, as the library's tests have them, and ground at
+        // the worst offset table 38-24 allows.
         let voltage = World::NORMAL.reading(Channel::Voltage);
         assert_eq!(kr1k::battery::centivolts(voltage), 380);
         assert_eq!(World::NORMAL.reading(Channel::Temperature), 8603);
+        assert_eq!(World::NORMAL.reading(Channel::Ground), 20);
+    }
+
+    /// Ground reads against 1.024 V, as the voltage does, and nothing else.
+    #[test]
+    fn ground_only_converts_against_1_024_v() {
+        let mut chip = adc_ready(ADC_MUXPOS_GND);
+        poke(&mut chip, reg::VREF_ADC0REF, VREF_REFSEL_2V048).unwrap();
+        let err = start(&mut chip).unwrap_err();
+        assert!(err.contains("MUXPOS 0x40"), "{err}");
+    }
+
+    /// A stuck ADC reads the same for every input.
+    #[test]
+    fn a_stuck_adc_reads_one_value_for_every_input() {
+        for muxpos in [ADC_MUXPOS_VDDDIV10, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_GND] {
+            let mut chip = adc_ready(muxpos);
+            chip.world.scene.adc_stuck = Some(6140);
+            convert(&mut chip);
+            assert_eq!(convert(&mut chip), 6140, "{muxpos:#04x}");
+        }
     }
 
     #[test]
@@ -4836,12 +4920,12 @@ mod tests {
             (
                 reg::VREF_ADC0REF,
                 VREF_REFSEL_2V048,
-                "VDD / 10 against 1.024 V",
+                "VDD / 10 and ground against 1.024 V",
             ),
             (
                 reg::ADC0_MUXPOS,
                 regs::ADC_MUXPOS_AIN1,
-                "VDD / 10 against 1.024 V",
+                "VDD / 10 and ground against 1.024 V",
             ),
         ] {
             let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);

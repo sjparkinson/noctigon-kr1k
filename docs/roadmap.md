@@ -42,6 +42,7 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 - [x] Restriction lints on the library. Overflow, indexing, casts and unwraps are made explicit, and clippy denies the rest
 - [x] Hold every ADC reading through low-voltage protection and thermal regulation and check where each ends up, plus a randomised property test of `limits::Limits`
 - [x] Fault injection on the AVR32DD20 simulator, a dead ADC and a stuck switch
+- [x] A ground reading to catch a stuck ADC (H15). While the torch is awake the ADC reads its GND input four times a second, and two in a row that aren't near zero are a fault. Not at rest. On the simulator, with an ADC stuck on a good cell's reading for every input. A reading that's wrong but moving is still undetected
 - [x] A hard floor for a cell that collapses with the light on (H6). The cell is read on seven ticks in sixteen while lit, and two readings in a row under 2.80 V turn the light off at once, as a flat cell. On the simulator, with the cell falling on every tick of the ADC's round. It narrows the window and is no brown-out detector, and 2.80 V is unmeasured
 - [x] Unhandled interrupts go to `hw::halt` instead of `reti`, across the AVR32DD20's 36 vectors
 - [ ] A commit stamp in flash, just before the CRC, at the end of 32 KB

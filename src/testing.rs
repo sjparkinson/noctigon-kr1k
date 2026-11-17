@@ -24,7 +24,8 @@
 //! match its CRC. `vddio2:lost` is MVIO saying VDDIO2, the supply PC1 is on,
 //! is missing from there on, and `vddio2:back` that it's there again. Lost
 //! before anything that takes time, it's missing at power-on, which is a
-//! failed check.
+//! failed check. `adc:stuck` freezes the ADC on the cell's reading as it
+//! stands, for every channel, ground included, from there on.
 //!
 //! # docs/ui.md
 //!
@@ -70,6 +71,14 @@ pub const CALIBRATION: Calibration = Calibration {
     offset: 0x0D24,
     slope: 0x03EE,
 };
+
+/// What four accumulated conversions of the ADC's GND input read here.
+///
+/// It's 20, the most table 38-24 of DS40002413B allows for the offset error,
+/// 5 LSb a conversion. A single-ended result can't go under zero, so the
+/// worst a working ADC can be is over it, and the most the table allows is
+/// the closest that gets to `sensors::GROUND_MAX` while still being in spec.
+pub const GROUND_READING: u16 = 4 * 5;
 
 /// The accumulated reading of VDD / 10 for a cell `battery::centivolts`
 /// reports as `cell`, the closest, saturating at four full-scale conversions.
@@ -123,13 +132,14 @@ fn closest(target: u16, read: impl Fn(u16) -> u16) -> u16 {
 /// way the firmware's loop sees the real one. A conversion measures what
 /// was there when it started.
 ///
-/// `voltage` and `temperature` are the raw results [`Adc::start`] reads.
-/// Anything else that knows what each channel reads can use
+/// `voltage`, `temperature` and `ground` are the raw results [`Adc::start`]
+/// reads. Anything else that knows what each channel reads can use
 /// [`Adc::start_with`] instead.
 #[derive(Clone, Debug)]
 pub struct Adc {
     pub voltage: u16,
     pub temperature: u16,
+    pub ground: u16,
     pending: Option<u16>,
 }
 
@@ -140,13 +150,21 @@ impl Default for Adc {
 }
 
 impl Adc {
-    /// 3.8 V and 25 °C with [`CALIBRATION`].
+    /// 3.8 V, 25 °C with [`CALIBRATION`], and ground at
+    /// [`GROUND_READING`].
     pub const fn new() -> Self {
         Self {
             voltage: 6140,
             temperature: 8603,
+            ground: GROUND_READING,
             pending: None,
         }
+    }
+
+    /// Stuck on `raw` for every channel, the way an ADC whose result
+    /// register or mux has stuck reads.
+    pub const fn stuck(&mut self, raw: u16) {
+        (self.voltage, self.temperature, self.ground) = (raw, raw, raw);
     }
 
     /// The result of the conversion started last tick, if there was one.
@@ -157,10 +175,11 @@ impl Adc {
     /// Starts `convert`, if there is one, reading `voltage` or
     /// `temperature`.
     pub fn start(&mut self, convert: Option<Convert>) {
-        let (voltage, temperature) = (self.voltage, self.temperature);
+        let (voltage, temperature, ground) = (self.voltage, self.temperature, self.ground);
         self.start_with(convert, |channel| match channel {
             Channel::Voltage => voltage,
             Channel::Temperature => temperature,
+            Channel::Ground => ground,
         });
     }
 
@@ -200,6 +219,9 @@ pub enum Action {
     CorruptFlash,
     /// The power-on checks fail. Power-on only.
     Fault,
+    /// The ADC sticks on the cell's reading as it is now, for every channel
+    /// and for good.
+    AdcStuck,
 }
 
 impl Action {
@@ -263,13 +285,16 @@ impl FromStr for Action {
     type Err = Error;
 
     /// `3C`, `2H`, `1H:500ms`, `wait:2s`, `cell:2.95V`, `heat:80C`,
-    /// `vddio2:lost`, `vddio2:back`, `fault` or `flash:corrupt`.
+    /// `vddio2:lost`, `vddio2:back`, `fault`, `flash:corrupt` or `adc:stuck`.
     fn from_str(word: &str) -> Result<Self, Error> {
         if word == "fault" {
             return Ok(Self::Fault);
         }
         if word == "flash:corrupt" {
             return Ok(Self::CorruptFlash);
+        }
+        if word == "adc:stuck" {
+            return Ok(Self::AdcStuck);
         }
         if let Some(supply) = word.strip_prefix("vddio2:") {
             return match supply {
@@ -405,6 +430,10 @@ pub struct Scene {
     pub adc_dead: bool,
     /// Whether MVIO says VDDIO2, the supply PC1 is on, is there.
     pub vddio2: bool,
+    /// The ADC's stuck on this raw reading for every channel, ground
+    /// included, whatever the cell does. `adc:stuck` sets it to the cell's
+    /// reading as it stands.
+    pub adc_stuck: Option<u16>,
 }
 
 impl Scene {
@@ -416,6 +445,7 @@ impl Scene {
         corrupt_flash: false,
         adc_dead: false,
         vddio2: true,
+        adc_stuck: None,
     };
 
     /// What the power-on checks find, with `fault` standing for a fuse that
@@ -431,9 +461,13 @@ impl Scene {
 
     /// The raw reading a conversion on `channel` gives.
     pub fn reading(&self, channel: Channel) -> u16 {
+        if let Some(raw) = self.adc_stuck {
+            return raw;
+        }
         match channel {
             Channel::Voltage => voltage_reading(self.cell),
             Channel::Temperature => temperature_reading(self.kelvin),
+            Channel::Ground => GROUND_READING,
         }
     }
 }
@@ -477,6 +511,10 @@ pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item 
             }
             Action::Fault => {
                 scene.fault = true;
+                (0, 0, 0)
+            }
+            Action::AdcStuck => {
+                scene.adc_stuck = Some(voltage_reading(scene.cell));
                 (0, 0, 0)
             }
         };
@@ -1060,6 +1098,7 @@ mod tests {
             corrupt_flash: false,
             adc_dead: false,
             vddio2: true,
+            adc_stuck: None,
         };
         let mut samples = samples(script).peekable();
         assert!(samples.peek().is_some());

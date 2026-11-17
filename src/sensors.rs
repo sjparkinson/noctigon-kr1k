@@ -41,9 +41,25 @@
 //! to the temperature. So with the light on the cell goes unread for ten
 //! ticks in every sixteen, 156 ms.
 //!
-//! The ADC's only set up when the channel changes. While a click's being
-//! counted with the light off it reads nothing but the voltage, so after the
-//! first round it skips the setup and goes straight to converting.
+//! After the temperature's turn, lit or not, comes ground's, a check on the
+//! ADC itself ([`Ground`]).
+//!
+//! ```text
+//! tick 11  set the ADC up for ground against 1.024 V, start a conversion
+//! tick 12  throw that result away, start another
+//! tick 13  that result is ground, which reads near zero on a working ADC
+//! ```
+//!
+//! Ticks 14 and 15 start nothing. Ground's turn only comes round while the
+//! torch is awake that long, which is while the light's on or a press is
+//! being counted. A check of the cell at rest is ticks 0 to 2 and then rests
+//! again (`torch::Torch`), so it never gets to tick 11, and that's on
+//! purpose. Garbage at rest is never a fault (docs/ui.md), so a ground
+//! reading there would have nothing to feed, and it would keep the chip
+//! awake three ticks longer every five minutes.
+//!
+//! The ADC's set up whenever the channel changes, which is at the start of
+//! every turn now ground has one, voltage included.
 //!
 //! A conversion takes a fraction of a millisecond, so it's always done by
 //! the next tick, and nothing ever waits on the ADC.
@@ -51,11 +67,12 @@
 //! The datasheet doesn't ask for the first conversion after a switch to be
 //! thrown away. It does say the temperature sensor wants about 40 µs after
 //! MUXPOS moves to it, and a reference about 10 µs to start (DS40002413B
-//! tables 38-25 and 38-18), and the two channels use different references,
-//! 1.024 V for the cell and 2.048 V for the temperature, so both the input
-//! and the reference move at each switch. The stock firmware throws the
-//! first one away too ("first result is unstable"). It costs a tick, so it's
-//! cheap insurance.
+//! tables 38-25 and 38-18), and the channels don't all use one reference,
+//! 1.024 V for the cell and ground and 2.048 V for the temperature, so the
+//! input moves at every switch and the reference at some. It says nothing
+//! about settling after a move to GND or VDDDIV10. The stock firmware throws
+//! the first one away too ("first result is unstable"). It costs a tick, so
+//! it's cheap insurance, and every turn does it, ground's included.
 //!
 //! The temperature is only read when asked for, which the caller does while
 //! the light's on. The voltage is read until [`Schedule::rest`], since the
@@ -71,6 +88,10 @@ pub enum Channel {
     /// its factory calibration is for (DS40002413B section 33.3.3.8), four
     /// 12-bit conversions accumulated, for `temp::sixteenths`.
     Temperature,
+    /// The ADC's GND input (MUXPOS 0x40, DS40002413B section 33.5.7) against
+    /// the internal 1.024 V reference, as the voltage is, four 12-bit
+    /// conversions accumulated, for [`Ground`].
+    Ground,
 }
 
 /// A conversion for the firmware to start this tick.
@@ -94,13 +115,83 @@ pub enum Reading {
     /// [`Reading::Voltage`]s that only run while the light's on. It's for
     /// `battery::Protection::quick` and nothing else.
     Quick(u16),
+    /// Ground, for [`Ground`].
+    Ground(u16),
 }
 
-/// Ticks in a full round of both channels, and so how many apart each
+/// Ticks in a full round of every channel, and so how many apart each
 /// channel's readings come.
 pub const CYCLE_TICKS: u8 = 16;
 /// Where the temperature's turn starts in the round.
 const TEMPERATURE_AT: u8 = CYCLE_TICKS / 2;
+/// Where ground's turn starts in the round, straight after the
+/// temperature's.
+const GROUND_AT: u8 = TEMPERATURE_AT + READING_STEP + 1;
+
+const _: () = assert!(GROUND_AT + READING_STEP < CYCLE_TICKS);
+
+/// The most a ground reading may be, in counts of four accumulated 12-bit
+/// conversions, for the ADC to count as working.
+///
+/// A conversion of ground reads its offset error, which table 38-24 of
+/// DS40002413B puts at ±5 LSb (2.5 typical) with VDD and the reference both
+/// at 3.0 V. A single-ended result can't go under 0, so ground reads 0 to 20
+/// over four. The table says nothing for the 1.024 V reference this reads
+/// against, and figure 39-112 has the offset growing as the reference falls,
+/// so the limit is three times that, 64 counts, 0.4 % of full scale. That's
+/// still under a twentieth of the smallest plausible cell reading
+/// (`battery::PLAUSIBLE` starts at 1.00 V, about 1,600 counts), so an ADC
+/// that hands back the cell's reading, or anything like it, for ground is far
+/// over it. Unmeasured.
+pub const GROUND_MAX: u16 = 64;
+
+/// How many ground readings in a row over [`GROUND_MAX`] count as an ADC
+/// that's stuck, two, a round apart, a quarter of a second.
+///
+/// One that far off isn't noise, but it's one conversion, and the second
+/// costs a quarter of a second. Unmeasured.
+pub const GROUND_MISSES: u8 = 2;
+
+/// Whether the ADC still answers for the input it's asked about.
+///
+/// An ADC whose result register or input mux has stuck hands back the same
+/// reading whatever MUXPOS says. If that reading is a plausible cell, the
+/// voltage checks can't tell it from a good one, and it hides a cell that's
+/// running flat. Ground can tell, since it reads near zero on a working ADC
+/// and the cell never does. So [`GROUND_MISSES`] ground readings in a row
+/// over [`GROUND_MAX`] are an ADC the firmware can't trust, which the caller
+/// treats as a cell it can't read.
+///
+/// It catches a reading that's stuck, or one that follows the wrong input.
+/// It can't catch one that's wrong and still moving, or a reference that's
+/// drifted, since ground reads near zero against any reference.
+#[derive(Clone, Debug, Default)]
+pub struct Ground {
+    misses: u8,
+}
+
+impl Ground {
+    pub const fn new() -> Self {
+        Self { misses: 0 }
+    }
+
+    /// One ground reading, raw. Returns whether the ADC's stuck. A missing
+    /// result reads as zero and passes, since a dead ADC is the voltage's to
+    /// catch.
+    pub const fn reading(&mut self, raw: u16) -> bool {
+        if raw <= GROUND_MAX {
+            self.misses = 0;
+            return false;
+        }
+        self.misses = self.misses.saturating_add(1);
+        self.misses >= GROUND_MISSES
+    }
+
+    /// Nothing measured for a tick, so the count starts again.
+    pub const fn rest(&mut self) {
+        self.misses = 0;
+    }
+}
 /// The step of a turn whose result is its reading, after the set-up and the
 /// throwaway.
 const READING_STEP: u8 = 2;
@@ -163,9 +254,13 @@ impl Schedule {
         // this tick belongs to.
         let quick = self.quick.then_some(Reading::Quick(raw));
         self.quick = false;
-        let (channel, step) = match phase.checked_sub(TEMPERATURE_AT) {
-            None => (Channel::Voltage, phase),
-            Some(step) => (Channel::Temperature, step),
+        let (channel, step) = match (
+            phase.checked_sub(GROUND_AT),
+            phase.checked_sub(TEMPERATURE_AT),
+        ) {
+            (Some(step), _) => (Channel::Ground, step),
+            (None, Some(step)) => (Channel::Temperature, step),
+            (None, None) => (Channel::Voltage, phase),
         };
         if step == 0 && channel == Channel::Temperature {
             self.temperature = lit;
@@ -185,6 +280,7 @@ impl Schedule {
                 let reading = match channel {
                     Channel::Voltage => Reading::Voltage(raw),
                     Channel::Temperature => Reading::Temperature(raw),
+                    Channel::Ground => Reading::Ground(raw),
                 };
                 (Some(reading), None)
             }
@@ -223,19 +319,48 @@ mod tests {
         Some(Convert { channel, setup })
     }
 
-    /// A round with the light off, the voltage alone, as a press reads it.
+    /// A round with the light off, the voltage then ground, as a press reads
+    /// it.
     fn dark_round() -> [(Option<Reading>, Option<Convert>); 16] {
         let mut expected = [(None, None); 16];
         expected[0].1 = convert(Channel::Voltage, true);
         expected[1].1 = convert(Channel::Voltage, false);
         expected[2].0 = Some(Reading::Voltage(7));
+        expected[11].1 = convert(Channel::Ground, true);
+        expected[12].1 = convert(Channel::Ground, false);
+        expected[13].0 = Some(Reading::Ground(7));
         expected
     }
 
     #[test]
-    fn dark_it_reads_the_voltage_and_nothing_else() {
+    fn dark_it_reads_the_voltage_then_ground() {
         let mut schedule = Schedule::new();
         assert_eq!(run(&mut schedule, 16, Some(7), false), dark_round());
+    }
+
+    /// A check of the cell at rest is the first three ticks of a round and
+    /// a rest, so it never gets to ground's turn.
+    #[test]
+    fn a_check_at_rest_reads_no_ground() {
+        let mut schedule = Schedule::new();
+        for _ in 0..10 {
+            let ticks = run(&mut schedule, 3, Some(7), false);
+            assert_eq!(ticks[..], dark_round()[..3]);
+            schedule.rest();
+        }
+    }
+
+    #[test]
+    fn ground_reads_against_the_voltages_reference_and_is_set_up_every_time() {
+        for lit in [false, true] {
+            let mut schedule = Schedule::new();
+            let ticks = run(&mut schedule, 64, Some(7), lit);
+            for round in ticks.chunks(16) {
+                assert_eq!(round[11].1, convert(Channel::Ground, true), "lit: {lit}");
+                // And the voltage after it.
+                assert_eq!(round[0].1, convert(Channel::Voltage, true), "lit: {lit}");
+            }
+        }
     }
 
     #[test]
@@ -277,6 +402,11 @@ mod tests {
             assert_eq!(
                 due(|r| matches!(r, Reading::Voltage(_))),
                 every_16_from(2),
+                "lit: {lit}"
+            );
+            assert_eq!(
+                due(|r| matches!(r, Reading::Ground(_))),
+                every_16_from(13),
                 "lit: {lit}"
             );
             let temperatures = due(|r| matches!(r, Reading::Temperature(_)));
@@ -321,7 +451,7 @@ mod tests {
                 "out at {out_at}"
             );
             let rest = run(&mut schedule, 15 - out_at, Some(7), false);
-            assert!(rest.iter().all(|&tick| tick == (None, None)), "{out_at}");
+            assert_eq!(rest[..], dark_round()[out_at + 1..], "{out_at}");
         }
     }
 
@@ -341,7 +471,7 @@ mod tests {
         let mut schedule = Schedule::new();
         run(&mut schedule, 9, Some(7), false);
         let late = run(&mut schedule, 7, Some(7), true);
-        assert!(late.iter().all(|&tick| tick == (None, None)));
+        assert_eq!(late[..], dark_round()[9..]);
     }
 
     #[test]
@@ -360,7 +490,7 @@ mod tests {
         let mut schedule = Schedule::new();
         for (reading, convert) in run(&mut schedule, 160, Some(1), false) {
             assert!(!matches!(reading, Some(Reading::Temperature(_))));
-            assert!(convert.is_none_or(|c| c.channel == Channel::Voltage));
+            assert!(convert.is_none_or(|c| c.channel != Channel::Temperature));
         }
     }
 
@@ -388,7 +518,7 @@ mod tests {
     }
 
     #[test]
-    fn only_sets_the_adc_up_when_the_channel_changes() {
+    fn sets_the_adc_up_at_the_start_of_every_turn() {
         let mut schedule = Schedule::new();
         let setups = |ticks: &[(Option<Reading>, Option<Convert>)]| -> Vec<Channel> {
             ticks
@@ -396,19 +526,13 @@ mod tests {
                 .filter_map(|(_, convert)| convert.filter(|c| c.setup).map(|c| c.channel))
                 .collect()
         };
-        // Off, so the first voltage turn sets up and the rest don't.
+        // Off, the voltage then ground, each set up every round.
         let off = run(&mut schedule, 64, Some(1), false);
-        assert_eq!(off[0].1, convert(Channel::Voltage, true));
-        assert_eq!(off[16].1, convert(Channel::Voltage, false));
-        assert_eq!(setups(&off), [Channel::Voltage]);
-        // On, so every turn switches channel and every turn sets up.
+        assert_eq!(setups(&off), [Channel::Voltage, Channel::Ground].repeat(4));
+        // On, the temperature between them.
         let on = run(&mut schedule, 64, Some(1), true);
-        let alternating = [Channel::Temperature, Channel::Voltage].repeat(4);
-        assert_eq!(setups(&on)[..], alternating[..7]);
-        // Off again, so the voltage turn after the last temperature one sets
-        // up, and that's all.
-        let off = run(&mut schedule, 64, Some(1), false);
-        assert_eq!(setups(&off), [Channel::Voltage]);
+        let round = [Channel::Voltage, Channel::Temperature, Channel::Ground];
+        assert_eq!(setups(&on), round.repeat(4));
     }
 
     #[test]
@@ -432,8 +556,8 @@ mod tests {
         let mut readings = Vec::new();
         for tick in 0..160 {
             let phase = tick % 16;
-            // A result on every tick except the two turns' due ones.
-            let result = (phase != 2 && phase != 10).then_some(0x155);
+            // A result on every tick except the three turns' due ones.
+            let result = (![2, 10, 13].contains(&phase)).then_some(0x155);
             let (reading, _) = schedule.tick(result, true);
             readings.push((phase, reading));
         }
@@ -443,23 +567,72 @@ mod tests {
                 // Asked for, a conversion a tick while the light's on.
                 3..=8 => assert_eq!(reading, Some(Reading::Quick(0x155))),
                 10 => assert_eq!(reading, Some(Reading::Temperature(0))),
+                13 => assert_eq!(reading, Some(Reading::Ground(0))),
                 _ => assert_eq!(reading, None, "phase {phase}"),
             }
         }
-        // And with the light off, nothing but the voltage is asked for, so
-        // every other tick's result is ignored, the temperature's due tick
-        // included.
+        // And with the light off, nothing but the voltage and ground is
+        // asked for, so every other tick's result is ignored, the
+        // temperature's due tick included.
         let mut schedule = Schedule::new();
         for tick in 0..160 {
             let (reading, convert) = schedule.tick(Some(0x155), false);
             match tick % 16 {
                 2 => assert_eq!(reading, Some(Reading::Voltage(0x155))),
+                13 => assert_eq!(reading, Some(Reading::Ground(0x155))),
                 phase => assert_eq!(reading, None, "phase {phase}"),
             }
-            if tick % 16 >= 2 {
+            if (2..11).contains(&(tick % 16)) || tick % 16 >= 13 {
                 assert_eq!(convert, None, "tick {tick}");
             }
         }
+    }
+
+    #[test]
+    fn ground_near_zero_is_a_working_adc() {
+        let mut ground = Ground::new();
+        for raw in 0..=GROUND_MAX {
+            for _ in 0..10 {
+                assert!(!ground.reading(raw), "{raw}");
+            }
+        }
+    }
+
+    #[test]
+    fn two_ground_readings_in_a_row_well_off_zero_are_a_stuck_adc() {
+        assert_eq!((GROUND_MAX, GROUND_MISSES), (64, 2));
+        // Just over, the cell's own reading, full scale and more.
+        for raw in [GROUND_MAX + 1, 6140, 4 * 4095, u16::MAX] {
+            let mut ground = Ground::new();
+            assert!(!ground.reading(raw), "{raw}: one");
+            assert!(ground.reading(raw), "{raw}: two");
+        }
+    }
+
+    #[test]
+    fn a_good_ground_reading_or_a_rest_starts_the_count_again() {
+        let mut ground = Ground::new();
+        for _ in 0..100 {
+            assert!(!ground.reading(6140));
+            assert!(!ground.reading(GROUND_MAX));
+        }
+        for _ in 0..100 {
+            assert!(!ground.reading(6140));
+            ground.rest();
+        }
+        // And a missing result, which reads as zero, passes.
+        assert!(!ground.reading(6140));
+        assert!(!ground.reading(0));
+    }
+
+    /// The smallest plausible cell reading is far over ground's limit, so an
+    /// ADC that answers ground with anything a cell could read is caught.
+    #[test]
+    fn every_plausible_cell_reading_is_far_over_grounds_limit() {
+        let smallest = (0..=4 * 4095)
+            .find(|&raw| crate::battery::plausible(crate::battery::centivolts(raw)))
+            .unwrap();
+        assert!(smallest > 20 * GROUND_MAX, "{smallest}");
     }
 
     #[test]
@@ -469,5 +642,6 @@ mod tests {
         assert_eq!(ticks[2].0, Some(Reading::Voltage(0)));
         assert_eq!(ticks[5].0, Some(Reading::Quick(0)));
         assert_eq!(ticks[10].0, Some(Reading::Temperature(0)));
+        assert_eq!(ticks[13].0, Some(Reading::Ground(0)));
     }
 }

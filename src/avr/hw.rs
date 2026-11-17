@@ -538,12 +538,14 @@ pub extern "avr-interrupt" fn portd_port() {
 /// Points the ADC at `channel`, with that channel's reference, turning it on
 /// if a rest turned it off. The cell's VDD / 10 reads against 1.024 V, as
 /// the stock firmware has it, and the temperature sensor against 2.048 V,
-/// which its factory calibration is for (section 33.3.3.8). The reference
-/// starts when the ADC asks for it, in about 10 µs (table 38-18).
+/// which its factory calibration is for (section 33.3.3.8). Ground, the
+/// check on the ADC itself, reads against 1.024 V like the cell. The
+/// reference starts when the ADC asks for it, in about 10 µs (table 38-18).
 fn adc_channel(channel: Channel) {
     let (reference, muxpos) = match channel {
         Channel::Voltage => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),
         Channel::Temperature => (regs::VREF_REFSEL_2V048, regs::ADC_MUXPOS_TEMPSENSE),
+        Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_GND),
     };
     write(reg::VREF_ADC0REF, reference);
     write(reg::ADC0_MUXPOS, muxpos);
