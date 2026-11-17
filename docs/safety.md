@@ -57,7 +57,7 @@ Nothing is past the simulator today. Results from the TS26 and its breakout are 
 
 **Mitigation.** `hw::start_watchdog` sets a 32-clock window and `watchdog::Feeder` says which passes feed it. A tick that stops while the light's on has its own deadline. TCB0 runs off the 4 MHz main clock in periodic interrupt mode while PC1 is high, flagging every 1 ms (`watchdog::TIMER_PERIOD_CLOCKS`), and `hw::wait_for_tick` counts those flags, not wake-ups, so a bouncing switch can't use it up. After `watchdog::TICK_DEADLINE_PERIODS` (104) with no tick, 103 to 104 ms, `main` calls `hw::halt`, which turns the light off and powers down for good. The next boot after a bite is a fault and won't light (`selftest::hung`).
 
-**Evidence.** Host tests in src/watchdog.rs for the feeding pattern, the window and the deadline's sums. On the simulator, `oscillator_stops` and `slow_ticks` in xtask/src/sim.rs, and the `no-tick-deadline`, `watchdog-never-fed` and `watchdog-fed-every-tick` breakages.
+**Evidence.** Host tests in src/watchdog.rs for the feeding pattern, the window and the deadline's sums. On the simulator, `oscillator_stops` and `slow_ticks` in xtask/src/sim.rs, and the `no-tick-deadline`, `watchdog-never-fed` and `watchdog-fed-every-tick` breakages. On this torch, a night off with the cell in didn't bite, since 1C lit the next morning (breakout.md 4.7 and 6.2). That's the resting side only, nothing about the deadline with the light on.
 
 **Status.** Simulator. It stops the 32 kHz oscillator with the light on, and PC1 has to drop within the deadline and the chip stop in power-down. It also runs every tick as slow as the oscillators' limits allow, which mustn't trip it.
 

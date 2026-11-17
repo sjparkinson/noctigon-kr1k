@@ -124,7 +124,7 @@ Write the result in the [table](#results) before going on.
 | 4.4 | Pass | 1C on, 1C off, a few dozen times, then holds | Same feel as the docs/ui.md rows | |
 | 4.5 | | Tail current, off, on the 4 A range | 0.000 to 0.003 once it's asleep. Anything steadily over about 5 mA isn't a sleeping chip, or it's a reset loop | The rough version of the off current |
 | 4.6 | | An hour on at a low level, in sight | Stays on and doesn't move. Going out is the watchdog biting or the tick deadline | "It never trips in normal use", in part |
-| 4.7 | | Leave it off overnight, then 1C | Comes on at once | |
+| 4.7 | Pass | Leave it off overnight, then 1C | Comes on at once | |
 
 ## Stage 5, the ramp
 
@@ -144,7 +144,7 @@ Short bursts at high levels, and the meter comes out at 3 A.
 | # | Status | Do | Needs | Expect | Closes |
 |---|---|---|---|---|---|
 | 6.1 | | 1C right after a flash | Main | Lights. A fault at power-on (flash CRC, fuses, a watchdog reset) keeps it dark. Suspect, in order, a bite (a cell swap clears it), then `xtask/src/crc.rs`, then the fuse check | The CRC, the fuse check |
-| 6.2 | | Leave it off for an hour, then 1C | Main | Lights. Dark means the watchdog bit while it rested | That a resting torch doesn't bite |
+| 6.2 | Pass | Leave it off for an hour, then 1C | Main | Lights. Dark means the watchdog bit while it rested | That a resting torch doesn't bite |
 | 6.3 | | T4, power-down straight after a feed, left overnight. Then 1C, and tail current off | T4 | Lit on 1C, and 0.000 to 0.003 A. Steady mA means it's resetting over and over | "Test power-down straight after a feed" |
 
 ## Stage 7, voltage and heat
@@ -206,3 +206,4 @@ Fill this in as you go, with the commit you flashed.
 | 4.3, 4.4 | 2026-11-16 | `910c667` | Cell in and head on, then clicks and holds. Reported as all good, the light off until clicked and the UI as docs/ui.md has it. The counts weren't recorded |
 | 4.1 peek | 2026-11-16 | `910c667` | `cargo xtask peek` with the full firmware resting, cell out, on the kit's power. PC1 an output held low, DAC0 enabled at 0 on 1.024 V, `VPORTA.DIR` 0xF2 with OUT 0, PD4 high, 4 MHz with no prescaler or autotune, `WDT.CTRLA` 0x33, PIT at CYC512 and on, TCB0 stopped with CCMP low byte 0x9F, SREG.I set, SP 0x7F81 (about 126 bytes of stack), `MVIO.STATUS` 0x01, `RSTFR` cleared. All as the code intends at rest |
 | Aux | 2026-11-16 | `c4f9cd4` | Flashed the firmware with the AW2016 driver, verified, `ping` answered. Cell in, the aux glowed dim blue when off, went bright red on 3C, and went dark while lit. Reported as looking good. Yellow and white not seen |
+| 4.7, 6.2 | 2026-11-17 | `c4f9cd4` | Left off overnight with the cell in, then 1C in the morning. Lit at once and worked as expected, so the watchdog didn't bite while it rested. Reported as no issues. Tail current wasn't measured |
