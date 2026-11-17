@@ -166,7 +166,7 @@ impl Aw2016 {
             (r, g, b) => {
                 return Err(format!(
                     "the AW2016 lights red {r}, green {g} and blue {b}, which is no colour \
-                     docs/ui.md has"
+                     the UI has"
                 ));
             }
         };
@@ -370,7 +370,7 @@ impl Twi {
                         if pc1_high && self.aw2016.lit() && !was_lit {
                             return Err(
                                 "lights the aux with PC1 high: they're out while the main \
-                                 LED's lit (docs/ui.md)"
+                                 LED's lit"
                                     .into(),
                             );
                         }

@@ -352,9 +352,8 @@ impl Aw2016 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{Rig, examples};
+    use crate::testing::{EXAMPLES, Rig};
 
-    const UI_MD: &str = include_str!("../docs/ui.md");
     const COLOURS: [Aux; 5] = [Aux::Off, Aux::Blue, Aux::Red, Aux::Yellow, Aux::White];
 
     /// A fake AW2016's registers, from 0x00 to 0x3F, written as the
@@ -617,9 +616,8 @@ mod tests {
     /// whatever shows matches what the torch wants within two ticks of it
     /// changing.
     #[test]
-    fn through_every_ui_md_example_the_aux_are_dark_while_lit_and_catch_up() {
-        for example in examples(UI_MD) {
-            let example = example.unwrap();
+    fn through_every_example_the_aux_are_dark_while_lit_and_catch_up() {
+        for example in EXAMPLES {
             let mut rig = Rig::default();
             let mut aw = Aw2016::new();
             let mut chip = Chip::new();
@@ -632,16 +630,16 @@ mod tests {
                 }
                 let lit = chip.lit().0 != [Level::OFF; 3];
                 if rig.torch.output().enable {
-                    assert!(!lit, "{}: aux lit with the light on", example.row);
+                    assert!(!lit, "{}: aux lit with the light on", example.name);
                 }
                 let mut fresh = Chip::new();
                 settle(&mut Aw2016::new(), &mut fresh, want);
                 if chip.lit() == fresh.lit() || !lit && want == Aux::Off {
                     behind = 0;
                 } else {
-                    assert!(!lit, "{}: the wrong colour", example.row);
+                    assert!(!lit, "{}: the wrong colour", example.name);
                     behind += 1;
-                    assert!(behind <= 2, "{}: {want:?} never shows", example.row);
+                    assert!(behind <= 2, "{}: {want:?} never shows", example.name);
                 }
             }
         }
