@@ -2,7 +2,7 @@
 //! `kr1k::testing`'s `Rig` sees too, plus the fuse bytes, which only the
 //! firmware reads.
 
-use kr1k::regs::addr as reg;
+use kr1k::regs::{FUSE_MVSYSCFG, FUSE_MVSYSCFG_SINGLE, addr as reg};
 use kr1k::selftest::{Faults, Fuses};
 use kr1k::sensors::Channel;
 use kr1k::testing::Scene;
@@ -88,8 +88,18 @@ impl World {
         Faults {
             fuses: !fuses.ok(),
             flash: self.scene.corrupt_flash,
+            supply: !self.vddio2s(),
             ..Faults::NONE
         }
+    }
+
+    /// What MVIO.STATUS.VDDIO2S reads. With the dual-supply fuse it's whether
+    /// VDDIO2 is there. With the single-supply one it always reads 1
+    /// (DS40002413B section 19.3.1), whatever VDDIO2 is doing, so the
+    /// firmware can't see it go.
+    pub fn vddio2s(&self) -> bool {
+        let supply = self.fuse(reg::FUSE_SYSCFG1).unwrap_or(0xFF) & FUSE_MVSYSCFG;
+        supply == FUSE_MVSYSCFG_SINGLE || self.scene.vddio2
     }
 }
 
@@ -128,10 +138,26 @@ mod tests {
             fault: true,
             corrupt_flash: true,
             adc_dead: true,
+            vddio2: false,
         };
         let world = World::from(scene);
         assert_eq!(world.scene, scene);
         assert_eq!(world.faults(), scene.faults());
+        assert!(world.faults().supply);
+    }
+
+    #[test]
+    fn vddio2s_follows_vddio2_with_dual_supply_and_reads_1_with_single() {
+        const SYSCFG1: usize = reg::FUSE_SYSCFG1 - reg::FUSE_WDTCFG;
+        let mut world = World::NORMAL;
+        assert!(world.vddio2s());
+        assert!(!world.faults().supply);
+        world.scene.vddio2 = false;
+        assert!(!world.vddio2s());
+        assert!(world.faults().supply);
+        world.fuses[SYSCFG1] = FUSE_MVSYSCFG_SINGLE;
+        assert!(world.vddio2s(), "single supply never says it's gone");
+        assert!(!world.faults().supply);
     }
 
     #[test]

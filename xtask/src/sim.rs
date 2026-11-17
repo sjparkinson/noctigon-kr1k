@@ -91,7 +91,10 @@
 //! - The fuses read as the world's, and writing any of them is an error.
 //!   SIGROW.TEMPSENSE0 and 1 hold `world::CALIBRATION`. MVIO.STATUS.VDDIO2S
 //!   reads 1 with single supply (§19.3.1), and otherwise says whether the run
-//!   has VDDIO2.
+//!   has VDDIO2. When VDDIO2 comes back the MVIO pins reload PORT
+//!   (§19.3.2.1), so PC1 rises then if PORTC has it set, and that's held to
+//!   every rule a rise is. The datasheet gives no VDDIO2S threshold and no
+//!   delay either way, so both are taken as at once.
 //!
 //! # The board
 //!
@@ -127,6 +130,10 @@
 //!   and UPDI) is ever written.
 //! - The aux are never lit while PC1 is high. An AW2016 write that lights
 //!   one with PC1 high is refused, and so is PC1 rising with one lit.
+//! - Without VDDIO2, PC1 is tri-stated, and what the driver's enable does
+//!   then isn't modelled. A pass that took its tick with VDDIO2S already
+//!   clear leaves PC1 clear in PORTC, DAC0 at 0 against 1.024 V and the
+//!   paths low before it sleeps (`Chip::dark_without_vddio2`).
 //! - TCB0, the tick deadline's timer, runs exactly while PC1 is high,
 //!   checked at every `sleep`. Power-down wants PC1 low and TCB0 stopped.
 //! - With the light on and no tick, `hw::wait_for_tick` gives up after
@@ -157,7 +164,9 @@
 //!    later, when the light has to be off (`adc_never_answers`). Twenty
 //!    thousand ticks with the switch held down from the first
 //!    (`switch_stuck`). VDDIO2 missing, so the light never comes on
-//!    (`vddio2_missing`). The AW2016 never answering, SDA held low and SCL
+//!    (`vddio2_missing`), and VDDIO2 going at the top of the ramp, straight
+//!    after the firmware's look, so the light has to be off a tick and a pass
+//!    later and stay off (`vddio2_drops`). The AW2016 never answering, SDA held low and SCL
 //!    held low (`bad_bus`).
 //! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
 //! 7. Twenty thousand ticks of random clicks and holds.
@@ -191,7 +200,6 @@ use std::thread;
 use kr1k::TICKS_PER_SECOND;
 use kr1k::board;
 use kr1k::ramp::{Output, Vref};
-use kr1k::selftest::Faults;
 use kr1k::sensors::Channel;
 use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
 use kr1k::ui::Aux;
@@ -216,10 +224,9 @@ use kr1k::regs::{
     self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10, ADC_PRESC,
     ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN, ADC_SAMPNUM, ADC_SAMPNUM_ACC4,
     ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, CRCSCAN_SRC_FLASH, DAC_ENABLE, DAC_OUTEN,
-    FUSE_MVSYSCFG, FUSE_MVSYSCFG_SINGLE, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN,
-    RSTCTRL_PORF, RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE,
-    VREF_REFSEL_1V024, VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY,
-    WDT_WINDOW, addr as reg,
+    MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN, RSTCTRL_PORF, RTC_CTRLBUSY, RTC_PI,
+    RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE, VREF_REFSEL_1V024, VREF_REFSEL_2V048,
+    VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY, WDT_WINDOW, addr as reg,
 };
 
 const CCP_IOREG: u8 = regs::CPU_CCP_IOREG;
@@ -492,10 +499,13 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
-    let bus_faults: [(FaultCheck, &str); 3] = [
+    // VDDIO2 going while lit comes last too, since it holds the switch down
+    // with the light on.
+    let late_faults: [(FaultCheck, &str); 4] = [
         (aw2016_absent, "with the AW2016 never answering"),
         (sda_held_low, "with SDA held low"),
         (scl_held_low, "with SCL held low"),
+        (vddio2_drops, "with VDDIO2 going while lit"),
     ];
     let power_on = &power_on;
     let reports: Vec<Result<Report, String>> = thread::scope(|scope| {
@@ -514,11 +524,11 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
             .chain([None])
             .map(|example| scope.spawn(move || both_ways(power_on, example)))
             .collect();
-        let bus_faults = bus_faults.map(spawn);
+        let late_faults = late_faults.map(spawn);
         faults
             .into_iter()
             .chain(runs)
-            .chain(bus_faults)
+            .chain(late_faults)
             .map(|run| run.join().unwrap_or_else(|_| Err("a run panicked".into())))
             .collect()
     });
@@ -733,17 +743,22 @@ fn switch_stuck(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// MVIO says VDDIO2 isn't there, so PORTC's pins, PC1 among them, are
-/// tri-stated whatever PORT says (§19.3.2.1), and come back with whatever
-/// PORT holds if VDDIO2 does. The firmware has to treat it as a fault and
-/// keep PC1 low, through a click and a hold, in step with a library that's
-/// told the same.
+/// MVIO says VDDIO2 isn't there, from power-on, so PORTC's pins, PC1 among
+/// them, are tri-stated whatever PORT says (§19.3.2.1), and come back with
+/// whatever PORT holds if VDDIO2 does. The firmware has to treat it as a
+/// fault and keep PC1 low, through a click and a hold, in step with a
+/// library that's told the same.
+///
+/// It starts with a second at rest. A firmware that let the power-on check
+/// go would still find VDDIO2 missing on its first pass, now that every
+/// waking pass looks, and never light. But it would be a torch with nothing
+/// wrong for that one pass, awake to read its cell, where one that failed
+/// the check powers down from the first tick, and the rest is where that
+/// shows.
 fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
-    sim.chip.vddio2 = false;
-    if sim.chip.vddio2_ok() {
-        return Err("the fuses have single supply, so VDDIO2S reads 1 regardless".into());
-    }
     let script = [
+        Action::Vddio2(false),
+        Action::Wait(TICKS_PER_SECOND),
         Action::Clicks(1),
         Action::Wait(TICKS_PER_SECOND),
         Action::Hold {
@@ -753,8 +768,68 @@ fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         Action::Wait(TICKS_PER_SECOND),
     ];
     let end = in_step(&mut sim, testing::samples(script), report)?;
+    if sim.chip.vddio2_ok() {
+        return Err("the fuses have single supply, so VDDIO2S reads 1 regardless".into());
+    }
     if end != Some(0) {
         return Err(format!("ends at level {end:?}, not off"));
+    }
+    if sim.chip.pc1_rises != 0 {
+        return Err("raised PC1 with VDDIO2 missing from power-on".into());
+    }
+    Ok(())
+}
+
+/// VDDIO2 goes with the light on, at the top of the ramp, so all three paths
+/// are up and DAC0 is near the top of its range. It goes at the worst moment
+/// for a firmware that looks once a pass, straight after this pass's look
+/// (`Chip::vddio2_goes`), so it's a whole tick before anything can see it.
+/// The pass that takes the next tick has to leave PC1 clear in PORTC, DAC0
+/// at 0 against 1.024 V and the paths low before it sleeps
+/// (`Chip::dark_without_vddio2`), which is a tick and a pass after it went.
+///
+/// Then it has to stay off, in step with the library, through a click and a
+/// hold with VDDIO2 still gone, and through another click once it's back,
+/// when PC1 would rise again if PORTC still had it set (§19.3.2.1). The
+/// library has the aux white after each press, and the AW2016 is held to it.
+///
+/// Dips shorter than a tick aren't run. A firmware that looks once a pass
+/// can miss one whole, and the chip would then put PC1 back up with DAC0
+/// live, which `Chip::vddio2_moved` refuses, so such a run could only fail.
+/// docs/safety.md has that under H1's what's left.
+fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
+    sim.chip.late_vddio2 = true;
+    let second = TICKS_PER_SECOND;
+    let script = [
+        Action::Clicks(1),
+        Action::Hold {
+            clicks: 0,
+            ticks: 3 * second,
+        },
+        Action::Vddio2(false),
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Hold {
+            clicks: 0,
+            ticks: second,
+        },
+        Action::Vddio2(true),
+        Action::Wait(second),
+        Action::Clicks(1),
+        Action::Wait(second),
+    ];
+    let end = in_step(&mut sim, testing::samples(script), report)?;
+    if !sim.chip.lost_lit {
+        return Err("VDDIO2 never went with the light on, so this checked nothing".into());
+    }
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    if sim.chip.pc1_rises != 1 {
+        return Err(format!(
+            "PC1 rose {} times, not just the once before VDDIO2 went",
+            sim.chip.pc1_rises
+        ));
     }
     Ok(())
 }
@@ -994,7 +1069,7 @@ fn in_step(
     // powers up in is the first sample's.
     let mut samples = samples.into_iter().peekable();
     let power_on = World::from(samples.peek().map_or(Scene::NORMAL, |s| s.scene));
-    sim.chip.world = power_on;
+    sim.chip.set_world(power_on)?;
     if power_on.scene.corrupt_flash {
         // The checksum's high byte, which is never code, so the firmware
         // still runs however big it gets.
@@ -1012,11 +1087,7 @@ fn in_step(
     if sim.chip.wdt_open() == 0 {
         return Err("hw::start_watchdog never turned the watchdog on".into());
     }
-    let faults = Faults {
-        supply: !sim.chip.vddio2_ok(),
-        ..power_on.faults()
-    };
-    let mut rig = Rig::new(faults);
+    let mut rig = Rig::new(power_on.faults());
     let mut was_resting = false;
     let mut feeder = Feeder::new();
     let mut finished = true;
@@ -1032,7 +1103,15 @@ fn in_step(
             Landing::Until(_) => true,
             Landing::Off | Landing::Watch => false,
         };
-        sim.chip.world = World::from(sample.scene);
+        sim.chip.enter(World::from(sample.scene)).map_err(at)?;
+        // What MVIO says as the pass begins, which is what the library's
+        // told this tick. It's the scene's, but for a chip whose fuses have
+        // single supply, and for a run that takes VDDIO2 away mid-pass,
+        // after the firmware's looked (`Chip::vddio2_goes`).
+        let scene = Scene {
+            vddio2: sim.chip.vddio2_ok(),
+            ..sample.scene
+        };
         let power_downs = sim.chip.power_downs;
         let took = sim.tick(sample.pressed).map_err(at)?;
         // Interrupts landed on purpose run their handlers on top of the
@@ -1046,7 +1125,7 @@ fn in_step(
         if powered_down && was_resting {
             report.off_instructions = report.off_instructions.max(took);
         }
-        rig.tick_in(sample.pressed, &sample.scene);
+        rig.tick_in(sample.pressed, &scene);
         sim.chip.shows(rig.torch.output()).map_err(at)?;
         if !sim.chip.aux_unwired {
             aux.tick(&sim.chip.twi, rig.torch.aux()).map_err(at)?;
@@ -2203,10 +2282,23 @@ struct Chip {
     adc: Adc,
     /// RSTCTRL.RSTFR.
     rstfr: u8,
-    /// What the ADC measures, and the fuses.
+    /// What the ADC measures, whether VDDIO2 is there, and the fuses.
     world: World,
-    /// Whether VDDIO2 is there, for MVIO.STATUS with dual supply.
-    vddio2: bool,
+    /// When MVIO.STATUS.VDDIO2S last dropped, while it's still clear.
+    vddio2_lost_at: Option<u64>,
+    /// Whether the light was lit when it dropped, PC1 set in PORTC and DAC0
+    /// above 0, so a run can tell it took VDDIO2 from a lit torch.
+    lost_lit: bool,
+    /// When RTC.PITINTFLAGS.PI was last cleared, which is the firmware
+    /// taking a tick, and the start of the pass of the main loop that it
+    /// wakes.
+    tick_taken_at: u64,
+    /// Takes VDDIO2 away at the worst moment for a firmware that looks once
+    /// a pass, rather than as the tick begins (`Chip::enter`).
+    late_vddio2: bool,
+    /// VDDIO2 goes straight after the next read of MVIO.STATUS, or as the
+    /// firmware next sleeps if it gets there without looking.
+    vddio2_going: bool,
     /// A bit per vector whose interrupt is enabled.
     enabled: u64,
     /// A request `force_interrupt` put up, until the CPU takes it.
@@ -2273,7 +2365,11 @@ impl Chip {
             adc: Adc::default(),
             rstfr: RSTCTRL_PORF,
             world: World::NORMAL,
-            vddio2: true,
+            vddio2_lost_at: None,
+            lost_lit: false,
+            tick_taken_at: 0,
+            late_vddio2: false,
+            vddio2_going: false,
             enabled: 0,
             forced: None,
             in_handler: false,
@@ -2335,8 +2431,111 @@ impl Chip {
     /// MVIO.STATUS.VDDIO2S. It reads 1 with single supply, since PORTC is on
     /// VDD then (§19.3.1).
     fn vddio2_ok(&self) -> bool {
-        let syscfg1 = self.world.fuse(reg::FUSE_SYSCFG1).unwrap_or(0xFF);
-        syscfg1 & FUSE_MVSYSCFG == FUSE_MVSYSCFG_SINGLE || self.vddio2
+        self.world.vddio2s()
+    }
+
+    /// Puts the chip in `world`, which a run does between passes. A change
+    /// of VDDIO2 is the only part of it the chip has to act on.
+    fn set_world(&mut self, world: World) -> Result<(), String> {
+        let was = self.vddio2_ok();
+        self.world = world;
+        self.vddio2_moved(was)
+    }
+
+    /// Takes VDDIO2 away, or brings it back, now.
+    fn set_vddio2(&mut self, there: bool) -> Result<(), String> {
+        let was = self.vddio2_ok();
+        self.world.scene.vddio2 = there;
+        self.vddio2_moved(was)
+    }
+
+    /// `set_world` as a tick begins. With `late_vddio2`, a world that takes
+    /// VDDIO2 away keeps it for now and arms `vddio2_goes` instead.
+    fn enter(&mut self, mut world: World) -> Result<(), String> {
+        if self.late_vddio2 && self.world.scene.vddio2 && !world.scene.vddio2 {
+            world.scene.vddio2 = true;
+            self.vddio2_going = true;
+        }
+        self.set_world(world)
+    }
+
+    /// Takes VDDIO2 away if `enter` armed it. The chip calls this straight
+    /// after a read of MVIO.STATUS, which has already had its answer, and as
+    /// the firmware sleeps. For a firmware that looks once a pass that's the
+    /// longest it can go unseen, a whole tick and the pass that then finds
+    /// it. For one that never looks it's the end of the pass, and nothing
+    /// finds it. A firmware that looked more than once a pass would see this
+    /// sooner than `in_step` tells the library, and this would need another
+    /// way of choosing its moment.
+    fn vddio2_goes(&mut self) -> Result<(), String> {
+        if !self.vddio2_going {
+            return Ok(());
+        }
+        self.vddio2_going = false;
+        self.set_vddio2(false)
+    }
+
+    /// MVIO.STATUS.VDDIO2S has just changed, if `was` isn't what it reads
+    /// now. Without VDDIO2 the MVIO pins are tri-stated, and when it comes
+    /// back they "reload the current configuration of the PORT registers"
+    /// (§19.3.2.1). So if PORTC still has PC1 high then, PC1 rises there and
+    /// then, and it's held to everything a rise is. The datasheet gives no
+    /// delay for either, so both are taken as at once.
+    ///
+    /// Nothing here says what the driver's enable does while PC1 is
+    /// tri-stated. That's the board's, and nobody knows it. The worst case
+    /// is that it stays wherever it was, so the firmware is held to what it
+    /// still controls (`dark_without_vddio2`), and `enabled_high` goes on
+    /// meaning what PORTC asks for.
+    fn vddio2_moved(&mut self, was: bool) -> Result<(), String> {
+        let ok = self.vddio2_ok();
+        if was && !ok {
+            self.vddio2_lost_at = Some(self.now);
+            self.lost_lit = self.enabled_high() && self.dac.code != 0;
+        }
+        if ok && !was {
+            self.vddio2_lost_at = None;
+            if self.enabled_high() {
+                self.pc1_moves(false).map_err(|e| {
+                    format!(
+                        "VDDIO2 comes back with PC1 still set in PORTC, and the pin takes that \
+                         up again (section 19.3.2.1), which {e}"
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// With MVIO.STATUS.VDDIO2S clear, PC1 is tri-stated whatever PORTC says
+    /// (§19.3.2.1), so nothing the firmware writes holds the driver's enable,
+    /// and DAC0 and the paths, which are on VDD, are all it has left. A pass
+    /// of the main loop that took its tick with VDDIO2S already clear has
+    /// them at 0 and low before it sleeps, with PC1 clear in PORTC as well,
+    /// so the pin has nothing to take up if VDDIO2 comes back. That's a tick
+    /// and a pass after it went, at most. A pass that was already under way
+    /// when it went is let off, since it may have looked before then.
+    ///
+    /// It's the firmware's rule, not the datasheet's. One that waited for a
+    /// second reading before acting would fail it, and that would be a
+    /// choice to make here on purpose.
+    fn dark_without_vddio2(&self) -> Result<(), String> {
+        let Some(lost) = self.vddio2_lost_at else {
+            return Ok(());
+        };
+        if lost > self.tick_taken_at || self.shows(Output::OFF).is_ok() {
+            return Ok(());
+        }
+        Err(format!(
+            "sleeps with PC1 {} in PORTC, DAC0 at {}, VREF.DAC0REF {:#04x} and the paths \
+             {:#04x}, at the end of a pass that began with MVIO.STATUS.VDDIO2S clear: PC1 is \
+             tri-stated without VDDIO2 (section 19.3.2.1), so the light goes off in that pass, \
+             DAC0 to 0 and the paths low",
+            if self.enabled_high() { "set" } else { "clear" },
+            self.dac.code,
+            self.dac_reference(),
+            self.paths()
+        ))
     }
 
     /// Refuses a chip `hw::init` left on a clock or a timer the model doesn't
@@ -3339,6 +3538,8 @@ impl Bus for Chip {
         if self.bare {
             return Err("runs `sleep`, and first light never sleeps".into());
         }
+        self.dark_without_vddio2()?;
+        self.vddio2_goes()?;
         self.ccp_hold = false;
         self.tick_polled = true;
         let ctrla = self.io[reg::SLPCTRL_CTRLA];
@@ -3449,7 +3650,9 @@ impl Bus for Chip {
             reg::VPORTD_INTFLAGS => Ok(self.portd_flags),
             reg::MVIO_STATUS => {
                 self.boot.supply_read.get_or_insert(self.now);
-                Ok(if self.vddio2_ok() { MVIO_VDDIO2S } else { 0 })
+                let status = if self.vddio2_ok() { MVIO_VDDIO2S } else { 0 };
+                self.vddio2_goes()?;
+                Ok(status)
             }
             reg::RTC_PITSTATUS => {
                 let busy = self.pit_busy > 0;
@@ -3707,6 +3910,9 @@ impl Bus for Chip {
             }
             reg::RTC_PITINTFLAGS => {
                 if value & RTC_PI != 0 {
+                    if self.pit_flag {
+                        self.tick_taken_at = self.now;
+                    }
                     self.pit_flag = false;
                 }
             }
@@ -4233,16 +4439,185 @@ mod tests {
         assert!(chip.set_switch(true).unwrap_err().contains("doesn't model"));
     }
 
+    /// The world's fuses with MVSYSCFG at single supply.
+    fn single_supply(mut world: World) -> World {
+        world.fuses[reg::FUSE_SYSCFG1 - reg::FUSE_WDTCFG] = regs::FUSE_MVSYSCFG_SINGLE;
+        world
+    }
+
     #[test]
     fn vddio2s_reads_the_world_with_dual_supply_and_1_with_single() {
         let mut chip = Chip::new(Vec::new());
         let read = |chip: &mut Chip| chip.read(reg::MVIO_STATUS as u16);
         assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
-        chip.vddio2 = false;
+        chip.set_vddio2(false).unwrap();
         assert_eq!(read(&mut chip), Ok(0));
-        let syscfg1 = reg::FUSE_SYSCFG1 - reg::FUSE_WDTCFG;
-        chip.world.fuses[syscfg1] = FUSE_MVSYSCFG_SINGLE;
+        assert_eq!(chip.vddio2_lost_at, Some(chip.now));
+        chip.set_vddio2(true).unwrap();
         assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
+        assert_eq!(chip.vddio2_lost_at, None);
+        // With single supply it reads 1 whatever VDDIO2 does, so the chip
+        // never counts it as lost.
+        chip.set_world(single_supply(World::NORMAL)).unwrap();
+        chip.set_vddio2(false).unwrap();
+        assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
+        assert_eq!(chip.vddio2_lost_at, None);
+    }
+
+    /// The firmware taking a tick, as `hw::rtc_pit` does.
+    fn take_tick(chip: &mut Chip) {
+        chip.pit_flag = true;
+        poke(chip, reg::RTC_PITINTFLAGS, RTC_PI).unwrap();
+    }
+
+    /// `lit`, at a level on the high path, set up to sleep in idle as the
+    /// firmware does with the light on.
+    fn lit_and_idling() -> Chip {
+        let mut chip = lit();
+        poke(&mut chip, reg::VPORTA_OUT, PATHS).unwrap();
+        dac(&mut chip, 300).unwrap();
+        poke(&mut chip, reg::RTC_PITINTCTRL, RTC_PI).unwrap();
+        poke(&mut chip, reg::SLPCTRL_CTRLA, SLEEP_IDLE | SLPCTRL_SEN).unwrap();
+        chip
+    }
+
+    /// The driver off in the firmware's order, with TCB0 stopped.
+    fn turn_off(chip: &mut Chip) {
+        dac(chip, 0).unwrap();
+        poke(chip, reg::VREF_DAC0REF, VREF_REFSEL_1V024).unwrap();
+        poke(chip, reg::VPORTC_OUT, 0).unwrap();
+        poke(chip, reg::VPORTA_OUT, 0).unwrap();
+        poke(chip, reg::TCB0_CTRLA, 0).unwrap();
+        poke(chip, reg::TCB0_INTCTRL, 0).unwrap();
+    }
+
+    #[test]
+    fn a_pass_that_begins_without_vddio2_cant_sleep_with_the_light_on() {
+        // Gone before the tick's taken, so this pass could have seen it.
+        let mut chip = lit_and_idling();
+        chip.set_vddio2(false).unwrap();
+        assert!(chip.lost_lit);
+        wait(&mut chip, 10);
+        take_tick(&mut chip);
+        let err = chip.sleep().unwrap_err();
+        assert!(
+            err.contains("began with MVIO.STATUS.VDDIO2S clear") && err.contains("DAC0 at 300"),
+            "{err}"
+        );
+        // Off in PORTC, DAC0 and the paths, and it may.
+        turn_off(&mut chip);
+        assert_eq!(chip.sleep(), Ok(true));
+
+        // PC1 clear in PORTC isn't enough, since it's the one pin that isn't
+        // listening. The paths are still up here.
+        let mut chip = lit_and_idling();
+        chip.set_vddio2(false).unwrap();
+        take_tick(&mut chip);
+        dac(&mut chip, 0).unwrap();
+        poke(&mut chip, reg::VPORTC_OUT, 0).unwrap();
+        poke(&mut chip, reg::TCB0_CTRLA, 0).unwrap();
+        poke(&mut chip, reg::TCB0_INTCTRL, 0).unwrap();
+        let err = chip.sleep().unwrap_err();
+        assert!(
+            err.contains("PC1 clear in PORTC, DAC0 at 0") && err.contains("the paths 0xe0"),
+            "{err}"
+        );
+        poke(&mut chip, reg::VPORTA_OUT, 0).unwrap();
+        assert_eq!(chip.sleep(), Ok(true));
+    }
+
+    #[test]
+    fn a_pass_already_under_way_when_vddio2_goes_is_let_off_until_the_next() {
+        let mut chip = lit_and_idling();
+        take_tick(&mut chip);
+        wait(&mut chip, 10);
+        chip.set_vddio2(false).unwrap();
+        assert_eq!(chip.sleep(), Ok(true), "it may have looked before it went");
+        wait(&mut chip, 10);
+        take_tick(&mut chip);
+        let err = chip.sleep().unwrap_err();
+        assert!(
+            err.contains("began with MVIO.STATUS.VDDIO2S clear"),
+            "{err}"
+        );
+    }
+
+    /// With single supply the firmware can't see VDDIO2 go, so nothing's
+    /// asked of it.
+    #[test]
+    fn single_supply_asks_nothing_when_vddio2_goes() {
+        let mut chip = lit_and_idling();
+        chip.set_world(single_supply(World::NORMAL)).unwrap();
+        chip.set_vddio2(false).unwrap();
+        take_tick(&mut chip);
+        assert_eq!(chip.sleep(), Ok(true));
+    }
+
+    #[test]
+    fn vddio2_coming_back_raises_pc1_if_portc_still_has_it_set() {
+        // Still lit in the registers, so PC1 comes up with DAC0 live.
+        let mut chip = lit_and_idling();
+        chip.set_vddio2(false).unwrap();
+        let err = chip.set_vddio2(true).unwrap_err();
+        assert!(
+            err.contains("VDDIO2 comes back with PC1 still set in PORTC")
+                && err.contains("raises PC1 with DAC0 at 300"),
+            "{err}"
+        );
+        // Off in the registers, and it comes back to nothing.
+        let mut chip = lit_and_idling();
+        chip.set_vddio2(false).unwrap();
+        turn_off(&mut chip);
+        let rises = chip.pc1_rises;
+        chip.set_vddio2(true).unwrap();
+        assert_eq!(chip.pc1_rises, rises);
+        // PC1 set with DAC0 at 0 and the paths low is a rise like any other,
+        // and DAC0 waits for the boost converter again.
+        let mut chip = lit();
+        chip.set_vddio2(false).unwrap();
+        wait(&mut chip, 100);
+        chip.set_vddio2(true).unwrap();
+        assert_eq!(chip.pc1_rises, 2);
+        assert!(dac(&mut chip, 300).unwrap_err().contains("8 ms"));
+    }
+
+    #[test]
+    fn late_vddio2_goes_after_the_look_or_as_the_firmware_sleeps() {
+        let lost = World::from(Scene {
+            vddio2: false,
+            ..Scene::NORMAL
+        });
+        let read = |chip: &mut Chip| chip.read(reg::MVIO_STATUS as u16);
+        // Not late, it's gone as the tick begins.
+        let mut chip = lit_and_idling();
+        chip.enter(lost).unwrap();
+        assert!(!chip.vddio2_ok());
+        // Late, the look still sees it, and it's gone straight after.
+        let mut chip = lit_and_idling();
+        chip.late_vddio2 = true;
+        chip.enter(lost).unwrap();
+        assert!(chip.vddio2_ok());
+        take_tick(&mut chip);
+        wait(&mut chip, 10);
+        assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
+        assert_eq!(chip.vddio2_lost_at, Some(chip.now));
+        assert_eq!(read(&mut chip), Ok(0));
+        assert_eq!(chip.sleep(), Ok(true), "the pass that had already looked");
+        // The next tick's world still has it gone, and nothing's armed.
+        chip.enter(lost).unwrap();
+        assert!(!chip.vddio2_going && !chip.vddio2_ok());
+        // With no look at all, it goes as the pass sleeps.
+        let mut chip = lit_and_idling();
+        chip.late_vddio2 = true;
+        chip.enter(lost).unwrap();
+        take_tick(&mut chip);
+        assert_eq!(chip.sleep(), Ok(true));
+        assert!(!chip.vddio2_ok());
+        // Coming back is never late.
+        chip.late_vddio2 = true;
+        turn_off(&mut chip);
+        chip.enter(World::NORMAL).unwrap();
+        assert!(chip.vddio2_ok());
     }
 
     /// A chip with the ADC set up as `hw::init` and `adc_channel` do.

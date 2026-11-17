@@ -10,11 +10,16 @@
 //! Two things stop the light altogether, and [`Limits::health`] says which.
 //! A flat cell turns it off and keeps it off until the cell reads as charged
 //! (`battery::Protection::flat`). A fault turns it off and keeps it off until
-//! the cell comes out. A fault is a failed power-on self-test, or a cell that
+//! the cell comes out. A fault is a failed power-on self-test, a cell that
 //! can't be read (`battery::Verdict::Blind`), since with no reading there's
-//! no low-voltage cut-off, and this cell has no protection of its own. A
-//! fault that comes up with the light on fades it down the ramp first, so it
-//! doesn't snap out in someone's hand.
+//! no low-voltage cut-off, and this cell has no protection of its own, or
+//! VDDIO2 going missing. A cell that can't be read with the light on fades it
+//! down the ramp first, so it doesn't snap out in someone's hand.
+//!
+//! VDDIO2 going missing is the one fault with no fade. PC1, the driver's
+//! enable, is on that supply and tri-stated without it, so there's nothing
+//! left holding the enable to fade with, and the light's level is 0 on the
+//! tick that reads it missing ([`Limits::tick`]).
 //!
 //! Garbage readings fail safe. Each side has its own idea of a reading that
 //! can't be real (`battery::plausible`, `thermal::plausible`) and lets a few
@@ -34,7 +39,8 @@ pub enum Health {
     Good,
     /// Turned off for a flat cell, and not yet read as charged.
     Flat,
-    /// A failed self-test, or a cell it couldn't read. Only a reset clears it.
+    /// A failed self-test, a cell it couldn't read, or VDDIO2 gone missing.
+    /// Only a reset clears it.
     Fault,
 }
 
@@ -67,7 +73,7 @@ pub struct Limits {
     /// ran across the two.
     lit_before: bool,
     convert: Option<Convert>,
-    /// A self-test failed, or the cell couldn't be read.
+    /// A self-test failed, the cell couldn't be read, or VDDIO2 went missing.
     fault: bool,
 }
 
@@ -125,6 +131,12 @@ impl Limits {
     /// (`battery::FORGET_TICKS`). The torch's checks of the cell at rest
     /// (`torch::CHECK_TICKS`) are ordinary ticks with the UI off, three of
     /// them, between runs of these.
+    ///
+    /// Nothing looks at VDDIO2 here either. At rest PORT has PC1 low, DAC0 is
+    /// at 0 and the paths are low, so PC1 letting go changes nothing the
+    /// firmware controls, and a supply that dips and comes back at rest
+    /// isn't a fault. The light can't come on without ticks of
+    /// [`Limits::tick`] first, and those look.
     pub const fn rest(&mut self) {
         self.schedule.rest();
         self.protection.rest();
@@ -133,9 +145,27 @@ impl Limits {
         self.level = 0;
     }
 
-    /// One tick. `ui` is the level the UI wants (`0` for off) and `result`
-    /// the ADC's result, if it has one ready.
-    pub fn tick(&mut self, ui: u8, result: Option<u16>) -> Step {
+    /// One tick. `ui` is the level the UI wants (`0` for off), `result` the
+    /// ADC's result, if it has one ready, and `vddio2` whether MVIO says
+    /// VDDIO2 is there on this pass (`MVIO.STATUS.VDDIO2S`, DS40002413B
+    /// section 19.5.3, which `hw::vddio2_ok` reads).
+    ///
+    /// VDDIO2 missing is a fault from this tick, and the level is 0 on this
+    /// tick, whatever it was, with no fade. PC1, the driver's enable, is on
+    /// VDDIO2 and tri-stated without it (section 19.3.2.1), so nothing the
+    /// firmware writes reaches the enable, and DAC0 and the paths, which are
+    /// on VDD, are all that's left to turn down. If VDDIO2 came back, PC1
+    /// would take up whatever PORT held (the same section), so the light
+    /// being off in PORT by then is what stops PC1 rising with DAC0 live.
+    ///
+    /// One reading is enough. The bit isn't a measurement to average. It's
+    /// the chip saying PC1 is tri-stated now, so the thing to guard against
+    /// has already happened, and a second reading would leave DAC0 and the
+    /// paths up for another tick with nothing holding the enable. A wrong
+    /// one costs a torch that's dark until the cell comes out, which is what
+    /// one watchdog reset costs too. Nobody has seen the bit read 0 on this
+    /// torch, with or without cause.
+    pub fn tick(&mut self, ui: u8, result: Option<u16>, vddio2: bool) -> Step {
         let on = ui != 0;
         if on && !self.on {
             self.thermal.reset();
@@ -177,6 +207,13 @@ impl Limits {
             }
             None => {}
         }
+        // PC1 has let go of the driver's enable, so there's no fade to wait
+        // for. That's this tick only. The fault it leaves keeps the light
+        // out from here on, as any fault with the light out does.
+        let cut = !vddio2;
+        if cut {
+            self.fault = true;
+        }
         // Every tick, so a good reading during the fade can't send the
         // battery ceiling back up and leave a fault lit.
         if self.fault {
@@ -192,7 +229,7 @@ impl Limits {
         // A fault's fade has the battery ceiling heading for level 1, so a
         // low cell during it can call itself flat from any level. The fault
         // decides when that light goes out instead.
-        let fault = self.fault && self.level <= 1;
+        let fault = self.fault && (cut || self.level <= 1);
         let flat = !self.fault && self.protection.flat();
         let off = on && (fault || flat);
         self.lit_before = self.level > 0;
@@ -233,6 +270,8 @@ mod tests {
         limits: Limits,
         adc: Adc,
         ui: u8,
+        /// Whether MVIO says VDDIO2 is there.
+        vddio2: bool,
         uis: Vec<u8>,
         levels: Vec<u8>,
         offs: usize,
@@ -249,6 +288,7 @@ mod tests {
                 limits: Limits::new(CALIBRATION, faults),
                 adc: Adc::new(),
                 ui: 0,
+                vddio2: true,
                 uis: Vec::new(),
                 levels: Vec::new(),
                 offs: 0,
@@ -257,13 +297,14 @@ mod tests {
 
         fn tick(&mut self) -> u8 {
             let ui = self.ui;
-            let step = self.limits.tick(ui, self.adc.result());
+            let step = self.limits.tick(ui, self.adc.result(), self.vddio2);
             self.adc.start(self.limits.convert());
             if step.off {
                 self.offs += 1;
                 self.ui = 0;
             }
-            // Only a change of UI level (or the cell going flat) may jump.
+            // Only a change of UI level (or the cell going flat, or VDDIO2
+            // going missing) may jump.
             let steady = self.uis.last() == Some(&ui) && ui != 0 && !step.off;
             if let (Some(&last), true) = (self.levels.last(), steady) {
                 assert!(
@@ -632,7 +673,7 @@ mod tests {
     #[test]
     fn no_result_at_all_is_garbage_too() {
         let mut limits = Limits::new(CALIBRATION, Faults::NONE);
-        let off = (0..5 * TICKS_PER_SECOND).position(|_| limits.tick(CEILING, None).off);
+        let off = (0..5 * TICKS_PER_SECOND).position(|_| limits.tick(CEILING, None, true).off);
         assert!(off.is_some());
         assert_eq!(limits.health(), Health::Fault);
         assert_eq!(limits.ceilings().1, FLOOR);
@@ -745,7 +786,7 @@ mod tests {
             let mut adc = Adc::new();
             adc.voltage = voltage;
             for tick in 0..64 {
-                let step = limits.tick(0, adc.result());
+                let step = limits.tick(0, adc.result(), true);
                 adc.start(limits.convert());
                 let read = due(tick).then(|| battery::centivolts(voltage));
                 assert_eq!(step.unloaded, read, "{voltage}: tick {tick}");
@@ -758,7 +799,7 @@ mod tests {
             let mut adc = Adc::new();
             for tick in 0..out_at + 40 {
                 let ui = if tick < out_at { 50 } else { 0 };
-                let step = limits.tick(ui, adc.result());
+                let step = limits.tick(ui, adc.result(), true);
                 adc.start(limits.convert());
                 let read = (due(tick) && tick >= out_at + 2).then_some(380);
                 assert_eq!(step.unloaded, read, "out at {out_at}: tick {tick}");
@@ -832,11 +873,100 @@ mod tests {
         assert_eq!(run.offs, 4, "asked for off every time");
     }
 
+    /// VDDIO2 missing is the one fault that doesn't fade. From any level, the
+    /// tick that reads it missing is the first with the light out, and it
+    /// coming back changes nothing.
+    #[test]
+    fn vddio2_missing_puts_the_light_out_on_that_tick_from_any_level() {
+        for level in 1..=CEILING {
+            let mut run = Run::new();
+            run.ui = level;
+            assert_eq!(run.secs(1), level);
+            run.vddio2 = false;
+            assert_eq!(run.ticks(1), 0, "from {level}");
+            assert_eq!(run.offs, 1, "from {level}");
+            assert_eq!(run.limits.health(), Health::Fault, "from {level}");
+            run.vddio2 = true;
+            assert_eq!(run.secs(1), 0, "from {level}, with VDDIO2 back");
+            run.ui = level;
+            assert_eq!(run.secs(1), 0, "from {level}, asked again");
+            assert_eq!(run.limits.health(), Health::Fault, "from {level}");
+        }
+    }
+
+    #[test]
+    fn vddio2_missing_with_the_light_off_is_a_fault_before_anything_lights() {
+        let mut run = Run::new();
+        run.secs(1);
+        run.vddio2 = false;
+        assert_eq!(run.ticks(1), 0);
+        assert_eq!(run.limits.health(), Health::Fault);
+        assert_eq!(run.offs, 0, "nothing was on to turn off");
+        run.vddio2 = true;
+        run.ui = CEILING;
+        assert_eq!(run.ticks(1), 0);
+        assert_eq!(run.offs, 1);
+    }
+
+    /// The UI asking for light on the very tick VDDIO2 reads missing gets
+    /// none, not even for that tick.
+    #[test]
+    fn turning_on_with_vddio2_missing_never_lights() {
+        let mut run = Run::new();
+        run.secs(1);
+        run.vddio2 = false;
+        run.ui = CEILING;
+        assert_eq!(run.ticks(1), 0);
+        assert_eq!(run.offs, 1);
+        assert_eq!(run.limits.health(), Health::Fault);
+        assert!(run.levels.iter().all(|&l| l == 0));
+    }
+
+    /// A cell that can't be read fades the light out. VDDIO2 going missing
+    /// part-way down doesn't wait for the fade.
+    #[test]
+    fn vddio2_missing_cuts_another_faults_fade_short() {
+        let mut run = Run::new();
+        run.ui = CEILING;
+        run.secs(2);
+        run.adc.voltage = 0;
+        while run.limits.health() == Health::Good {
+            run.tick();
+        }
+        let fading = run.ticks(10);
+        assert!(fading > 1 && fading < CEILING, "{fading}");
+        run.vddio2 = false;
+        assert_eq!(run.ticks(1), 0, "from {fading}");
+        assert_eq!(run.offs, 1);
+    }
+
+    /// A flat cell can be charged. VDDIO2 going missing can't be undone, so
+    /// a charged cell doesn't bring the light back after it.
+    #[test]
+    fn vddio2_missing_outranks_a_flat_cell() {
+        let mut run = Run::new();
+        run.adc.voltage = voltage_reading(280);
+        run.ui = 50;
+        run.secs(6);
+        assert_eq!(run.limits.health(), Health::Flat);
+        run.vddio2 = false;
+        run.ticks(1);
+        assert_eq!(run.limits.health(), Health::Fault);
+        run.vddio2 = true;
+        run.adc.voltage = voltage_reading(380);
+        run.secs(2);
+        assert_eq!(run.limits.health(), Health::Fault);
+        run.ui = 50;
+        assert_eq!(run.ticks(1), 0);
+    }
+
     /// A million ticks of random UI levels and ADC results, checking every
-    /// step against `cap` and the UI.
-    fn throw_noise_at(mut limits: Limits, cap: u8, seed: u32) {
+    /// step against `cap` and the UI. With `gone_at`, VDDIO2 reads missing
+    /// on that tick alone, and nothing lights from then on.
+    fn throw_noise_at(mut limits: Limits, mut cap: u8, seed: u32, gone_at: Option<u32>) {
         let mut rng = crate::testing::Rng::new(seed);
         let mut ticks = 0_u32;
+        let mut tick = 0_u32;
         while ticks < 1_000_000 {
             // The UI holds a level for a run of ticks, so the ceilings have
             // time to move. Some runs are off, and some ask for more than
@@ -858,7 +988,12 @@ mod tests {
                     (_, 1) => Some(rng.next_u16() % (4 * 4095 + 1)),
                     _ => Some(held),
                 };
-                let step = limits.tick(ui, result);
+                let gone = gone_at == Some(tick);
+                if gone {
+                    cap = 0;
+                }
+                tick += 1;
+                let step = limits.tick(ui, result, !gone);
                 assert!(
                     step.level <= ui.min(cap),
                     "ui {ui}, result {result:?}: level {}",
@@ -867,6 +1002,10 @@ mod tests {
                 assert!(step.level <= CEILING, "level {}", step.level);
                 assert!(!step.off || step.level == 0, "off at level {}", step.level);
                 assert_eq!(limits.level(), step.level);
+                if cap == 0 {
+                    assert_eq!(step.off, ui != 0, "ui {ui} with nothing allowed");
+                    assert_eq!(limits.health(), Health::Fault);
+                }
             }
             ticks += run;
         }
@@ -874,11 +1013,23 @@ mod tests {
 
     #[test]
     fn random_readings_never_lift_the_level_over_the_ui_or_the_cap() {
-        throw_noise_at(Limits::new(CALIBRATION, Faults::NONE), CEILING, 0x5EED_0001);
+        let limits = Limits::new(CALIBRATION, Faults::NONE);
+        throw_noise_at(limits, CEILING, 0x5EED_0001, None);
     }
 
     #[test]
     fn random_readings_never_light_a_failed_self_test() {
-        throw_noise_at(Limits::new(CALIBRATION, FAILED), 0, 0x5EED_0002);
+        throw_noise_at(Limits::new(CALIBRATION, FAILED), 0, 0x5EED_0002, None);
+    }
+
+    /// The same noise, with VDDIO2 reading missing for one tick part of the
+    /// way in, at a few different points. Whatever the readings and the UI
+    /// do afterwards, nothing lights again.
+    #[test]
+    fn random_readings_never_light_it_once_vddio2_has_read_missing() {
+        for gone_at in [0, 1, 2, 5_000, 123_456] {
+            let limits = Limits::new(CALIBRATION, Faults::NONE);
+            throw_noise_at(limits, CEILING, 0x5EED_0007, Some(gone_at));
+        }
     }
 }

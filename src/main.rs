@@ -78,7 +78,10 @@ extern "C" fn main() -> ! {
             hw::halt();
         }
 
-        torch.tick(hw::switch_pressed(), hw::adc_result());
+        // VDDIO2 is read again on every pass, since PC1 is on it and lets go
+        // of the driver's enable without it. The library puts the light out
+        // on the tick it reads missing.
+        torch.tick(hw::switch_pressed(), hw::adc_result(), hw::vddio2_ok());
 
         if let Some(convert) = torch.convert() {
             hw::adc_start(convert);

@@ -83,6 +83,7 @@ const HW: &str = "src/avr/hw.rs";
 const MAIN: &str = "src/main.rs";
 const FIRST_LIGHT: &str = "examples/first_light.rs";
 const AW2016: &str = "src/aw2016.rs";
+const LIMITS: &str = "src/limits.rs";
 
 /// The mistakes, each one a different alarm. Every one of them has been run
 /// and seen refused for the reason it gives, and `cargo xtask breakages`
@@ -322,7 +323,10 @@ const BREAKAGES: &[Breakage] = &[
         expect: "start-up order: turns the watchdog on before clearing the reset flags",
     },
     // Without VDDIO2, PC1 is tri-stated, so the light stays off as a fault.
-    // This reads MVIO.STATUS and ignores it.
+    // This reads MVIO.STATUS at power-on and ignores it. The first pass of
+    // the loop still finds it missing, so nothing lights, but it's a pass
+    // late, and the torch reads its cell as if nothing were wrong where one
+    // that failed the check rests. That's what's refused.
     Breakage {
         name: "vddio2-ignored",
         file: MAIN,
@@ -330,6 +334,28 @@ const BREAKAGES: &[Breakage] = &[
         replace: "        supply: !hw::vddio2_ok() && false,\n",
         stage: Stage::Simulator,
         expect: "with VDDIO2 missing: tick",
+    },
+    // VDDIO2 is read again on every pass, since it can go with the light on.
+    // This reads it at power-on and never again, as the firmware used to.
+    Breakage {
+        name: "vddio2-not-watched",
+        file: MAIN,
+        find: "hw::adc_result(), hw::vddio2_ok());\n",
+        replace: "hw::adc_result(), true);\n",
+        stage: Stage::Simulator,
+        expect: "began with MVIO.STATUS.VDDIO2S clear",
+    },
+    // ... and the light's out in the pass that finds it gone, with no fade,
+    // since PC1 isn't holding the driver through one. This fades it out like
+    // any other fault. The library and the firmware agree on that, being the
+    // same code, so it's the chip's own rule that objects.
+    Breakage {
+        name: "vddio2-loss-fades-out",
+        file: LIMITS,
+        find: "        let fault = self.fault && (cut || self.level <= 1);\n",
+        replace: "        let fault = self.fault && self.level <= 1;\n",
+        stage: Stage::Simulator,
+        expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
     Breakage {
         name: "watchdog-never-fed",
@@ -393,10 +419,10 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "bounds-check",
         file: MAIN,
-        find: "        torch.tick(hw::switch_pressed(), hw::adc_result());\n",
+        find: "        torch.tick(hw::switch_pressed(), hw::adc_result(), hw::vddio2_ok());\n",
         replace: "        let reading = hw::adc_result();\n        \
                   let pressed = [hw::switch_pressed(); 4][usize::from(reading.unwrap_or(0))];\n        \
-                  torch.tick(pressed, reading);\n",
+                  torch.tick(pressed, reading, hw::vddio2_ok());\n",
         stage: Stage::Layout,
         expect: "panic_bounds_check",
     },

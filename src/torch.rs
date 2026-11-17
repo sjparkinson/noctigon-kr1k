@@ -105,7 +105,17 @@ impl Torch {
     /// as a press does, and rests again once the reading's in. Any tick
     /// that isn't resting starts the count again, since the cell's read
     /// then anyway. Not with a fault, which nothing changes.
-    pub fn tick(&mut self, pressed: bool, adc: Option<u16>) -> Option<Event> {
+    ///
+    /// `vddio2` is whether MVIO says VDDIO2, the supply PC1 is on, is there
+    /// on this pass. On any tick that isn't resting, missing is a fault and
+    /// the light's out on that same tick, with no fade ([`Limits::tick`] has
+    /// why). A resting tick doesn't look, since there's nothing lit to put
+    /// out and PORT already has PC1 low, so a supply that goes and comes back
+    /// at rest is nothing. A press ends the rest on the tick that sees it,
+    /// and a click from off counts `button::RELEASE_TICKS` after it's let
+    /// go, so every tick from the press to the one that lights the light has
+    /// looked, that one included, and so does every check of the cell.
+    pub fn tick(&mut self, pressed: bool, adc: Option<u16>, vddio2: bool) -> Option<Event> {
         self.warm = self.level() > 0;
         self.showing = self.showing.saturating_sub(1);
         let event = self.clicks.tick_up_to(pressed, self.ui.most_clicks());
@@ -132,7 +142,7 @@ impl Torch {
             self.checking = true;
         }
         if !self.resting() {
-            let step = self.limits.tick(self.ui.output_level(), adc);
+            let step = self.limits.tick(self.ui.output_level(), adc, vddio2);
             if step.off {
                 self.ui.off();
             }
@@ -778,10 +788,10 @@ mod tests {
         rest(&mut torch, CHECK_TICKS - 1, "to the next check");
         // No result at all, which reads as zero.
         for _ in 0..2 {
-            torch.torch.tick(false, None);
+            torch.torch.tick(false, None, true);
             assert!(!torch.resting());
         }
-        torch.torch.tick(false, None);
+        torch.torch.tick(false, None, true);
         assert!(torch.resting());
         assert_eq!(torch.convert(), None);
         assert_eq!(torch.aux(), Aux::Off);
@@ -1145,6 +1155,10 @@ mod tests {
                 hang: true,
                 ..Faults::NONE
             },
+            Faults {
+                supply: true,
+                ..Faults::NONE
+            },
         ] {
             let mut torch = Rig::new(faults);
             assert_eq!(torch.aux(), Aux::White, "{faults:?}");
@@ -1160,6 +1174,206 @@ mod tests {
             assert_eq!(torch.level(), 0, "{faults:?}");
             assert_eq!(torch.aux(), Aux::Off, "{faults:?}");
         }
+    }
+
+    /// VDDIO2 read missing with the light on. It's out on that tick, from
+    /// the top of the ramp as from anywhere, with none of the levels between
+    /// asked for on the way, and the driver's told off whole.
+    #[test]
+    fn vddio2_lost_with_the_light_on_puts_it_out_on_that_tick_and_shows_white() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        assert_eq!(torch.output(), ramp::output(CEILING));
+        torch.vddio2 = false;
+        torch.tick(false);
+        assert_eq!(torch.level(), 0, "no fade");
+        assert_eq!(torch.output(), Output::OFF);
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.ui.mode(), Mode::Off, "the UI's off too");
+        assert!(torch.resting(), "and it rests from that pass");
+        // White for the three seconds after, like any fault, then dark.
+        for tick in 1..SHOW_TICKS {
+            assert_eq!(torch.aux(), Aux::White, "tick {tick}");
+            torch.tick(false);
+        }
+        assert_eq!(torch.aux(), Aux::White);
+        torch.tick(false);
+        assert_eq!(torch.aux(), Aux::Off);
+        // Presses light nothing, with VDDIO2 gone or back.
+        for back in [false, true] {
+            torch.vddio2 = back;
+            click(&mut torch);
+            assert_eq!(torch.level(), 0, "VDDIO2 back: {back}");
+            assert_eq!(torch.output(), Output::OFF);
+            assert_eq!(torch.aux(), Aux::White, "VDDIO2 back: {back}");
+            run(&mut torch, true, 2 * TICKS_PER_SECOND);
+            run(&mut torch, false, SHOW_TICKS);
+            assert_eq!(torch.level(), 0, "VDDIO2 back: {back}");
+        }
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+    }
+
+    /// The same from every level the UI can ask for, and from the tick the
+    /// driver's only starting, when DAC0 is still at 0.
+    #[test]
+    fn vddio2_lost_puts_it_out_from_every_level_and_from_starting() {
+        for held in 0..3 * TICKS_PER_SECOND {
+            let mut torch = Rig::default();
+            click(&mut torch);
+            run(&mut torch, true, held);
+            let level = torch.level();
+            assert!(level >= ON_LEVEL, "{level}");
+            torch.vddio2 = false;
+            torch.tick(held > 0);
+            assert_eq!(torch.level(), 0, "from {level}");
+            assert_eq!(torch.output(), Output::OFF, "from {level}");
+        }
+        let mut torch = Rig::default();
+        run(&mut torch, true, 4);
+        run(&mut torch, false, RELEASE_TICKS);
+        torch.tick(false);
+        assert_eq!(torch.output(), Output::STARTING);
+        torch.vddio2 = false;
+        torch.tick(false);
+        assert_eq!(torch.output(), Output::OFF, "never got its level");
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+    }
+
+    /// The click that would light it arrives on the very tick VDDIO2 first
+    /// reads missing. The driver's never asked on, not even to start.
+    #[test]
+    fn a_click_on_the_tick_vddio2_reads_missing_lights_nothing() {
+        let mut torch = Rig::default();
+        run(&mut torch, true, 4);
+        run(&mut torch, false, RELEASE_TICKS);
+        torch.vddio2 = false;
+        assert_eq!(torch.tick(false), Some(Event::Click(1)));
+        assert_eq!(torch.output(), Output::OFF);
+        assert_eq!(torch.ui.mode(), Mode::Off);
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.aux(), Aux::White);
+        torch.vddio2 = true;
+        for _ in 0..TICKS_PER_SECOND {
+            torch.tick(false);
+            assert_eq!(torch.output(), Output::OFF);
+        }
+    }
+
+    /// At rest nothing looks. VDDIO2 gone and back while the torch rests is
+    /// nothing, and it lights as usual afterwards.
+    #[test]
+    fn vddio2_lost_and_back_at_rest_is_nothing() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, TICKS_PER_SECOND);
+        torch.vddio2 = false;
+        rest(&mut torch, 10 * TICKS_PER_SECOND, "with VDDIO2 gone");
+        assert_eq!(torch.torch.limits.health(), Health::Good);
+        assert_eq!(torch.aux(), Aux::Blue);
+        torch.vddio2 = true;
+        click(&mut torch);
+        assert_eq!(torch.level(), ON_LEVEL);
+    }
+
+    /// Still gone at the next press, it's a fault on the first tick the
+    /// switch is seen down, which is `RELEASE_TICKS` and more before a click
+    /// could light anything, and white shows from that tick.
+    #[test]
+    fn vddio2_lost_at_rest_is_a_fault_at_the_next_press_before_its_click_counts() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, TICKS_PER_SECOND);
+        torch.vddio2 = false;
+        rest(&mut torch, TICKS_PER_SECOND, "with VDDIO2 gone");
+        assert_eq!(torch.tick(true), None);
+        assert_eq!(torch.torch.limits.health(), Health::Fault, "at the press");
+        assert_eq!(torch.aux(), Aux::White);
+        run(&mut torch, true, 3);
+        for _ in 0..RELEASE_TICKS + 1 {
+            torch.tick(false);
+            assert_eq!(torch.output(), Output::OFF);
+        }
+        assert_eq!(torch.ui.mode(), Mode::Off, "the click never reached the UI");
+    }
+
+    /// Left alone, the next check of the cell is what finds it, since a
+    /// check is three ticks awake.
+    #[test]
+    fn vddio2_lost_at_rest_is_a_fault_at_the_next_check_of_the_cell() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, 3);
+        torch.vddio2 = false;
+        rest(&mut torch, CHECK_TICKS - 1, "to the next check");
+        assert_eq!(torch.torch.limits.health(), Health::Good);
+        torch.tick(false);
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.aux(), Aux::White, "from the check");
+        // The check's own conversions are read out, then it rests, and
+        // there are no more checks.
+        run(&mut torch, false, 2);
+        assert!(torch.resting());
+        run(&mut torch, false, SHOW_TICKS);
+        assert_eq!(torch.aux(), Aux::Off);
+        for tick in 0..2 * u32::from(CHECK_TICKS) {
+            torch.tick(false);
+            assert!(torch.resting(), "tick {tick}");
+        }
+    }
+
+    /// Locked, a press still wakes it, so it still looks, and the fault's
+    /// white takes over from lockout's red.
+    #[test]
+    fn vddio2_lost_in_lockout_is_a_fault_at_the_next_press() {
+        let mut torch = Rig::default();
+        tap(&mut torch, 3, Event::Click(3));
+        run(&mut torch, false, LOCKED_TICKS);
+        torch.vddio2 = false;
+        rest(&mut torch, TICKS_PER_SECOND, "locked, with VDDIO2 gone");
+        torch.tick(true);
+        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.aux(), Aux::White);
+        assert_eq!(torch.level(), 0);
+    }
+
+    /// docs/ui.md's VDDIO2 rows only say how the light ends up. This holds
+    /// them to the fault, or the lack of one, and the aux they describe.
+    #[test]
+    fn the_vddio2_rows_in_docs_ui_md_end_as_they_describe() {
+        let rows = [
+            ("VDDIO2 missing at power-on", Health::Fault, Aux::White),
+            ("VDDIO2 lost with the light on", Health::Fault, Aux::White),
+            ("VDDIO2 lost, then back", Health::Fault, Aux::White),
+            ("VDDIO2 lost with the light off", Health::Fault, Aux::White),
+            (
+                "VDDIO2 lost and back while it rests",
+                Health::Good,
+                Aux::Off,
+            ),
+        ];
+        for (row, health, aux) in rows {
+            let example = examples(UI_MD)
+                .map(|example| example.unwrap())
+                .find(|example| example.row.action == row)
+                .unwrap_or_else(|| panic!("no row {row:?}"));
+            let rig = Rig::play(example.actions());
+            assert_eq!(rig.torch.limits.health(), health, "{row}");
+            assert_eq!(rig.aux(), aux, "{row}");
+        }
+        // "VDDIO2 lost with the light on" is out on the first tick after
+        // the word, not some way down a fade by the end of its wait.
+        let lost = examples(UI_MD)
+            .map(|example| example.unwrap())
+            .find(|example| example.row.action == "VDDIO2 lost with the light on")
+            .unwrap();
+        // The last lit level, and the ticks dark after it.
+        let (mut last_lit, mut dark_after) = (0, 0);
+        Rig::play_with(lost.actions(), |rig, _| {
+            if rig.level() > 0 {
+                (last_lit, dark_after) = (rig.level(), 0);
+            } else {
+                dark_after += 1;
+            }
+        });
+        assert_eq!(last_lit, CEILING, "out from the top in one tick");
+        assert_eq!(dark_after, 16, "for all of the 250 ms");
     }
 
     #[test]
@@ -1375,13 +1589,26 @@ mod tests {
         relit_at_a_check: u32,
         garbage_at_a_check: u32,
         charged_at_a_check: u32,
+        /// Ticks VDDIO2 read missing while the torch rested with nothing
+        /// wrong, and nothing came of it.
+        vddio2_missing_unseen: u32,
+        /// VDDIO2 read missing with the light on, and it went out that tick.
+        cut_while_lit: u32,
+        /// VDDIO2 read missing with the light off and the switch down.
+        cut_by_a_press: u32,
+        /// VDDIO2 read missing as a check of the cell at rest began.
+        cut_at_a_check: u32,
     }
 
     /// One torch from power-on, for `ticks` ticks of random switching, cells,
     /// temperatures and ADC results, or until half a minute into a fault,
     /// checking every tick against docs/ui.md. Returns how many ticks it ran.
+    ///
+    /// `supply` decides when VDDIO2 reads missing. It's a generator of its
+    /// own so that taking VDDIO2 away doesn't reshuffle everything else.
     fn live(
         rng: &mut Rng,
+        supply: &mut Rng,
         pace: Pace,
         faults: Faults,
         ticks: u32,
@@ -1419,6 +1646,8 @@ mod tests {
         // conversions in a row are a turn, whose second is the reading.
         let (mut converted, mut converted_before) = (None, None);
         let mut lit_before_last = false;
+        // Ticks VDDIO2 still has to read missing for.
+        let mut gone_left = 0_u16;
         for t in 1..=ticks {
             if switch_left == 0 {
                 pressed = !pressed;
@@ -1439,8 +1668,21 @@ mod tests {
                     }
                     _ => between(rng, 1, 30 * TICKS_PER_SECOND),
                 };
+                // Now and then VDDIO2 goes, for a tick to a few seconds, or
+                // at the slow pace for long enough that a check of the cell
+                // at rest comes round while it's gone.
+                if supply.next_u16().is_multiple_of(32) {
+                    gone_left = match pace {
+                        Pace::Slow if supply.next_u16().is_multiple_of(2) => {
+                            between(supply, CHECK_TICKS / 2, 2 * CHECK_TICKS)
+                        }
+                        _ => between(supply, 1, 3 * TICKS_PER_SECOND),
+                    };
+                }
             }
             world_left -= 1;
+            let vddio2 = gone_left == 0;
+            gone_left = gone_left.saturating_sub(1);
             up = if pressed { 0 } else { up + 1 };
 
             let health_before = rig.torch.limits.health();
@@ -1450,7 +1692,7 @@ mod tests {
             if lose != 0 && rng.next_u16().is_multiple_of(lose) {
                 seen.results_lost += u32::from(result.take().is_some());
             }
-            let event = rig.torch.tick(pressed, result);
+            let event = rig.torch.tick(pressed, result, vddio2);
             rig.adc
                 .start_with(rig.torch.convert(), |channel| match channel {
                     Channel::Voltage => cell.read(rng),
@@ -1459,6 +1701,18 @@ mod tests {
             let health = rig.torch.limits.health();
             let level = rig.level();
             let convert = rig.convert();
+
+            // VDDIO2. With the switch down or the light on the torch is
+            // awake, so missing is a fault and the light's out on this tick,
+            // from whatever level.
+            if !vddio2 && (pressed || level_before > 0) {
+                check!(t, health == Health::Fault, "{health:?}, VDDIO2 missing");
+                check!(t, level == 0, "level {level} with VDDIO2 missing");
+                check!(t, rig.output() == Output::OFF, "{:?}", rig.output());
+                let good = health_before == Health::Good;
+                seen.cut_while_lit += u32::from(level_before > 0);
+                seen.cut_by_a_press += u32::from(level_before == 0 && good);
+            }
 
             // The clicks and holds that should have reached the UI.
             let mut ignored = false;
@@ -1531,6 +1785,7 @@ mod tests {
                 check!(t, click, "on without a click: {event:?}");
                 check!(t, health_before == Health::Good, "{health_before:?}");
                 check!(t, health == Health::Good, "{health:?}");
+                check!(t, vddio2, "lit with VDDIO2 missing");
                 check!(t, level <= ON_LEVEL, "on at {level}");
                 seen.turned_on += 1;
             } else if level_before > 0 && level == 0 {
@@ -1571,12 +1826,14 @@ mod tests {
                 check!(t, level == 0, "flat at level {level}");
             }
             if health_before == Health::Fault {
-                // Down a level a tick, then off, or off at a click.
+                // Down a level a tick, then off, or off at a click, or off
+                // from anywhere with VDDIO2 missing.
                 check!(t, level <= level_before, "{level_before} to {level}");
                 if level > 0 {
                     check!(t, moved == 1, "{level_before} to {level}");
                 } else if level_before > 0 {
-                    check!(t, click || level_before == 1, "out from {level_before}");
+                    let out = click || level_before == 1 || !vddio2;
+                    check!(t, out, "out from {level_before}");
                     seen.clicked_off_mid_fade += u32::from(click);
                 }
             }
@@ -1613,9 +1870,16 @@ mod tests {
                     check!(t, !resting && convert == started, "no check, {convert:?}");
                     model.checked_at = t;
                     seen.checks += 1;
+                    // A check is awake, so it looks at VDDIO2 too.
+                    if !vddio2 {
+                        check!(t, health == Health::Fault, "{health:?} at a check");
+                        seen.cut_at_a_check += 1;
+                    }
                 } else {
+                    // At rest nothing looks, VDDIO2 included.
                     check!(t, resting, "woke with the switch up");
                     check!(t, health == health_before, "{health:?} while resting");
+                    seen.vddio2_missing_unseen += u32::from(!vddio2 && health == Health::Good);
                 }
             }
             let checking =
@@ -1625,7 +1889,8 @@ mod tests {
                 check!(
                     t,
                     health == health_before
-                        || (health_before == Health::Flat && health == Health::Good),
+                        || (health_before == Health::Flat && health == Health::Good)
+                        || (!vddio2 && health == Health::Fault),
                     "a check took it from {health_before:?} to {health:?}"
                 );
                 check!(t, resting == at_a_check, "two ticks awake, then rest");
@@ -1686,6 +1951,7 @@ mod tests {
     /// most. At [`Pace::Slow`] each lives ten times as long.
     fn throw_noise_at_torches(seed: u32, pace: Pace, ticks: u32, seen: &mut Seen) {
         let mut rng = Rng::new(seed);
+        let mut supply = Rng::new(seed ^ 0x00AA_0000);
         let (mut life, mut run) = (0, 0);
         while run < ticks {
             let faults = match rng.next_u16() % 8 {
@@ -1699,7 +1965,7 @@ mod tests {
             if pace == Pace::Slow {
                 length *= 10;
             }
-            run += live(&mut rng, pace, faults, length, seen, life);
+            run += live(&mut rng, &mut supply, pace, faults, length, seen, life);
             life += 1;
         }
     }
@@ -1726,6 +1992,8 @@ mod tests {
             ("locked out", seen.locked),
             ("flat", seen.flat),
             ("failed at power-on", seen.failed_at_power_on),
+            ("resting through VDDIO2 missing", seen.vddio2_missing_unseen),
+            ("cut at a check of the cell", seen.cut_at_a_check),
         ] {
             assert!(times > 0, "never {what}: {seen:?}");
         }
@@ -1764,6 +2032,9 @@ mod tests {
             ("unable to read the cell", seen.went_blind),
             ("clicked off mid-fade", seen.clicked_off_mid_fade),
             ("pressed with the light kept out", seen.ignored_presses),
+            ("resting through VDDIO2 missing", seen.vddio2_missing_unseen),
+            ("cut with the light on", seen.cut_while_lit),
+            ("cut by a press", seen.cut_by_a_press),
         ] {
             assert!(times > 0, "never {what}: {seen:?}");
         }

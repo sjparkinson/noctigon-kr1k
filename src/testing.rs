@@ -21,7 +21,10 @@
 //! the firmware can't read, and 0 V is what a dead ADC reads. `fault` starts
 //! a torch whose power-on checks failed, so it has to come before anything
 //! that takes time. So does `flash:corrupt`, a byte of flash that doesn't
-//! match its CRC.
+//! match its CRC. `vddio2:lost` is MVIO saying VDDIO2, the supply PC1 is on,
+//! is missing from there on, and `vddio2:back` that it's there again. Lost
+//! before anything that takes time, it's missing at power-on, which is a
+//! failed check.
 //!
 //! # docs/ui.md
 //!
@@ -191,6 +194,8 @@ pub enum Action {
     Cell(u16),
     /// The temperature from now on, in kelvin.
     Heat(u16),
+    /// Whether MVIO says VDDIO2 is there from now on.
+    Vddio2(bool),
     /// A flash byte that doesn't match the CRC. Power-on only.
     CorruptFlash,
     /// The power-on checks fail. Power-on only.
@@ -223,6 +228,8 @@ pub enum Error {
     TooLong,
     Voltage,
     Temperature,
+    /// `vddio2:` with anything but `lost` or `back`.
+    Supply,
     /// `fault` or `flash:corrupt` after something that takes time.
     NotAtPowerOn,
 }
@@ -242,6 +249,7 @@ impl fmt::Display for Error {
             Self::TooLong => "that's too long",
             Self::Voltage => "expected a voltage like 2.95V",
             Self::Temperature => "expected a temperature like 80C",
+            Self::Supply => "expected vddio2:lost or vddio2:back",
             Self::NotAtPowerOn => {
                 "the firmware only checks that at power-on, so it goes before anything \
                  that takes time"
@@ -254,14 +262,21 @@ impl fmt::Display for Error {
 impl FromStr for Action {
     type Err = Error;
 
-    /// `3C`, `2H`, `1H:500ms`, `wait:2s`, `cell:2.95V`, `heat:80C`, `fault`
-    /// or `flash:corrupt`.
+    /// `3C`, `2H`, `1H:500ms`, `wait:2s`, `cell:2.95V`, `heat:80C`,
+    /// `vddio2:lost`, `vddio2:back`, `fault` or `flash:corrupt`.
     fn from_str(word: &str) -> Result<Self, Error> {
         if word == "fault" {
             return Ok(Self::Fault);
         }
         if word == "flash:corrupt" {
             return Ok(Self::CorruptFlash);
+        }
+        if let Some(supply) = word.strip_prefix("vddio2:") {
+            return match supply {
+                "lost" => Ok(Self::Vddio2(false)),
+                "back" => Ok(Self::Vddio2(true)),
+                _ => Err(Error::Supply),
+            };
         }
         if let Some(volts) = word.strip_prefix("cell:") {
             return centivolts(volts).map(Self::Cell);
@@ -388,6 +403,8 @@ pub struct Scene {
     /// The ADC never finishes a conversion, so the firmware's loop never sees
     /// a result. No script word sets it.
     pub adc_dead: bool,
+    /// Whether MVIO says VDDIO2, the supply PC1 is on, is there.
+    pub vddio2: bool,
 }
 
 impl Scene {
@@ -398,6 +415,7 @@ impl Scene {
         fault: false,
         corrupt_flash: false,
         adc_dead: false,
+        vddio2: true,
     };
 
     /// What the power-on checks find, with `fault` standing for a fuse that
@@ -406,6 +424,7 @@ impl Scene {
         Faults {
             fuses: self.fault,
             flash: self.corrupt_flash,
+            supply: !self.vddio2,
             ..Faults::NONE
         }
     }
@@ -448,6 +467,10 @@ pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item 
                 scene.kelvin = kelvin;
                 (0, 0, 0)
             }
+            Action::Vddio2(there) => {
+                scene.vddio2 = there;
+                (0, 0, 0)
+            }
             Action::CorruptFlash => {
                 scene.corrupt_flash = true;
                 (0, 0, 0)
@@ -482,6 +505,9 @@ pub struct Rig {
     pub torch: Torch,
     /// What [`Rig::tick`] reads. [`Rig::tick_in`] reads a scene instead.
     pub adc: Adc,
+    /// Whether [`Rig::tick`] tells the torch VDDIO2 is there. A scene says
+    /// for [`Rig::tick_in`].
+    pub vddio2: bool,
 }
 
 impl Default for Rig {
@@ -499,19 +525,21 @@ impl Rig {
         Self {
             torch: Torch::new(CALIBRATION, faults),
             adc: Adc::new(),
+            vddio2: true,
         }
     }
 
-    /// One tick, the ADC reading `adc`'s `voltage` and `temperature`.
+    /// One tick, the ADC reading `adc`'s `voltage` and `temperature`, and
+    /// MVIO saying what `vddio2` does.
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
-        let event = self.torch.tick(pressed, self.adc.result());
+        let event = self.torch.tick(pressed, self.adc.result(), self.vddio2);
         self.adc.start(self.torch.convert());
         event
     }
 
-    /// One tick, the ADC reading what `scene` says.
+    /// One tick, the ADC and MVIO reading what `scene` says.
     pub fn tick_in(&mut self, pressed: bool, scene: &Scene) -> Option<Event> {
-        let event = self.torch.tick(pressed, self.adc.result());
+        let event = self.torch.tick(pressed, self.adc.result(), scene.vddio2);
         // A dead ADC is started on but never answers, so nothing's pending.
         let convert = self.torch.convert().filter(|_| !scene.adc_dead);
         self.adc
@@ -1031,6 +1059,7 @@ mod tests {
             fault: true,
             corrupt_flash: false,
             adc_dead: false,
+            vddio2: true,
         };
         let mut samples = samples(script).peekable();
         assert!(samples.peek().is_some());

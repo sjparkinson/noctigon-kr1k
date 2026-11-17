@@ -45,6 +45,7 @@ What covers each hazard, and how well, is in [safety.md](safety.md). These are t
 - [x] Unhandled interrupts go to `hw::halt` instead of `reti`, across the AVR32DD20's 36 vectors
 - [ ] A commit stamp in flash, just before the CRC, at the end of 32 KB
 - [x] The errata's lost write (DS80001026D §2.2.3) checked by the simulator, for every VPORT, GPR and `SLPCTRL.CTRLA` write the runs reach
+- [x] VDDIO2 watched after power-on, read once a pass while awake, and the light out on the tick it reads missing, as a fault (H1). Simulator only, and the threshold it trips at isn't in the datasheet
 
 ## 3. It's nice to use
 
