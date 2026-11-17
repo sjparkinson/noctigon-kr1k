@@ -92,8 +92,15 @@ extern "C" fn main() -> ! {
 
         // VDDIO2 is read again on every pass, since PC1 is on it and lets go
         // of the driver's enable without it. The library puts the light out
-        // on the tick it reads missing.
-        torch.tick(hw::switch_pressed(), hw::adc_result(), hw::vddio2_ok());
+        // on the tick it reads missing. The torch also keeps the light dark
+        // unless the watchdog's lit window is in force, whatever the UI asks
+        // for, so it never counts a light it isn't showing.
+        torch.tick(
+            hw::switch_pressed(),
+            hw::adc_result(),
+            hw::vddio2_ok(),
+            pacer.lit(),
+        );
 
         if let Some(convert) = torch.convert() {
             hw::adc_start(convert);
@@ -113,9 +120,7 @@ extern "C" fn main() -> ! {
             aux.failed();
         }
 
-        // Off unless the watchdog's lit window is in force, whatever the
-        // torch asks for.
-        if let Some(output) = output_changes.update(pacer.guard(torch.output())) {
+        if let Some(output) = output_changes.update(torch.output()) {
             hw::set_output(output);
         }
 

@@ -116,7 +116,25 @@ impl Torch {
     /// and a click from off counts `button::RELEASE_TICKS` after it's let
     /// go, so every tick from the press to the one that lights the light has
     /// looked, that one included, and so does every check of the cell.
-    pub fn tick(&mut self, pressed: bool, adc: Option<u16>, vddio2: bool) -> Option<Event> {
+    ///
+    /// `lit_window` is whether the watchdog's lit setting is in force with a
+    /// `wdr` behind it (`watchdog::Pacer::lit`), the only setting PC1 may
+    /// rise under. Without it the light's level is 0 whatever the UI wants,
+    /// so the torch doesn't count as lit, and its first tick with it is
+    /// [`Output::STARTING`] as for any light. The UI still wanting light
+    /// keeps the torch from resting, so the pacer puts the lit setting back.
+    /// The light only comes on after a click or a hold, which can't count
+    /// before the lit setting's back (`watchdog::EXIT_PASSES`), so this
+    /// changes nothing the torch does today. It's there so that a way to
+    /// light it added later, one that doesn't wait for the switch, can't
+    /// raise PC1 under the rest setting or with the PIT slow.
+    pub fn tick(
+        &mut self,
+        pressed: bool,
+        adc: Option<u16>,
+        vddio2: bool,
+        lit_window: bool,
+    ) -> Option<Event> {
         self.warm = self.level() > 0;
         self.showing = self.showing.saturating_sub(1);
         let event = self.clicks.tick_up_to(pressed, self.ui.most_clicks());
@@ -143,7 +161,13 @@ impl Torch {
             self.checking = true;
         }
         if !self.resting() {
-            let step = self.limits.tick(self.ui.output_level(), adc, vddio2);
+            // Dark outside the watchdog's lit window, whatever the UI wants.
+            let asked = if lit_window {
+                self.ui.output_level()
+            } else {
+                0
+            };
+            let step = self.limits.tick(asked, adc, vddio2);
             if step.off {
                 self.ui.off();
             }
@@ -456,15 +480,19 @@ mod tests {
                         passes += 1;
                     }
                     slow += u32::from(paced.pacer.slow());
-                    // The torch's own output, before `Pacer::guard`, which
-                    // would make the last check true whatever it asked for.
-                    let asked = paced.rig.torch.output();
-                    assert_eq!(paced.output(), asked, "{phase:?}: the guard never bites");
+                    // The UI never wants light on a pass the torch was told
+                    // the lit window isn't in force, so holding it dark
+                    // never holds anything back.
+                    assert!(
+                        paced.rig.lit_window || paced.rig.torch.ui.output_level() == 0,
+                        "{phase:?}: the UI wants light outside the lit window"
+                    );
+                    let shown = paced.output();
                     if phase == PitPhase::Aligned {
-                        assert_eq!(asked, plain.output());
+                        assert_eq!(shown, plain.output());
                     }
-                    lit += u32::from(asked.enable);
-                    assert!(!asked.enable || paced.pacer.lit(), "{phase:?}");
+                    lit += u32::from(shown.enable);
+                    assert!(!shown.enable || paced.pacer.lit(), "{phase:?}");
                 }
             }
             assert!(slow > 10_000, "{phase:?} hardly ever slowed: {slow}");
@@ -492,7 +520,7 @@ mod tests {
             let quiet = torch.quiet_for().map_or(0, |quiet| quiet.min(ticks));
             let mut by_tick = torch.torch.clone();
             for _ in 0..quiet {
-                by_tick.tick(false, None, true);
+                by_tick.tick(false, None, true, true);
             }
             let mut at_once = torch.torch.clone();
             at_once.rest_for(ticks);
@@ -589,6 +617,40 @@ mod tests {
             torch.tick(false);
             assert_eq!(torch.output(), Output::OFF);
         }
+    }
+
+    /// Told the watchdog's lit window isn't in force, the torch is dark at
+    /// level 0 whatever the UI wants, stays awake so the window comes back,
+    /// and starts the driver with the DAC at zero once it does, as for any
+    /// light. The firmware never gets here today.
+    #[test]
+    fn outside_the_lit_window_it_stays_dark_and_starts_afresh_after() {
+        let mut torch = Rig {
+            lit_window: false,
+            ..Rig::default()
+        };
+        click(&mut torch);
+        assert_eq!(torch.ui.output_level(), ON_LEVEL, "the UI's on");
+        assert_eq!(torch.level(), 0);
+        assert_eq!(torch.output(), Output::OFF);
+        run(&mut torch, false, 10);
+        assert_eq!(torch.output(), Output::OFF);
+        assert!(!torch.resting(), "awake, so the pacer puts the window back");
+        torch.lit_window = true;
+        torch.tick(false);
+        assert_eq!(torch.output(), Output::STARTING);
+        torch.tick(false);
+        assert_eq!(torch.output(), dim());
+        // Lit, the window going for a tick puts it out, and it starts
+        // afresh when it's back.
+        torch.lit_window = false;
+        torch.tick(false);
+        assert_eq!((torch.level(), torch.output()), (0, Output::OFF));
+        torch.lit_window = true;
+        torch.tick(false);
+        assert_eq!(torch.output(), Output::STARTING);
+        torch.tick(false);
+        assert_eq!(torch.output(), dim());
     }
 
     #[test]
@@ -1019,10 +1081,10 @@ mod tests {
         rest(&mut torch, CHECK_TICKS - 1, "to the next check");
         // No result at all, which reads as zero.
         for _ in 0..CHECK_AWAKE {
-            torch.torch.tick(false, None, true);
+            torch.torch.tick(false, None, true, true);
             assert!(!torch.resting());
         }
-        torch.torch.tick(false, None, true);
+        torch.torch.tick(false, None, true, true);
         assert!(torch.resting());
         assert_eq!(torch.convert(), None);
         assert_eq!(torch.aux(), Aux::Off);
@@ -2105,7 +2167,7 @@ mod tests {
             if lose != 0 && rng.next_u16().is_multiple_of(lose) {
                 seen.results_lost += u32::from(result.take().is_some());
             }
-            let event = rig.torch.tick(pressed, result, vddio2);
+            let event = rig.torch.tick(pressed, result, vddio2, true);
             rig.adc
                 .start_with(rig.torch.convert(), |channel| match channel {
                     Channel::Voltage | Channel::Vddio2 => cell.read(rng),
