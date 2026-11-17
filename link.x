@@ -1,14 +1,8 @@
 /*
- * AVR32DD20: 32 KB flash, 4 KB SRAM, 256 B EEPROM.
- *
- * AVR ELF files put data space at 0x800000, so SRAM (data address 0x7000)
- * is 0x807000 here. The chip also maps flash into data space at 0x8000, a
- * 32 KB window (DS40002413A section 11.3.2), so read-only data is linked at
- * its flash address + 0x808000 and read with ordinary loads, no progmem
- * dance needed. NVMCTRL.CTRLB.FLMAP picks which 32 KB of flash the window
- * shows, and on a part with 32 KB of flash every value shows all of it
- * (DS40002413A section 11.5.2). Its reset value is 0x30, SECTION3, and
- * nothing in the firmware writes it.
+ * AVR ELF puts data space at 0x800000. Flash is mapped into data space at
+ * 0x8000 (DS40002413A §11.3.2), so .rodata sits at 0x808000 and up and is
+ * read with ordinary loads. With 32 KB of flash every FLMAP value shows all
+ * of it (§11.5.2).
  */
 MEMORY {
   FLASH  (rx)   : ORIGIN = 0x000000, LENGTH = 32K
@@ -29,10 +23,8 @@ SECTIONS {
   } > MAPPED
 
   /*
-   * The firmware's last supply readings, first in SRAM so `cargo xtask peek`
-   * finds them at a fixed address (kr1k::sensors::SUPPLIES_AT), whatever
-   * other statics come and go. NOLOAD and outside .bss, so src/avr/rt.rs
-   * doesn't touch it, and `main` zeroes it itself straight after reset.
+   * First in SRAM so `cargo xtask peek` finds it at kr1k::sensors::SUPPLIES_AT.
+   * NOLOAD and outside .bss, so rt.rs leaves it alone and `main` zeroes it.
    */
   .supplies (NOLOAD) : {
     KEEP(*(.supplies))
@@ -45,7 +37,7 @@ SECTIONS {
     __data_end = .;
   } > RAM
 
-  /* Where src/avr/rt.rs copies .data from, as a mapped-flash data address. */
+  /* A mapped-flash data address. */
   __data_load = LOADADDR(.data) + 0x8000;
 
   .bss (NOLOAD) : {
@@ -54,8 +46,6 @@ SECTIONS {
     . = ALIGN(2);
     __bss_end = .;
   } > RAM
-
-  /* The stack grows down from the top of SRAM, where the CPU starts SP. */
 
   /DISCARD/ : {
     *(.eh_frame*)
