@@ -1,16 +1,9 @@
-//! The firmware. Sample the switch, step the UI, set the output, 64 times a
-//! second, or once a second at rest (`kr1k::watchdog::Pacer`).
-//!
-//! On the host this builds to a stub, so `cargo test` and `cargo clippy`
-//! work across the workspace. `cargo xtask hex` builds the real thing.
+//! The firmware's loop. On the host it builds to a stub, so the workspace
+//! builds and tests there.
 
 #![cfg_attr(target_arch = "avr", no_std, no_main)]
 #![cfg_attr(target_arch = "avr", feature(asm_experimental_arch))]
 #![cfg_attr(target_arch = "avr", feature(abi_avr_interrupt))]
-// The same restrictions as the library's, for the loop, the hardware layer
-// and the startup code. Only the AVR clippy sees them. The xtask test
-// `lints::restriction_lint_lists_match` keeps this list in step with the
-// library's.
 #![cfg_attr(
     target_arch = "avr",
     deny(
@@ -27,7 +20,6 @@
     )
 )]
 
-// The hardware layer and the startup code, which only the AVR build has.
 #[cfg(target_arch = "avr")]
 mod avr {
     pub mod hw;
@@ -35,12 +27,9 @@ mod avr {
 }
 #[cfg(target_arch = "avr")]
 use avr::hw;
-// The library owns src/regs.rs, since its self-tests check fuse fields with
-// the same masks; hw.rs and rt.rs reach it as `crate::regs`.
 #[cfg(target_arch = "avr")]
 use kr1k::regs;
 
-// src/avr/rt.rs calls `main` by name once memory is set up.
 #[cfg(target_arch = "avr")]
 #[allow(unsafe_code)]
 #[unsafe(no_mangle)]
@@ -50,10 +39,9 @@ extern "C" fn main() -> ! {
     use kr1k::torch::{Changes, Torch};
     use kr1k::watchdog::{End, Pacer};
 
-    // PC1 floats from reset until it's an output.
+    // First, since PC1 floats from reset until it's an output.
     hw::hold_enable_low();
-    // The supply readings for `cargo xtask peek` sit outside .bss, so
-    // startup leaves them as SRAM had them. Nothing's been read yet.
+    // The supply readings sit outside .bss, so startup doesn't zero them.
     hw::record_supplies([0; 4]);
 
     let faults = Faults {
@@ -73,28 +61,20 @@ extern "C" fn main() -> ! {
     let mut end = End::start(torch.resting());
 
     loop {
-        // Power-down or idle, and whether a switch edge ends it, as the last
-        // pass's end says, which the simulator holds this loop to. `None`
-        // means the light's on and no tick came in about 103 ms, so the
-        // 32 kHz oscillator has most likely stopped, and the watchdog with
-        // it. The light goes off and stays off until a reset.
+        // Most likely a stopped 32 kHz oscillator with the light on.
         let Some(wake) = hw::wait_for_tick(end.power_down, end.switch_wakes) else {
             hw::halt();
         };
 
-        // A slow tick stands for a second of resting ticks, and a watchdog
-        // setting to change goes in now, to sync while the pass runs.
+        // A watchdog setting goes in now, to sync while the pass runs.
         let begin = pacer.begin(wake);
         if let Some(setting) = begin.watchdog {
             hw::set_watchdog(setting);
         }
         torch.rest_for(begin.rested);
 
-        // VDDIO2 is read again on every pass, since PC1 is on it and lets go
-        // of the driver's enable without it. The library puts the light out
-        // on the tick it reads missing. The torch also keeps the light dark
-        // unless the watchdog's lit window is in force, whatever the UI asks
-        // for, so it never counts a light it isn't showing.
+        // VDDIO2 is read on every pass, since PC1 lets go of the driver's
+        // enable without it.
         torch.tick(
             hw::take_switch(),
             hw::adc_result(),
@@ -106,14 +86,10 @@ extern "C" fn main() -> ! {
             hw::adc_start(convert);
         }
 
-        // The cell and VDDIO2 as last read with the light off, kept for
-        // `cargo xtask peek`. Nothing reads them back.
         hw::record_supplies(torch.supplies().to_bytes());
 
         // The aux before the output, so they go dark before the light comes
-        // on. They only light a tick after it goes out, since the AW2016
-        // wakes a tick before it takes a colour. A step that fails is given
-        // up on, never tried again until the colour changes.
+        // on. A step that fails is never retried.
         if let Some(update) = aux.step(torch.aux())
             && !hw::set_aux(update)
         {
@@ -124,9 +100,8 @@ extern "C" fn main() -> ! {
             hw::set_output(output);
         }
 
-        // The only place the running torch feeds the watchdog, after the
-        // setting written at the start has synced, and before the PIT
-        // changes period.
+        // The only feed, after the setting written at the start has synced
+        // and before the PIT changes period.
         end = pacer.end(
             torch.resting(),
             torch.can_slow() && aux.settled(torch.aux()),
@@ -143,18 +118,8 @@ extern "C" fn main() -> ! {
     }
 }
 
-// Turns the light off and powers down for good (`hw::halt`). The watchdog
-// isn't fed there, so it resets the chip, within 64 WDT clocks of the last
-// feed under the lit setting, about 63 ms, or within 8,192 under the rest
-// setting, about 8 s, and the next boot comes up as a fault, dark until the
-// cell comes out.
-//
-// Spinning here would end the same way while the watchdog runs. `halt` is for
-// when it doesn't, with the 32 kHz oscillator dead. No reset comes then, and
-// a spin would keep the CPU running off the cell for good where `halt`
-// sleeps. It's here because Rust requires a handler. `cargo xtask hex`
-// refuses any image that could reach it (xtask/src/layout.rs), so nothing
-// should ever run this.
+// `halt` rather than a spin, which would drain the cell if the 32 kHz
+// oscillator were dead and no watchdog reset came.
 #[cfg(target_arch = "avr")]
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

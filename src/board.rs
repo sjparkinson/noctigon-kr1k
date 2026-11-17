@@ -1,51 +1,12 @@
-//! The KR1K's Lume X1-C driver pin map, as bit numbers within each port.
-//! It's what the stock firmware's board definition says, and nobody has
-//! traced it on a real board yet.
-//!
-//! These are board facts, not registers. `src/avr/hw.rs` drives the pins
-//! through `src/regs.rs`, and xtask's simulator wires its fake chip up the
-//! same way from here.
-//!
-//! | Pin           | Job                                                    |
-//! |---------------|--------------------------------------------------------|
-//! | PA0           | FET gate (TCA0 WO0), not fitted on this driver, unused |
-//! | PA1           | Unknown, an output held low as the stock build has it  |
-//! | PA2           | TWI0 SDA to the AW2016 aux driver                      |
-//! | PA3           | TWI0 SCL to the AW2016 aux driver                      |
-//! | PA4           | Button LED, plain GPIO                                 |
-//! | PA5           | Power path 3, high range                               |
-//! | PA6           | Power path 2, low range                                |
-//! | PA7           | Power path 1, moon range                               |
-//! | PC1           | Boost and amplifier enable, high is on                 |
-//! | PC2, PC3      | Unused                                                 |
-//! | PD4           | E-switch, active low, external 100k pull-up            |
-//! | PD5           | Unused                                                 |
-//! | PD6           | DAC0 out, the current setpoint                         |
-//! | PD7           | Power-bank enable on other boards, unused              |
-//! | PF6           | Reset pin, left alone                                  |
-//! | PF7           | UPDI, left alone                                       |
-//!
-//! The RGB aux LEDs hang off the AW2016, an I2C LED driver, so no MCU pin
-//! lights a colour. `kr1k::aw2016` turns `ui::Aux` into AW2016 register
-//! writes, and the AW2016 outputs each colour is on are below, as
-//! [`AUX_RED`], [`AUX_GREEN`] and [`AUX_BLUE`].
-//!
-//! PA1 is the one pin that isn't what the stock board definition says. That
-//! has nothing on it and gives it a pull-up, but the build this torch shipped
-//! with (0284, in the gitignored `backup/stock/flash.hex`) writes 0xF2 to
-//! `VPORTA.DIR` in its reset path and never sets PA1's `OUT`, so PA1 is an
-//! output held low. `cargo xtask peek` on 2026-11-16, with that build asleep,
-//! read `VPORTA.DIR` as 0xE2, PA1 still an output. What PA1 connects to on
-//! the X1-C is unknown (on the plain Lume X1 it's the aux red LED), so the
-//! firmware does what the stock build did and never drives it high.
+//! The KR1K's Lume X1-C driver pin map, as bit numbers within each port. It's
+//! the stock firmware's, bar PA1, and nobody has traced it on a real board.
 
-/// PA0, the FET gate on drivers that have a FET. Unused here.
+/// PA0, the FET gate, not fitted on this driver.
 pub const FET: u8 = 0;
-/// PA1, connected to nobody knows what, so an output held low as the stock
-/// build on this torch has it (see the module doc). Never high, and no
-/// pull-up.
+/// PA1, connected to something unknown. The stock build on this torch holds
+/// it as an output at 0, so never high, and no pull-up.
 pub const HELD_LOW: u8 = 1;
-/// PA2, TWI0 SDA.
+/// PA2, TWI0 SDA to the AW2016.
 pub const TWI_SDA: u8 = 2;
 /// PA3, TWI0 SCL.
 pub const TWI_SCL: u8 = 3;
@@ -57,37 +18,30 @@ pub const PATH3: u8 = 5;
 pub const PATH2: u8 = 6;
 /// PA7, power path 1, the moon range.
 pub const PATH1: u8 = 7;
-/// All three power paths, as a PORTA mask.
 pub const PATHS: u8 = 1 << PATH1 | 1 << PATH2 | 1 << PATH3;
 
-/// PC1, the dangerous one, which is low whenever the light's off.
+/// PC1, the boost and amplifier enable. High is on.
 pub const ENABLE: u8 = 1;
-/// PC2.
 pub const UNUSED_PC2: u8 = 2;
-/// PC3.
 pub const UNUSED_PC3: u8 = 3;
 
-/// PD4, the e-switch.
+/// PD4, the e-switch, active low, with an external 100k pull-up.
 pub const SWITCH: u8 = 4;
-/// PD5.
 pub const UNUSED_PD5: u8 = 5;
-/// PD6, DAC0's output.
+/// PD6, DAC0's output, the current setpoint.
 pub const DAC: u8 = 6;
-/// PD7, a power-bank enable on other boards.
+/// PD7, a power-bank enable on other boards, unused here.
 pub const POWER_BANK: u8 = 7;
 
-/// The AW2016 output the red aux are on, counting LED1 as 0. These three are
-/// the stock firmware's channel map, and nobody has traced them on a real
-/// board.
+/// The AW2016 output each aux colour is on, counting LED1 as 0. The stock
+/// firmware's channel map, which nobody has traced on a real board.
 pub const AUX_RED: u8 = 1;
-/// The AW2016 output the green aux are on, LED1.
 pub const AUX_GREEN: u8 = 0;
-/// The AW2016 output the blue aux are on, LED3.
 pub const AUX_BLUE: u8 = 2;
 
-/// PF6, the reset pin.
+/// PF6, the reset pin, left alone.
 pub const RESET: u8 = 6;
-/// PF7, UPDI.
+/// PF7, UPDI, left alone.
 pub const UPDI: u8 = 7;
 
 #[cfg(test)]
