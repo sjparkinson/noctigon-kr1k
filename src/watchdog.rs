@@ -172,8 +172,10 @@ impl Feeder {
         self.fed
     }
 
-    /// Whether the last [`tick`](Self::tick) fed the watchdog.
-    pub const fn fed(&self) -> bool {
+    /// Whether the last [`tick`](Self::tick) fed the watchdog. Only the tests
+    /// ask, since [`Feeder::power_down`] reads it for the firmware.
+    #[cfg(test)]
+    const fn fed(&self) -> bool {
         self.fed
     }
 
