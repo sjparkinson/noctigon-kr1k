@@ -1,21 +1,11 @@
 //! Enough XML to read Microchip's ATDF, and the generator that turns the copy
 //! in `vendor/` into the constants in `src/regs.rs`.
 //!
-//! This file does two jobs. The root package's `build.rs` loads it by path and
-//! calls [`generate`]. xtask compiles it for its tests only (`main.rs` declares
-//! it under `#[cfg(test)]`), which is where the parser and the generator get
-//! tested, because a build script can't have tests of its own. The tests also
-//! check what generating can't, which is what the firmware assumes about the
-//! ATDF's layout, and that `link.x` agrees with it. So nothing outside them
-//! may name `crate::` or `kr1k::`, which `build.rs` doesn't have.
-//!
-//! The parser handles what ATDF files contain, which is elements, double- or
-//! single-quoted attributes, comments and the XML declaration. Text content
-//! is skipped, since the ATDF keeps everything in attributes.
+//! The root package's `build.rs` loads this file by path, so nothing outside
+//! the tests may name `crate::` or `kr1k::`.
 
 use std::collections::BTreeMap;
 
-/// One XML element, with its name, attributes and child elements.
 struct Element {
     name: String,
     attrs: Vec<(String, String)>,
@@ -46,7 +36,6 @@ impl Element {
             .unwrap_or_else(|| panic!("<{}> has no <{tag}>", self.name))
     }
 
-    /// The child `<tag name="...">`.
     fn named(&self, tag: &str, name: &str) -> &Self {
         self.children
             .iter()
@@ -173,7 +162,6 @@ fn unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
-/// A register on one peripheral instance, at its data-space address.
 struct Register<'a> {
     instance: &'a str,
     name: &'a str,
@@ -182,8 +170,7 @@ struct Register<'a> {
     element: &'a Element,
 }
 
-/// Every register on every peripheral instance. TCA0's come twice where its
-/// SINGLE and SPLIT modes share a name.
+/// TCA0's registers come twice where its SINGLE and SPLIT modes share a name.
 fn registers(document: &Element) -> Vec<Register<'_>> {
     let file = document.child("avr-tools-device-file");
     let device = file.child("devices").child("device");
@@ -208,16 +195,10 @@ fn registers(document: &Element) -> Vec<Register<'_>> {
     registers
 }
 
-/// Generated constants on their way out, by name, so they come out sorted.
 #[derive(Default)]
 struct Consts(BTreeMap<String, (u32, String)>);
 
 impl Consts {
-    /// Adds a constant. A name can turn up more than once (RTC.PITINTFLAGS.PI
-    /// and RTC.PITINTCTRL.PI, or a TCA register in both modes), which is fine
-    /// while the value agrees. If it doesn't, the names in `src/regs.rs` have
-    /// stopped being unique, and the build should say so. The ATDF's names
-    /// are nearly all upper case; a few values, like `10mV`, aren't.
     fn add(&mut self, name: String, value: u32, doc: String) {
         let name = name.to_ascii_uppercase();
         if let Some((theirs, first)) = self.0.get(&name) {
@@ -241,7 +222,6 @@ impl Consts {
     }
 }
 
-/// `path`, and the ATDF's caption for it if it has one.
 fn doc(path: String, element: &Element) -> String {
     match element.attr("caption") {
         Some(caption) if !caption.is_empty() => format!("{path}: {caption}"),
@@ -249,11 +229,7 @@ fn doc(path: String, element: &Element) -> String {
     }
 }
 
-/// The Rust source of every constant the ATDF can give. `src/regs.rs`
-/// includes it, and describes the names.
-///
-/// Only addresses, masks, named values, segments, vectors and the signature.
-/// The `initval`s stay out on purpose, because they disagree with the
+/// The ATDF's `initval`s stay out on purpose, because they disagree with the
 /// datasheet on ADC0.CALIB and the factory OSCCFG and SYSCFG0.
 pub fn generate(xml: &str) -> String {
     let document = parse(xml);
@@ -357,8 +333,7 @@ pub fn generate(xml: &str) -> String {
          /// The device signature.\n\
          pub const SIGNATURE: [u8; 3] = {signature:#04X?};\n",
         addr.render(|_| "usize"),
-        // usize is 16 bits on the AVR, and the mapped-flash window ends at
-        // 0x10000, one past the top of data space.
+        // usize is 16 bits on the AVR, and the mapped-flash window ends at 0x10000.
         mem.render(|value| if value > 0xFFFF { "u32" } else { "usize" }),
         bits.render(|value| match value {
             0x1_0000.. => "u32",
@@ -398,8 +373,6 @@ mod tests {
         assert_eq!(num("16"), 16);
     }
 
-    /// One constant per rule in `generate`, as the AVR32DD20's datasheet and
-    /// ATDF have them, so a generator that goes wrong can't agree with itself.
     #[test]
     fn generates_each_kind_of_constant() {
         assert_eq!(addr::CPU_CCP, 0x0034, "a plain address");
@@ -456,11 +429,6 @@ mod tests {
         consts.add("A".into(), 2, "second".into());
     }
 
-    /// `write16` takes TCB0's CNT and CCMP and DAC0.DATA, the current
-    /// setpoint, two bytes at a time, and so does the ADC result read.
-    /// Nothing uses TCA0, but its 16-bit SINGLE mode registers sit at the
-    /// same addresses as SPLIT mode's 8-bit ones, so they check a width isn't
-    /// lost to that.
     #[test]
     fn the_16_bit_registers_are_16_bits() {
         let xml = atdf();
@@ -485,7 +453,6 @@ mod tests {
         }
     }
 
-    /// hw.rs reaches PINnCTRL as PIN0CTRL + n.
     #[test]
     fn pin_controls_are_consecutive() {
         let xml = atdf();
@@ -508,9 +475,6 @@ mod tests {
         }
     }
 
-    /// link.x's MEMORY regions, and every other address in it, against the
-    /// ATDF. 0x800000 (`elf::DATA_SPACE`) is where AVR ELF files put data
-    /// space, a toolchain convention the ATDF doesn't record.
     #[test]
     fn linker_script_matches_the_atdf() {
         let data = crate::elf::DATA_SPACE;
@@ -539,8 +503,6 @@ mod tests {
             ],
             "link.x MEMORY"
         );
-        // SECTIONS turns flash addresses into mapped ones, as ELF addresses
-        // for .rodata and as data-space ones for __data_load.
         for n in sections {
             assert!(
                 n == data + mapped || n == mapped,
@@ -565,9 +527,8 @@ mod tests {
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 
-    /// Enough of a GNU ld script to get the (name, origin, length) of each
-    /// MEMORY region, and the hex numbers anywhere after MEMORY. Comments
-    /// are dropped first.
+    /// Each MEMORY region as (name, origin, length), then every hex number
+    /// after MEMORY.
     fn linker_script(script: &str) -> (Vec<(String, u32, u32)>, Vec<u32>) {
         let mut text = String::new();
         let mut rest = script;

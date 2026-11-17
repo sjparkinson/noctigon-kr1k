@@ -7,10 +7,10 @@ use kr1k::regs::mem;
 
 /// AVR ELF files put data space at 0x800000.
 pub const DATA_SPACE: u32 = 0x80_0000;
-/// SRAM's data-space range on the AVR32DD20, as ELF addresses.
+/// SRAM as ELF addresses.
 pub const RAM: Range<u32> =
     DATA_SPACE + mem::INTERNAL_SRAM_START as u32..DATA_SPACE + mem::INTERNAL_SRAM_END as u32;
-/// The same range as the CPU and UPDI see it, as data-space addresses.
+/// SRAM as data-space addresses.
 pub const SRAM: Range<u16> = (RAM.start - DATA_SPACE) as u16..(RAM.end - DATA_SPACE) as u16;
 
 const PT_LOAD: u32 = 1;
@@ -25,9 +25,7 @@ pub struct Elf {
     symbols: Vec<(String, u32)>,
 }
 
-/// A loadable piece of the image. `vaddr` is where the code expects to find
-/// it, `paddr` where it sits in flash. They differ for .rodata (read through
-/// the mapped-flash window) and .data (copied into SRAM by src/avr/rt.rs).
+/// `vaddr` is where the code expects it and `paddr` is where it sits in flash.
 pub struct Segment {
     pub vaddr: u32,
     pub paddr: u32,
@@ -66,9 +64,6 @@ impl Elf {
                 r.u32(at + 12)?,
                 r.u32(at + 16)?,
             );
-            // Loadable bytes with a flash load address are what gets
-            // programmed, which means .text, .rodata and .data's initial
-            // values.
             if kind == PT_LOAD && filesz > 0 && paddr < DATA_SPACE {
                 let data = r.slice(offset as usize, filesz as usize)?.to_vec();
                 segments.push(Segment { vaddr, paddr, data });
@@ -89,10 +84,8 @@ impl Elf {
                 size: r.u32(at + 20)?,
             });
             if r.u32(at + 4)? == SHT_SYMTAB {
-                // sh_link names the string table the symbols' names are in.
                 let (offset, size) = (r.u32(at + 16)? as usize, r.u32(at + 20)? as usize);
                 let strings = r.u32(header(r.u32(at + 24)?) + 16)? as usize;
-                // Entry 0 is the reserved null symbol.
                 for sym in (offset..offset + size).step_by(16).skip(1) {
                     let name = r.cstr(strings + r.u32(sym)? as usize)?;
                     symbols.push((name, r.u32(sym + 4)?));
@@ -108,7 +101,6 @@ impl Elf {
         })
     }
 
-    /// Flash contents from address 0, with gaps filled with 0xFF (erased).
     pub fn flash_image(&self) -> Vec<u8> {
         let end = self
             .segments
@@ -124,7 +116,6 @@ impl Elf {
         image
     }
 
-    /// Bytes of SRAM taken by .data and .bss.
     pub fn ram_bytes(&self) -> u32 {
         self.sections
             .iter()
@@ -133,7 +124,6 @@ impl Elf {
             .sum()
     }
 
-    /// The address execution starts at, from the ELF header.
     pub const fn entry(&self) -> u32 {
         self.entry
     }
@@ -142,7 +132,6 @@ impl Elf {
         &self.segments
     }
 
-    /// The address range of the first section called `name`.
     pub fn section(&self, name: &str) -> Option<Range<u32>> {
         self.sections
             .iter()
@@ -150,8 +139,7 @@ impl Elf {
             .map(|s| s.addr..s.addr + s.size)
     }
 
-    /// The value of the first symbol called `name`. For code that's its
-    /// byte address in flash.
+    /// For code, the value is a byte address in flash.
     pub fn symbol(&self, name: &str) -> Option<u32> {
         self.symbols
             .iter()
@@ -159,7 +147,6 @@ impl Elf {
             .map(|&(_, value)| value)
     }
 
-    /// Every symbol name, in the order the symbol table has them.
     pub fn symbols(&self) -> impl Iterator<Item = &str> + '_ {
         self.symbols.iter().map(|(name, _)| name.as_str())
     }
@@ -188,7 +175,6 @@ impl Reader<'_> {
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
 
-    /// A NUL-terminated string starting at `at`.
     fn cstr(&self, at: usize) -> Result<String, String> {
         let rest = self
             .0
@@ -206,15 +192,11 @@ impl Reader<'_> {
 mod tests {
     use super::*;
 
-    /// Builds a minimal AVR ELF with two loadable segments, a .bss section, a
-    /// debug section and a symbol table.
     fn sample() -> Vec<u8> {
         sample_with(&[])
     }
 
-    /// [`sample`], with more program headers after its two. Each is
-    /// `(type, vaddr, paddr, filesz)`, and its bytes in the file are the
-    /// start of the sample's own six.
+    /// Each extra program header is `(type, vaddr, paddr, filesz)`.
     fn sample_with(extra: &[(u32, u32, u32, u32)]) -> Vec<u8> {
         const SHNUM: usize = 5;
         let phnum = 2 + extra.len();
@@ -235,7 +217,6 @@ mod tests {
         f[48..50].copy_from_slice(&(SHNUM as u16).to_le_bytes());
         f[50..52].copy_from_slice(&2u16.to_le_bytes()); // shstrndx
 
-        // The bytes the headers point at, in file order.
         let image = [0x0C, 0x94, 0x1F, 0x00, 0xAA, 0xBB];
         let shstrtab = b"\0.bss\0.shstrtab\0.symtab\0.strtab\0.debug_info\0";
         let strtab = b"\0__reset\0main\0halt\0";
@@ -251,7 +232,6 @@ mod tests {
         let strtab_at = shstrtab_at + shstrtab.len() as u32;
         let symtab_at = strtab_at + strtab.len() as u32;
 
-        // .text at 0, then .rodata loaded at 6 but linked in mapped flash.
         let headers = [
             (PT_LOAD, 0u32, 0u32, image_at, 4u32),
             (PT_LOAD, 0x80_8006, 6, image_at + 4, 2),
@@ -270,9 +250,7 @@ mod tests {
         }
         // (name, type, flags, addr, offset, size, link)
         let sections = [
-            (1u32, 8u32, SHF_ALLOC | 0x1, 0x80_7000u32, 0u32, 12u32, 0u32), // .bss counts
-            // .debug_info doesn't, wherever it says it is, since it isn't
-            // allocated.
+            (1u32, 8u32, SHF_ALLOC | 0x1, 0x80_7000u32, 0u32, 12u32, 0u32),
             (34, 1, 0, 0x80_7100, 0, 999, 0),
             (6, 3, 0, 0, shstrtab_at, shstrtab.len() as u32, 0),
             (16, SHT_SYMTAB, 0, 0, symtab_at, symtab.len() as u32, 4),
@@ -314,7 +292,6 @@ mod tests {
 
     #[test]
     fn does_not_count_an_allocated_section_outside_sram() {
-        // .bss moved to each end of what isn't SRAM.
         for addr in [0, RAM.start - 1, RAM.end, DATA_SPACE + 0x8000] {
             let mut f = sample();
             let bss = 52 + 2 * 32;
@@ -333,11 +310,8 @@ mod tests {
     fn takes_only_loadable_bytes_bound_for_flash() {
         const PT_NOTE: u32 = 4;
         let extra = [
-            // Not loadable.
             (PT_NOTE, 0x20, 0x20, 2),
-            // Loadable, with nothing in the file, as .bss is.
             (PT_LOAD, 0x40, 0x40, 0),
-            // Loaded into data space, at its very start and inside SRAM.
             (PT_LOAD, DATA_SPACE, DATA_SPACE, 2),
             (PT_LOAD, RAM.start, RAM.start, 2),
         ];
@@ -348,7 +322,6 @@ mod tests {
             [0x0C, 0x94, 0x1F, 0x00, 0xFF, 0xFF, 0xAA, 0xBB]
         );
 
-        // The last byte of program space still counts as flash.
         let elf = Elf::parse(&sample_with(&[(PT_LOAD, 0, DATA_SPACE - 1, 1)])).unwrap();
         assert_eq!(elf.segments().len(), 3);
         assert_eq!(elf.segments()[2].paddr, DATA_SPACE - 1);
@@ -378,8 +351,7 @@ mod tests {
     #[test]
     fn refuses_a_file_that_was_cut_short() {
         let f = sample();
-        // The last eight bytes are the end of the last symbol, which nothing
-        // reads.
+        // Nothing reads the last eight bytes, the end of the last symbol.
         for len in 4..f.len() - 8 {
             let Err(err) = Elf::parse(&f[..len]) else {
                 panic!("parsed the first {len} bytes");

@@ -1,33 +1,14 @@
-//! A UPDI programmer for the AVR32DD20, spoken over a serial adapter.
+//! A UPDI programmer for the AVR32DD20 over a serial adapter (DS40002413B
+//! chapters 11 and 36), with the sequences of pymcuprog's `nvmp2.py`.
 //!
-//! UPDI is Microchip's one-wire debug and programming interface. A "serial
-//! UPDI" programmer is a USB-serial chip with TX and RX joined onto that one
-//! wire, so everything sent comes straight back as an echo before the
-//! chip's reply. [`Wire`] hides the echo; this module only sees replies.
-//!
-//! The protocol is in the AVR DD datasheet (DS40002413B, chapter 36, UPDI),
-//! and the NVM controller in chapter 11 (NVMCTRL). The DD has 24-bit UPDI
-//! addressing with flash at 0x80_0000 (§36.2.2), and the NVM controller
-//! pymcuprog calls NVM P:2, which writes flash a word at a time with no page
-//! buffer. The sequences here (link set-up, NVM key, reset, chip erase, page
-//! erase, word writes, EEPROM erase-writes) follow Microchip's pymcuprog
-//! (`serialupdi/nvmp2.py`), the reference serial UPDI implementation, and
-//! agree with avrdude's serialupdi. Register addresses, the memory map and NVM
-//! commands come from the AVR32DD20 ATDF in `vendor/`, through `kr1k::regs`.
-//! The UPDI instruction set, and where flash sits in UPDI's address space,
-//! aren't in the ATDF, so those stay hand-written.
-//!
-//! This deliberately can't write fuses, the lock bits or the user row, and
-//! can't unlock a locked chip. None of those are needed to flash the KR1K,
-//! and a wrong fuse can leave it unrecoverable without a high-voltage
-//! programmer.
+//! It deliberately can't write fuses, the lock bits or the user row, and
+//! can't unlock a locked chip.
 
 use std::fmt;
 use std::io;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-// NVMCTRL.CTRLA commands and NVMCTRL.STATUS fields.
 use kr1k::regs::{
     NVMCTRL_CMD_CHER as NVM_CHIP_ERASE, NVMCTRL_CMD_EEERWR as NVM_EEPROM_ERASE_WRITE,
     NVMCTRL_CMD_FLPER as NVM_FLASH_PAGE_ERASE, NVMCTRL_CMD_FLWR as NVM_FLASH_WRITE,
@@ -37,55 +18,38 @@ use kr1k::regs::{
     NVMCTRL_ERROR_ILLEGALSADDR as NVM_ERROR_WRITE_PROTECT, NVMCTRL_FBUSY as NVM_FBUSY,
 };
 
-/// The AVR32DD20's memories. Everything but [`UPDI_FLASH`] is a data-space
-/// address, which UPDI reaches at the same number (DS40002413B §36.2.2).
+/// All but [`UPDI_FLASH`] are data-space addresses (DS40002413B §36.2.2).
 pub mod map {
     use kr1k::regs::{self, addr, mem};
 
-    /// Flash in UPDI's own address space, where "the code space always
-    /// starts at the offset address 0x80_0000" (DS §36.2.2, figure 36-2).
-    /// The ATDF only has the CPU's view, so this one is typed by hand. Every
-    /// flash read and write the programmer makes goes here.
+    /// UPDI's address space (DS §36.2.2, figure 36-2), not in the ATDF.
     pub const UPDI_FLASH: u32 = 0x80_0000;
-    /// Flash seen through the CPU's data-space window, all 32 KB of it. The
-    /// programmer doesn't use it; the simulator and `layout.rs` do.
     pub const FLASH: u16 = mem::MAPPED_PROGMEM_START as u16;
     pub const FLASH_SIZE: usize = mem::PROGMEM_SIZE;
-    /// The erase granularity. Writes go by the word (DS §11.3.1.1).
     pub const FLASH_PAGE: usize = mem::PROGMEM_PAGE;
 
-    /// EEPROM, which erases and writes a byte at a time (DS §11.3.1.2).
     pub const EEPROM: u16 = mem::EEPROM_START as u16;
     pub const EEPROM_SIZE: usize = mem::EEPROM_SIZE;
 
-    /// Device ID, SIGROW.DEVICEID0 to DEVICEID2.
     pub const SIGNATURE: u16 = mem::SIGNATURES_START as u16;
-    /// What the device ID reads on an AVR32DD20 (DS table 8-4), and the only
-    /// chip this programmer writes to.
     pub const AVR32DD20: [u8; 3] = regs::SIGNATURE;
 
-    /// The chip's serial number, SIGROW.SERNUM0 to SERNUM15 (DS §8.6.2).
-    /// Read only, since UPDI can't write the signature row (DS table 8-5),
-    /// and nothing here tries.
+    /// Read only, since UPDI can't write the signature row (DS table 8-5).
     pub const SERIAL: u16 = addr::SIGROW_SERNUM0 as u16;
     pub const SERIAL_SIZE: usize = addr::SIGROW_SERNUM15 - addr::SIGROW_SERNUM0 + 1;
 
-    /// FUSE.WDTCFG to the last reserved fuse byte. Read for `backup`, and
-    /// nothing here writes them.
+    /// Read for `backup`. Nothing here writes the fuses.
     pub const FUSES: u16 = mem::FUSES_START as u16;
     pub const FUSES_SIZE: usize = mem::FUSES_SIZE;
 
-    /// LOCK.KEY, 32 bits low byte first, which sits before the fuses on the
-    /// DD. Read for `backup`, and nothing here writes it.
+    /// LOCK.KEY, low byte first. Read for `backup`, and nothing here writes it.
     pub const LOCK: u16 = mem::LOCKBITS_START as u16;
     pub const LOCK_SIZE: usize = mem::LOCKBITS_SIZE;
-    /// What LOCK.KEY reads on an unlocked chip, in the order UPDI reads it.
-    /// "Other" values lock it (DS §8.9.2.1). The programmer goes by
-    /// ASI_SYS_STATUS.LOCKSTATUS; the fake chip keeps LOCK.KEY.
+    /// Any other value locks the chip (DS §8.9.2.1).
     #[cfg(test)]
     pub const UNLOCKED: [u8; LOCK_SIZE] = regs::LOCK_KEY_NOLOCK.to_le_bytes();
 
-    /// The user row. Read for `backup`, and nothing here writes it.
+    /// Read for `backup`. Nothing here writes the user row.
     pub const USERROW: u16 = mem::USER_SIGNATURES_START as u16;
     pub const USERROW_SIZE: usize = mem::USER_SIGNATURES_SIZE;
 
@@ -93,18 +57,12 @@ pub mod map {
     pub const NVMCTRL_STATUS: u16 = addr::NVMCTRL_STATUS as u16;
 }
 
-/// One serial UPDI connection. `send` writes bytes and swallows their echo;
-/// `recv` reads the chip's reply.
+/// `send` swallows the echo of what it writes.
 pub trait Wire {
     fn send(&mut self, bytes: &[u8]) -> io::Result<()>;
     fn recv(&mut self, buf: &mut [u8]) -> io::Result<()>;
-    /// Holds the line low for two long frames, which resets UPDI's own
-    /// state machine (not the chip) so it listens for a fresh SYNC.
+    /// Resets UPDI's own state machine, not the chip.
     fn double_break(&mut self) -> io::Result<()>;
-    /// The time, which the programmer's timeouts count against. A real
-    /// connection takes the clock's; the fake chip in the tests keeps its
-    /// own, a frame per byte and a round trip per reply, so a timeout can't
-    /// pass on a count of polls and the tests don't wait for real.
     fn now(&self) -> Instant {
         Instant::now()
     }
@@ -125,13 +83,11 @@ const REPEAT: u8 = 0xA0;
 const STCS: u8 = 0xC0;
 const KEY: u8 = 0xE0;
 
-// Instruction modifiers.
 const PTR_INC: u8 = 0x04;
 const PTR_ADDRESS: u8 = 0x08;
 /// Size A of three bytes, in bits 3:2 of LDS and STS.
 const ADDRESS_24: u8 = 0x08;
-/// The same size in bits 1:0 of an ST to the pointer, which is where that
-/// instruction takes it (DS §36.3.3.4).
+/// The same size in bits 1:0 of an ST to the pointer (DS §36.3.3.4).
 const PTR_SIZE_24: u8 = 0x02;
 const DATA_8: u8 = 0x00;
 const DATA_16: u8 = 0x01;
@@ -139,7 +95,7 @@ const KEY_SIB: u8 = 0x04;
 const KEY_64: u8 = 0x00;
 const SIB_16: u8 = 0x01;
 
-// Control and status registers.
+// Control and status registers (DS §36.4) and their bits (§36.5.3 to §36.5.9).
 const CS_STATUSA: u8 = 0x00;
 const CS_CTRLA: u8 = 0x02;
 const CS_CTRLB: u8 = 0x03;
@@ -158,36 +114,22 @@ const RESET_REQ_APPLY: u8 = 0x59;
 
 const KEY_NVMPROG: &[u8; 8] = b"NVMProg ";
 
-/// SIB bytes 8 to 10, NVM_VERSION (DS figure 36-20), on a chip with the NVM
-/// controller this programmer drives. avrdude read "NVM type 2" from the
-/// torch's SIB on 2026-11-16. A tinyAVR reads `P:0`.
+/// SIB bytes 8 to 10, NVM_VERSION (DS figure 36-20). A tinyAVR reads `P:0`.
 const SIB_NVM_P2: &[u8; 3] = b"P:2";
 
-/// The most a single REPEAT can cover, which is 256 bytes on a read and 256
-/// words, one flash page, on a write.
+/// The most one REPEAT covers, in bytes on a read and words on a write.
 const MAX_BLOCK: usize = 256;
 
-/// How long the chip gets to come out of reset into programming mode.
+/// As avrdude allows to reach programming mode. SUT is 64 ms at most (ATDF).
 const PROGMODE_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The highest address UPDI's 24-bit addressing reaches.
 const ADDRESS_END: u32 = 1 << 24;
 
-/// A chip's serial number, SIGROW.SERNUM0 to SERNUM15 in that order.
-///
-/// The datasheet's words are "Each device has an individual serial number,
-/// representing a unique ID. This number can be used to identify a specific
-/// device in the field" (DS §8.6.2.3), and it "consists of the production
-/// lot number, wafer number, and the device's wafer coordinates" (§11.3.1.3).
-/// Nobody here has compared two chips'.
-/// `backup` saves it beside the images, and `restore` checks it before it
-/// erases anything, so a backup only goes back onto the chip it was read
-/// from.
+/// A unique ID by DS §8.6.2.3, unconfirmed across chips.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SerialNumber([u8; map::SERIAL_SIZE]);
 
 impl SerialNumber {
-    /// From the bytes `backup` saved, which have to be all sixteen.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         match bytes.try_into() {
             Ok(bytes) => Ok(Self(bytes)),
@@ -203,17 +145,11 @@ impl SerialNumber {
         &self.0
     }
 
-    /// Whether every byte is 0xFF, or every byte is 0x00. Two chips that
-    /// both read that way couldn't be told apart, so it can't say which chip
-    /// a backup came from, and a check against it would pass for the wrong
-    /// reason. Nothing says a real chip ever reads like this.
+    /// Nothing says a real chip ever reads like this.
     pub fn is_blank(&self) -> bool {
         self.0 == [0xFF; map::SERIAL_SIZE] || self.0 == [0x00; map::SERIAL_SIZE]
     }
 
-    /// Fails if this serial number, the one saved with the backup in `dir`,
-    /// is blank. That needs no chip, so `restore` asks before it opens the
-    /// port.
     pub fn check_saved(&self, dir: &Path) -> Result<()> {
         if !self.is_blank() {
             return Ok(());
@@ -227,10 +163,6 @@ impl SerialNumber {
         ))
     }
 
-    /// Fails unless `chip`, just read from the chip on the wire, is this
-    /// serial number, the one saved with the backup in `dir`. A blank one on
-    /// either side fails too. Only [`Programmer::connect_for_restore`] asks,
-    /// and it asks before anything's erased, which is what the errors say.
     fn check_chip(&self, chip: &Self, dir: &Path) -> Result<()> {
         self.check_saved(dir)?;
         if chip.is_blank() {
@@ -254,7 +186,6 @@ impl SerialNumber {
     }
 }
 
-/// As `12 34 56`, the way the signature's shown.
 impl fmt::Display for SerialNumber {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&hex(&self.0))
@@ -266,17 +197,6 @@ pub struct Programmer<W: Wire> {
 }
 
 impl<W: Wire> Programmer<W> {
-    /// Brings up the UPDI link, with a double break and a second try if the
-    /// chip doesn't answer the first time.
-    ///
-    /// If the second try fails too, this gives up without sending UPDIDIS,
-    /// though the chip may have heard enough to turn UPDI on. That's been
-    /// looked at and left. By then the line has failed to answer twice, and
-    /// it gets no more bytes sent down it. For one that's held low,
-    /// docs/flashing.md says to stop and measure. What's left behind is UPDI
-    /// and its clock request staying on, which costs power (DS §36.3.2.2.2),
-    /// and only while the chip has any. The cell's out, so the adapter is its
-    /// only supply, and that goes as the probe lifts.
     pub fn connect(wire: W) -> Result<Self> {
         let mut p = Self { wire };
         if p.init_link().is_err() {
@@ -286,26 +206,10 @@ impl<W: Wire> Programmer<W> {
         Ok(p)
     }
 
-    /// Brings up the link, refuses a chip whose SIB doesn't say NVM P:2,
-    /// enters programming mode and refuses anything but an AVR32DD20.
-    ///
-    /// The SIB needs no key (DS §36.3.7), so a tinyAVR such as the TS26's
-    /// ATtiny1616 is turned away before the key or a reset goes out, with
-    /// UPDIDIS and nothing else. If entering programming mode or the
-    /// signature check fails, the NVM key and a reset may already have gone
-    /// out, so this leaves the way [`Self::leave`] does before it reports
-    /// what failed. Returning early would leave the chip with UPDI on, and
-    /// perhaps held in programming mode, with nothing here to let it go.
-    ///
-    /// Leaving is a reset request and UPDIDIS, both writes to UPDI's own
-    /// registers, which is all a locked chip accepts (DS §36.3.8.1). Neither
-    /// erases anything, since that takes the chip erase key, which this never
-    /// sends.
+    /// The SIB needs no key (DS §36.3.7), so it's checked before the key goes out.
     pub fn connect_for_programming(wire: W) -> Result<Self> {
         let mut p = Self::connect(wire)?;
         if let Err(error) = p.check_sib() {
-            // Whatever turning UPDI off says, the first error is the one to
-            // report.
             let _ = p.disconnect();
             return Err(error);
         }
@@ -318,15 +222,6 @@ impl<W: Wire> Programmer<W> {
         }
     }
 
-    /// As [`Self::connect_for_programming`], for `restore`. It then reads
-    /// the chip's serial number and refuses any chip but the one the backup
-    /// in `dir` was read from, whose serial number is `saved`. That's after
-    /// the signature check and before anything's erased, so there's no
-    /// programmer to erase with until the two match. A chip that's refused is
-    /// left the way [`Self::leave`] does it, with a reset and then UPDI off.
-    ///
-    /// A blank `saved` is refused before a byte goes out. All this adds on
-    /// the wire is one read of the signature row.
     pub fn connect_for_restore(wire: W, saved: &SerialNumber, dir: &Path) -> Result<Self> {
         saved.check_saved(dir)?;
         let mut p = Self::connect_for_programming(wire)?;
@@ -336,7 +231,6 @@ impl<W: Wire> Programmer<W> {
         {
             Ok(()) => Ok(p),
             Err(error) => {
-                // Whatever leaving says, the first error is the one to report.
                 let _ = p.leave();
                 Err(error)
             }
@@ -352,9 +246,7 @@ impl<W: Wire> Programmer<W> {
         }
     }
 
-    /// The System Information Block, 16 bytes of ASCII naming the chip
-    /// family, NVM and debug versions. Readable without any key, locked or
-    /// not (DS §36.3.7).
+    /// Readable without a key, locked or not (DS §36.3.7).
     pub fn sib(&mut self) -> Result<[u8; 16]> {
         self.send(&[SYNC, KEY | KEY_SIB | SIB_16])?;
         let mut sib = [0; 16];
@@ -362,11 +254,6 @@ impl<W: Wire> Programmer<W> {
         Ok(sib)
     }
 
-    /// Fails unless the SIB's NVM_VERSION, bytes 8 to 10 (DS figure 36-20),
-    /// says `P:2`, the NVM controller every write here is written for. The
-    /// signature is the real check, read after the key and reset as the
-    /// TS26's programmer did it, though UPDI can read it without (§8.6); this one
-    /// turns away other families before the key goes out.
     pub fn check_sib(&mut self) -> Result<()> {
         let sib = self.sib()?;
         if &sib[8..11] == SIB_NVM_P2 {
@@ -380,14 +267,8 @@ impl<W: Wire> Programmer<W> {
         ))
     }
 
-    /// Sends the NVM programming key and resets the chip into programming
-    /// mode, as DS40002413B §36.3.8.2 has it, steps 2 to 7. The firmware
-    /// stops running from here until [`Self::leave`].
+    /// DS40002413B §36.3.8.2 steps 2 to 7.
     pub fn enter_progmode(&mut self) -> Result<()> {
-        // Already there only counts on the same terms as the wait below. The
-        // NVMPROG key needs the lock bits cleared (DS table 36-4), so a real
-        // chip shouldn't read both bits set, but nothing in the datasheet
-        // says it can't.
         let status = self.ldcs(ASI_SYS_STATUS)?;
         if status & SYS_STATUS_LOCKSTATUS == 0 && status & SYS_STATUS_PROGSTART != 0 {
             return Ok(());
@@ -400,16 +281,6 @@ impl<W: Wire> Programmer<W> {
             return Err("the chip didn't accept the NVM programming key".into());
         }
 
-        // The chip isn't in programming mode until it's through reset and
-        // ASI_SYS_STATUS.PROGSTART is set (§36.3.8.2 steps 6 and 7), and
-        // pymcuprog and avrdude both expect it to read as locked until then,
-        // so this waits for PROGSTART set and LOCKSTATUS clear. That's timed
-        // by the clock, not by a count of polls, because a poll's round trip
-        // depends on the adapter's USB latency, and a fast adapter could run
-        // out of polls inside the start-up time. FUSE.SYSCFG1's SUT sets
-        // that, and 64 ms is the longest it goes (ATDF), whatever this chip's
-        // fuse holds. avrdude allows 100 ms to unlock and 500 ms more to
-        // reach programming mode; one 500 ms window covers both here.
         self.reset()?;
         let deadline = self.wire.now() + PROGMODE_TIMEOUT;
         loop {
@@ -428,7 +299,6 @@ impl<W: Wire> Programmer<W> {
         )
     }
 
-    /// Fails unless the chip reports itself as an AVR32DD20.
     pub fn check_signature(&mut self) -> Result<()> {
         let signature = self.read(map::SIGNATURE, 3)?;
         if signature == map::AVR32DD20 {
@@ -442,16 +312,12 @@ impl<W: Wire> Programmer<W> {
         }
     }
 
-    /// Reads the chip's serial number, SERNUM0 to SERNUM15. It's the same
-    /// kind of read as [`Self::check_signature`]'s, further along the
-    /// signature row, which UPDI can read on an unlocked chip (DS table 8-5).
     pub fn serial_number(&mut self) -> Result<SerialNumber> {
         let bytes = self.read(map::SERIAL, map::SERIAL_SIZE)?;
         SerialNumber::from_bytes(&bytes)
     }
 
-    /// Reads `len` bytes from `addr` in UPDI's address space, which is data
-    /// space below 0x1_0000 and flash from [`map::UPDI_FLASH`].
+    /// `addr` is in UPDI's address space, so flash is from [`map::UPDI_FLASH`].
     pub fn read(&mut self, addr: impl Into<u32>, len: usize) -> Result<Vec<u8>> {
         let addr = addr.into();
         let mut out = vec![0; len];
@@ -465,12 +331,7 @@ impl<W: Wire> Programmer<W> {
         Ok(out)
     }
 
-    /// Erases all of flash, and EEPROM unless the EESAVE fuse is set, with
-    /// NVMCTRL's CHER, which "can only be started from the UPDI" (DS
-    /// §11.3.2.3.8), and then clears the command, as pymcuprog's
-    /// `chip_erase` does. This is on an unlocked chip in programming mode,
-    /// which is the only kind this programmer gets that far with, so it's an
-    /// erase of what the chip holds and never an unlock.
+    /// CHER (DS §11.3.2.3.8). Only reached unlocked, so it's never an unlock.
     pub fn chip_erase(&mut self) -> Result<()> {
         self.wait_nvm()?;
         self.nvm_command(NVM_CHIP_ERASE)?;
@@ -478,19 +339,7 @@ impl<W: Wire> Programmer<W> {
         self.clear_command(erased)
     }
 
-    /// Chip-erases, then writes `data` from the start of flash a page at a
-    /// time, each page erased with FLPER and then written by the word with
-    /// FLWR. Blank pages are skipped, since the chip erase left them blank.
-    /// Erases EEPROM too unless EESAVE is set.
-    ///
-    /// The page erase straight after a chip erase repeats work, about 10 ms
-    /// a page (DS table 38-8). It's there so a word only ever lands on a page
-    /// this call erased itself, since "before a write is performed to an
-    /// address, its content needs to be erased" (§11.3.2.3.1). The chip erase stays because that's what
-    /// clears the pages the image leaves blank, and EEPROM.
-    ///
-    /// Follow with [`Self::verify`], which catches an erase that didn't
-    /// take. Refuses an image bigger than flash before erasing anything.
+    /// A word only lands on a page this call erased (DS §11.3.2.3.1).
     pub fn erase_and_write_flash(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > map::FLASH_SIZE {
             return Err(format!(
@@ -511,10 +360,7 @@ impl<W: Wire> Programmer<W> {
         Ok(())
     }
 
-    /// Erases the 512-byte page at `page` with FLPER, which "will allow each
-    /// write to the memory array to erase a page" (DS §11.3.2.3.2), so one
-    /// byte stored anywhere in it erases the lot. pymcuprog's
-    /// `erase_flash_page` stores 0xFF at the page's address.
+    /// FLPER (DS §11.3.2.3.2), with 0xFF as pymcuprog stores.
     fn erase_flash_page(&mut self, page: u32) -> Result<()> {
         self.wait_nvm()?;
         self.nvm_command(NVM_FLASH_PAGE_ERASE)?;
@@ -522,21 +368,8 @@ impl<W: Wire> Programmer<W> {
         self.clear_command(erased)
     }
 
-    /// Writes `data`, at most a page, by the word from `page` with FLWR (DS
-    /// §11.3.2.3.1), as pymcuprog's `write_nvm` does with word access. An odd
-    /// length gets a 0xFF to make the last word, which leaves that erased
-    /// byte as it was.
-    ///
-    /// The words go out in one burst with the ACKs turned off, which is safe
-    /// only because the controller keeps up. A word write takes 75 µs at
-    /// most (tP_WRD, DS table 38-8), and a word is two 12-bit frames, 208 µs
-    /// at 115,200 baud, so each is done before the next arrives. In FLWR mode
-    /// "the ST* instructions write one byte at a time" (§11.3.2.3.1), so if a
-    /// UPDI word store programs as two bytes it's 150 µs, still inside the
-    /// 208 µs. That margin goes at about 160 kbaud, so don't raise the baud
-    /// rate without moving to acknowledged stores. A store
-    /// that came early would meet a bus wait, and with RSD set "a loss of
-    /// data may occur" (§36.5.3). [`Self::verify`] would catch that.
+    /// FLWR (DS §11.3.2.3.1) with ACKs off is safe only while a word write
+    /// (75 µs max, DS table 38-8) beats a word at 115,200 baud (208 µs).
     fn write_flash_page(&mut self, page: u32, data: &[u8]) -> Result<()> {
         assert!(data.len() <= map::FLASH_PAGE, "a page at most");
         let mut words = data.to_vec();
@@ -558,21 +391,8 @@ impl<W: Wire> Programmer<W> {
         self.clear_command(written)
     }
 
-    /// Writes `data` over EEPROM from its start, every byte of it, blank ones
-    /// included, since EESAVE can keep the old contents through a chip
-    /// erase. EEPROM erases and writes by the byte, with EEERWR, which
-    /// enables "the erase operation directly followed by a write operation"
-    /// (DS §11.3.2.3.5), as
-    /// pymcuprog's `write_eeprom` uses.
-    ///
-    /// Each byte goes as its own STS, with its ACK, and then a wait for
-    /// EEBUSY to clear, since an erase-write takes about 10 ms (tD_BEW, DS
-    /// table 38-8) and only the bus wait would hold back the next one.
-    /// Bytes past `data` keep what they held.
-    ///
-    /// Fuse programming "is identical to the EEPROM programming" (§11.3.2.2),
-    /// so this only ever stores inside EEPROM, and refuses more bytes than
-    /// EEPROM has before it sends any.
+    /// Fuse programming "is identical to the EEPROM programming" (DS
+    /// §11.3.2.2), so this must only ever store inside EEPROM.
     pub fn write_eeprom(&mut self, data: &[u8]) -> Result<()> {
         if data.len() > map::EEPROM_SIZE {
             return Err(format!(
@@ -589,9 +409,6 @@ impl<W: Wire> Programmer<W> {
         self.clear_command(written)
     }
 
-    /// Reads `data.len()` bytes from `addr` and compares them with `data`.
-    /// Run it after [`Self::erase_and_write_flash`] and
-    /// [`Self::write_eeprom`].
     pub fn verify(&mut self, addr: impl Into<u32>, data: &[u8]) -> Result<()> {
         let addr = addr.into();
         let actual = self.read(addr, data.len())?;
@@ -606,35 +423,19 @@ impl<W: Wire> Programmer<W> {
         }
     }
 
-    /// Resets the chip out of programming mode and turns UPDI off, so the
-    /// firmware starts (DS §36.3.8.2 steps 9 and 10).
+    /// DS §36.3.8.2 steps 9 and 10.
     pub fn leave(mut self) -> Result<W> {
         self.reset()?;
         self.disconnect()
     }
 
-    /// Turns UPDI off. The firmware sends no reset of its own here, but the
-    /// datasheet says writing UPDIDIS issues a system reset (§36.3.2.2.2),
-    /// so expect the chip to restart. Nobody's seen that on a real one yet.
+    /// UPDIDIS issues a System Reset (DS §36.3.2.2.2), unconfirmed on a chip.
     pub fn disconnect(mut self) -> Result<W> {
         self.stcs(CS_CTRLB, CTRLB_UPDIDIS | CTRLB_CCDETDIS)?;
         Ok(self.wire)
     }
 
-    /// Polls until the NVM controller's idle, and fails on an error code in
-    /// STATUS.ERROR, bits 6:4 (DS §11.5.3). pymcuprog's `nvmp2.py` masks
-    /// 0x30, two of the three bits; this takes all three, the ATDF's mask.
-    ///
-    /// It gives up after a count of polls where [`Self::enter_progmode`] goes
-    /// by the clock. That's been looked at and left. A count is only wrong
-    /// when a fast adapter can get through it before the chip's done, and
-    /// this one is an upper bound with room to spare. The longest operation
-    /// is a page erase at 11.7 ms or a chip erase at 11.6 ms (DS table
-    /// 38-8's maximums), and an EEPROM erase-write is 10.07 ms typical with
-    /// no maximum given. 10,000 polls take a second even at 0.1 ms a round
-    /// trip, and `serial.rs` can't be that quick. A poll is six 12-bit
-    /// frames, about 0.6 ms at 115,200 baud before any USB latency, so it's
-    /// six seconds or more.
+    /// STATUS.ERROR is bits 6:4 (DS §11.5.3), where pymcuprog masks 0x30.
     fn wait_nvm(&mut self) -> Result<()> {
         for _ in 0..10_000 {
             let status = self.lds(map::NVMCTRL_STATUS)?;
@@ -652,10 +453,7 @@ impl<W: Wire> Programmer<W> {
         self.sts(map::NVMCTRL_CTRLA, command)
     }
 
-    /// Clears the NVM command after an operation, whether `done` says it
-    /// worked or not, since "a change from one command to another must
-    /// always go through" NOCMD or NOOP (DS §11.5.1). pymcuprog clears it on
-    /// failure too. The first error is the one to report.
+    /// A change of command must go through NOCMD or NOOP (DS §11.5.1).
     fn clear_command(&mut self, done: Result<()>) -> Result<()> {
         let cleared = self.nvm_command(NVM_NO_COMMAND);
         done.and(cleared)
@@ -722,7 +520,6 @@ impl<W: Wire> Programmer<W> {
     }
 }
 
-/// `addr` as the three bytes UPDI takes, low byte first.
 fn address(addr: u32) -> Result<[u8; 3]> {
     if addr >= ADDRESS_END {
         return Err("address out of range".into());
@@ -739,15 +536,12 @@ fn offset(addr: u32, by: usize) -> Result<u32> {
         .ok_or_else(|| "address out of range".to_string())
 }
 
-/// A REPEAT instruction, to be sent ahead of the one it repeats.
 fn repeat(count: usize) -> Vec<u8> {
     assert!((1..=MAX_BLOCK).contains(&count), "REPEAT covers 1 to 256");
     vec![SYNC, REPEAT, (count - 1) as u8]
 }
 
-/// What a non-zero STATUS.ERROR means, in the datasheet's names (DS §11.5.3).
-/// The ATDF's names differ, and it gives a fourth code the datasheet calls
-/// reserved.
+/// The datasheet's names (DS §11.5.3), which differ from the ATDF's.
 fn nvm_error(status: u8) -> String {
     let code = status & NVM_ERROR;
     let what = match code {
@@ -762,7 +556,6 @@ fn nvm_error(status: u8) -> String {
     )
 }
 
-/// `[0x1E, 0x95]` as `1E 95`.
 fn hex(bytes: &[u8]) -> String {
     let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
     hex.join(" ")
@@ -782,19 +575,12 @@ pub(crate) mod tests {
     use super::*;
     use fake::Dd20;
 
-    /// Where the tests say a backup is. Nothing's read from it.
     const BACKUP: &str = "backup/breakout";
 
-    /// What `map` assumes about the ATDF's segments. Its constants come from
-    /// the ATDF, but the UPDI instruction set and UPDI's own address space
-    /// aren't in there, so those stay checked by review against the
-    /// datasheet and pymcuprog.
     #[test]
     fn map_assumes_what_the_atdf_says() {
         use kr1k::regs::{addr, mem};
 
-        // SERIAL and SERIAL_SIZE take SERNUM0 and SERNUM15 as the ends of
-        // one run of bytes.
         let sernum = [
             addr::SIGROW_SERNUM0,
             addr::SIGROW_SERNUM1,
@@ -822,15 +608,12 @@ pub(crate) mod tests {
         assert_eq!(map::FLASH_PAGE, mem::MAPPED_PROGMEM_PAGE, "flash page");
         assert_eq!(map::AVR32DD20.len(), mem::SIGNATURES_SIZE, "signature size");
         assert_eq!(addr::LOCK_KEY, map::LOCK as usize, "LOCK.KEY");
-        // The lock bits and the fuses are two reads, since they don't touch.
         const { assert!(mem::LOCKBITS_END <= mem::FUSES_START) };
     }
 
-    /// This drives a real chip, so the numbers it writes to are pinned to
-    /// the datasheet's memory map (DS40002413B §8 and §36.2.2), and a
-    /// generator that goes wrong can't move them.
     #[test]
     fn map_is_the_datasheets() {
+        // DS40002413B §8 and §36.2.2.
         assert_eq!(map::UPDI_FLASH, 0x80_0000, "flash in UPDI space");
         assert_eq!(map::FLASH_SIZE, 32 * 1024, "flash size");
         assert_eq!(map::FLASH_PAGE, 512, "flash page");
@@ -838,7 +621,6 @@ pub(crate) mod tests {
         assert_eq!(map::EEPROM_SIZE, 256, "EEPROM size");
         assert_eq!(map::SIGNATURE, 0x1100, "signature");
         assert_eq!(map::AVR32DD20, [0x1E, 0x95, 0x3A], "AVR32DD20");
-        // SIGROW is at 0x1100 (§8.2) and SERNUM0 is 0x10 into it (§8.6.1).
         assert_eq!(map::SERIAL, 0x1110, "serial number");
         assert_eq!(map::SERIAL_SIZE, 16, "serial number size");
         assert_eq!(map::LOCK, 0x1040, "lock bits");
@@ -852,12 +634,9 @@ pub(crate) mod tests {
         assert_eq!(map::NVMCTRL_STATUS, 0x1002, "NVMCTRL.STATUS");
     }
 
-    /// The NVM commands and status fields, pinned to DS40002413B §11.5.1 and
-    /// §11.5.3 and to pymcuprog's `nvmp2.py`, for the same reason. The fake
-    /// chip decodes them with these same names, so a wrong alias, CHER in
-    /// particular, would pass every other test.
     #[test]
     fn nvm_commands_are_the_datasheets() {
+        // DS40002413B §11.5.1 and §11.5.3, and pymcuprog's `nvmp2.py`.
         assert_eq!(NVM_NO_COMMAND, 0x00, "NOCMD");
         assert_eq!(NVM_FLASH_WRITE, 0x02, "FLWR");
         assert_eq!(NVM_FLASH_PAGE_ERASE, 0x08, "FLPER");
@@ -901,13 +680,8 @@ pub(crate) mod tests {
         p.check_signature().unwrap();
     }
 
-    /// More polls than the old fixed count of 100 allowed, which a fast
-    /// adapter could get through inside a 64 ms start-up time.
     #[test]
     fn waits_for_the_chip_to_start_up_on_a_fast_or_slow_adapter() {
-        // SUT is 64 ms at most; 400 ms is near the end of the window. A fast
-        // adapter fits over a thousand polls in that, more than any fixed
-        // count this used to have, and a slow one 25.
         for round_trip in [Duration::from_micros(100), Duration::from_millis(16)] {
             let mut dd = Dd20::new();
             dd.start_up = Duration::from_millis(400);
@@ -925,9 +699,6 @@ pub(crate) mod tests {
             let mut dd = Dd20::new();
             dd.start_up = Duration::from_millis(600);
             dd.round_trip = round_trip;
-            // A poll is two frames out and a round trip back. Before the
-            // first come 20 frames and two round trips: a poll, the key, its
-            // status and the reset.
             let poll = round_trip + 2 * dd.byte_time;
             let setup = 20 * dd.byte_time + 2 * round_trip;
             let mut p = Programmer::connect(dd).unwrap();
@@ -943,8 +714,7 @@ pub(crate) mod tests {
 
     #[test]
     fn refuses_another_chip_by_its_signature() {
-        // An AVR32DD32 (DS table 8-4) has the same SIB, and the TS26's
-        // ATtiny1616 shouldn't get this far, but its signature is refused too.
+        // An AVR32DD32 (DS table 8-4) and an ATtiny1616.
         for signature in [[0x1E, 0x95, 0x38], [0x1E, 0x94, 0x21]] {
             let mut dd = Dd20::new();
             dd.signature = signature;
@@ -974,9 +744,6 @@ pub(crate) mod tests {
         assert!(!dd.updi_disabled, "UPDI was turned off");
     }
 
-    /// Gives a chip something in flash and EEPROM to lose, shaped like what
-    /// avrdude read off the torch on 2026-11-16 (flash used up to 0x3B7D,
-    /// the first 58 bytes of EEPROM used), without any of its bytes.
     fn with_contents(mut dd: Dd20) -> Dd20 {
         dd.flash[..0x3B7E].fill(0x42);
         dd.eeprom[..58].fill(0x24);
@@ -997,10 +764,6 @@ pub(crate) mod tests {
         assert_eq!(dd.nvm_operations(), 0, "an erase or write went in");
     }
 
-    /// Checks a chip that was refused was let go the way `leave` does it,
-    /// which is reset a second time, then UPDI off, with the chip out of
-    /// programming mode and the flash and EEPROM [`with_contents`] gave it as
-    /// they were.
     fn assert_let_go(dd: &Dd20) {
         assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
         assert!(!dd.in_reset, "the chip was left in reset");
@@ -1009,8 +772,6 @@ pub(crate) mod tests {
         assert_contents_kept(dd);
     }
 
-    /// Connects for programming to a chip that should be refused, and checks
-    /// it was let go. Returns the error.
     fn refused(dd: Dd20) -> String {
         let mut dd = with_contents(dd);
         let Err(error) = Programmer::connect_for_programming(&mut dd) else {
@@ -1020,7 +781,6 @@ pub(crate) mod tests {
         error
     }
 
-    /// The same for a restore, of a backup that was saved with `saved`.
     fn refused_a_restore(dd: Dd20, saved: &SerialNumber) -> String {
         let mut dd = with_contents(dd);
         let Err(error) = Programmer::connect_for_restore(&mut dd, saved, Path::new(BACKUP)) else {
@@ -1038,13 +798,10 @@ pub(crate) mod tests {
         assert!(err.contains("1E 95 38"), "{err}");
     }
 
-    /// The TS26's chip, or any tinyAVR, is turned away on its SIB before the
-    /// key goes out, so it's never reset into programming mode. Only UPDIDIS
-    /// follows, and nothing's sent to its data space at all.
     #[test]
     fn a_tinyavr_is_refused_on_its_sib_before_the_key() {
         let mut dd = with_contents(Dd20::new());
-        // What another real ATtiny1616 reported.
+        // What a real ATtiny1616 reported.
         dd.sib = *b"tinyAVR P:0D:0-3";
         dd.signature = [0x1E, 0x94, 0x21];
         let Err(err) = Programmer::connect_for_programming(&mut dd) else {
@@ -1091,7 +848,6 @@ pub(crate) mod tests {
     #[test]
     fn a_serial_number_is_sixteen_bytes() {
         assert!(SerialNumber::from_bytes(&[0x12; 16]).is_ok());
-        // Ten was the ATtiny1616's.
         for wrong in [0, 10, 15, 17] {
             let err = SerialNumber::from_bytes(&vec![0x12; wrong]).unwrap_err();
             assert!(err.contains(&format!("16 bytes, not {wrong}")), "{err}");
@@ -1102,7 +858,6 @@ pub(crate) mod tests {
     fn a_serial_number_of_all_ff_or_all_00_is_blank() {
         for fill in [0xFF, 0x00] {
             assert!(SerialNumber([fill; map::SERIAL_SIZE]).is_blank());
-            // One byte that isn't is enough to tell a chip by.
             for n in 0..map::SERIAL_SIZE {
                 let mut bytes = [fill; map::SERIAL_SIZE];
                 bytes[n] ^= 0x01;
@@ -1126,7 +881,6 @@ pub(crate) mod tests {
     #[test]
     fn a_restore_onto_another_chip_ends_with_updi_off_and_nothing_written() {
         let saved = SerialNumber(Dd20::new().serial);
-        // A serial number that differs in any one byte is another chip's.
         for n in 0..map::SERIAL_SIZE {
             let mut dd = Dd20::new();
             dd.serial[n] ^= 0x01;
@@ -1154,7 +908,6 @@ pub(crate) mod tests {
     #[test]
     fn a_restore_of_a_backup_with_a_blank_serial_number_sends_nothing() {
         for (blank, name) in [(0xFF, "all FF"), (0x00, "all 00")] {
-            // The chip reads the same, so comparing the two would pass.
             let mut dd = Dd20::new();
             dd.serial = [blank; map::SERIAL_SIZE];
             let saved = SerialNumber(dd.serial);
@@ -1188,7 +941,6 @@ pub(crate) mod tests {
 
         assert_eq!(&dd.flash[..image.len()], &image[..]);
         assert!(dd.flash[image.len()..].iter().all(|&b| b == 0xFF));
-        // 1000 bytes is two pages, each erased and then written by the word.
         assert_eq!(dd.chip_erases, 1);
         assert_eq!(dd.page_erases, 2);
         assert_eq!(dd.word_writes, 500);
@@ -1209,9 +961,6 @@ pub(crate) mod tests {
         assert_eq!(dd.word_writes, 2);
     }
 
-    /// Pages the image leaves blank are skipped, so the chip erase is what
-    /// clears them. One that silently didn't happen leaves the old bytes
-    /// there, and verify reads them back.
     #[test]
     fn verify_catches_a_chip_erase_that_did_not_take() {
         let mut image = vec![0xFF; 2 * map::FLASH_PAGE];
@@ -1225,8 +974,6 @@ pub(crate) mod tests {
         assert!(err.contains("verify failed at 0x800000"), "{err}");
     }
 
-    /// And a page erase that didn't happen leaves words written over old
-    /// bytes, which only clear bits, so verify catches that too.
     #[test]
     fn verify_catches_a_page_erase_that_did_not_take() {
         let image: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
@@ -1265,7 +1012,6 @@ pub(crate) mod tests {
 
     #[test]
     fn writes_every_eeprom_byte_over_eesave_contents_blank_ones_too() {
-        // A backup whose second half is blank, over EEPROM that EESAVE kept.
         let mut eeprom: Vec<u8> = (0..=255).collect();
         eeprom[128..].fill(0xFF);
         let mut dd = Dd20::new();
@@ -1296,9 +1042,6 @@ pub(crate) mod tests {
         assert_eq!(dd.eeprom_writes, 40);
     }
 
-    /// Fuse programming works the way EEPROM's does (DS §11.3.2.2), so
-    /// `write_eeprom` refuses anything that would run past EEPROM before it
-    /// sends a byte.
     #[test]
     fn refuses_an_eeprom_image_bigger_than_eeprom_before_writing() {
         let mut p = Programmer::connect_for_programming(Dd20::new()).unwrap();
@@ -1315,7 +1058,7 @@ pub(crate) mod tests {
         p.write_eeprom(&eeprom).unwrap();
         p.verify(map::EEPROM, &eeprom).unwrap();
         let fuses = p.read(map::FUSES, map::FUSES_SIZE).unwrap();
-        // FUSE.SYSCFG0, as the torch's read.
+        // FUSE.SYSCFG0.
         assert_eq!(fuses[5], 0xD0);
         assert_eq!(p.read(map::LOCK, map::LOCK_SIZE).unwrap(), map::UNLOCKED);
         assert_eq!(
@@ -1334,17 +1077,10 @@ pub(crate) mod tests {
         assert!(err.contains("0x800001"), "{err}");
     }
 
-    /// UPDI's own registers, their bits and its instructions, pinned to the
-    /// numbers in the datasheet's UPDI chapter and pymcuprog's
-    /// `constants.py`. None of them are in the ATDF, and the fake chip
-    /// decodes most with these same names, so a slip in one would pass every
-    /// other test. Each has been read against DS40002413B: SYNCH in
-    /// §36.3.1.3, ACK in figure 36-4, the opcodes and size fields in figure
-    /// 36-8 and §36.3.3, the addresses in §36.4, the bits in §36.5.3 to
-    /// §36.5.9, the reset signature in §36.5.6, and the key and its order,
-    /// least significant byte first, in table 36-5.
     #[test]
     fn updi_registers_and_instructions_are_the_datasheets() {
+        // DS40002413B §36.3.1.3, figure 36-4, figure 36-8, §36.3.3, §36.5.6
+        // and table 36-5 (the key least significant byte first).
         assert_eq!(SYNC, 0x55, "SYNCH");
         assert_eq!(ACK, 0x40, "ACK");
 
@@ -1353,9 +1089,6 @@ pub(crate) mod tests {
             [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0, 0xC0, 0xE0],
             "opcodes"
         );
-        // What goes on the wire: LDS and STS with a 3-byte address and a
-        // byte of data, ST to the pointer with a 3-byte address, LD of bytes
-        // and ST of words with the pointer incremented, and the 16-byte SIB.
         assert_eq!(
             [
                 LDS | ADDRESS_24 | DATA_8,
@@ -1411,13 +1144,9 @@ pub(crate) mod tests {
         );
         assert!(nvm_error(0x12).contains("error 1 (INVALIDCMD"));
         assert!(nvm_error(0x21).contains("error 2 (WRITEPROTECT"));
-        // pymcuprog's 0x30 mask would miss this one.
         assert!(nvm_error(0x40).contains("error 4 (a code the datasheet calls reserved)"));
     }
 
-    /// Stands in for a line that fails the same way every time, with no chip
-    /// behind it. `fails` makes the error, on `send` if `on_send` and on
-    /// `recv` if not.
     struct BadLine {
         fails: fn() -> io::Error,
         on_send: bool,
@@ -1443,7 +1172,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// The words docs/flashing.md tells the reader to look for.
     #[test]
     fn a_chip_that_says_nothing_reads_as_no_reply_after_a_double_break() {
         let mut line = BadLine {
@@ -1462,9 +1190,6 @@ pub(crate) mod tests {
         assert_eq!(line.breaks, 1, "one double break and a second try");
     }
 
-    /// `serial.rs` says "nothing echoed back" when the adapter can't hear its
-    /// own bytes, which on the pads can mean a short. That mustn't come out as
-    /// "no reply", which means poor contact and invites pressing harder.
     #[test]
     fn a_line_that_does_not_echo_is_not_reported_as_no_reply() {
         let mut line = BadLine {
@@ -1514,14 +1239,11 @@ pub(crate) mod tests {
         let mut dd = Dd20::new();
         dd.ignores_key = true;
 
-        // On its own, entering programming mode stops at the key.
         let mut p = Programmer::connect(&mut dd).unwrap();
         let err = p.enter_progmode().unwrap_err();
         assert_eq!(err, "the chip didn't accept the NVM programming key");
         assert_eq!(dd.resets, 0, "the chip was reset without the key");
 
-        // Connecting for programming lets the chip go afterwards, so the
-        // only reset is the one that leaves.
         let mut dd = with_contents(dd);
         let Err(err) = Programmer::connect_for_programming(&mut dd) else {
             panic!("connected for programming");
@@ -1534,9 +1256,6 @@ pub(crate) mod tests {
         assert_contents_kept(&dd);
     }
 
-    /// The programmer's rule is that a chip is ready when it reads unlocked
-    /// and PROGSTART, both (DS §36.3.8.2 step 7). Either alone is refused,
-    /// and so is neither, however long it's given.
     #[test]
     fn only_a_chip_that_reads_unlocked_and_progstart_is_written_to() {
         for status in [
@@ -1554,8 +1273,7 @@ pub(crate) mod tests {
             assert!(err.contains("which this tool won't do"), "{err}");
         }
 
-        // Other bits in the register don't matter. 0x02 is BOOTDONE and 0x20
-        // is SYSRST (§36.5.9).
+        // 0x02 is BOOTDONE and 0x20 is SYSRST (DS §36.5.9).
         for other in [0x02, 0x20] {
             let mut dd = Dd20::new();
             dd.sys_status_after_reset = Some(other | SYS_STATUS_PROGSTART);
@@ -1579,9 +1297,6 @@ pub(crate) mod tests {
         assert_eq!(p.wire.nvm_operations(), 0);
     }
 
-    /// A chip that's somehow in programming mode and locked at once isn't
-    /// taken as already in programming mode. It's sent the key, and stays
-    /// locked, and is refused.
     #[test]
     fn already_in_programming_mode_but_locked_is_refused() {
         let mut p = Programmer::connect(Dd20::new()).unwrap();
@@ -1592,14 +1307,12 @@ pub(crate) mod tests {
         assert_eq!(p.wire.resets, 1, "never sent the key and reset");
     }
 
-    /// An image over two flash pages, and the EEPROM to go with it.
     fn images() -> (Vec<u8>, Vec<u8>) {
         let flash = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
         let eeprom = (0..=255).collect();
         (flash, eeprom)
     }
 
-    /// Erases, writes and verifies both memories on `dd`, and leaves.
     fn write_both(dd: Dd20) -> Dd20 {
         let (flash, eeprom) = images();
         let mut p = Programmer::connect_for_programming(dd).unwrap();
@@ -1612,10 +1325,7 @@ pub(crate) mod tests {
 
     #[test]
     fn waits_out_every_erase_and_write_before_starting_the_next() {
-        // The datasheet's typical times, then its maximums with erases a
-        // slow chip might take, each on a fast adapter and a slow one. A word
-        // write can't be slower than the wire without losing words in the
-        // burst, which is the next test's.
+        // DS table 38-8's typical times, then its maximums.
         for (word, erase, eeprom) in [(70, 10, 10), (75, 45, 45)] {
             for round_trip in [Duration::from_micros(100), Duration::from_millis(16)] {
                 let mut dd = with_contents(Dd20::new());
@@ -1639,11 +1349,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// Why the burst is safe, and what would make it not. At 115,200 baud a
-    /// word takes 208 µs to arrive, against a 75 µs write at most. On a wire
-    /// ten times quicker, words arrive while the last is still being
-    /// written, and the fake loses them, as RSD's warning says a real one may
-    /// (DS §36.5.3).
     #[test]
     fn words_that_arrive_faster_than_flash_writes_them_are_lost() {
         let image = vec![0x12; map::FLASH_PAGE];
@@ -1656,8 +1361,6 @@ pub(crate) mod tests {
         assert!(p.wire.lost_while_busy > 0);
     }
 
-    /// Flash is busy on FBUSY and EEPROM on EEBUSY, and each has to be waited
-    /// for by itself.
     #[test]
     fn waits_for_eeprom_as_well_as_flash() {
         let (_, eeprom) = images();
@@ -1668,8 +1371,6 @@ pub(crate) mod tests {
         p.verify(map::EEPROM, &eeprom[..8]).unwrap();
         let dd = p.leave().unwrap();
         assert_eq!(dd.lost_while_busy, 0);
-        // Eight bytes, each busy for 30 ms, and a poll is five frames out
-        // and a 1 ms round trip back, about 1.5 ms, so 20 polls a byte.
         assert!(dd.busy_polls >= 8 * 15, "{} busy polls", dd.busy_polls);
         assert!(
             dd.flash[..0x3B7E].iter().all(|&b| b == 0x42),
@@ -1677,11 +1378,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// What the tests above rest on: the fake loses a store that arrives
-    /// while it's busy, so a programmer that doesn't wait can't pass them.
-    /// The datasheet says a store during an operation meets a bus wait
-    /// (§11.3.2.1, §11.3.2.3.5), and with RSD set "a loss of data may occur"
-    /// (§36.5.3), so losing it is the strict reading rather than a fact.
     #[test]
     fn the_fake_chip_loses_a_store_that_arrives_while_it_is_busy() {
         let mut dd = Dd20::new();
@@ -1693,21 +1389,17 @@ pub(crate) mod tests {
         p.nvm_command(NVM_FLASH_WRITE).unwrap_or_default();
         assert_eq!(p.wire.collisions, 1, "a command selected while busy");
 
-        // A store sent without waiting goes nowhere.
         p.wire.clear_error();
         p.sts(map::UPDI_FLASH, 0x12).unwrap();
         assert_eq!(p.wire.lost_while_busy, 1);
         assert_eq!(p.wire.word_writes, 0);
 
-        // After the wait the same page goes in.
         p.wait_nvm().unwrap();
         p.write_flash_page(map::UPDI_FLASH, &[0x12]).unwrap();
         assert_eq!(p.read(map::UPDI_FLASH, 2).unwrap(), [0x12, 0xFF]);
         assert_eq!(p.wire.lost_while_busy, 1);
     }
 
-    /// A programming command written while flash or EEPROM is busy is a
-    /// command collision (DS §11.5.1), and the programmer reports it.
     #[test]
     fn a_command_sent_while_busy_is_a_collision() {
         let mut dd = Dd20::new();
@@ -1720,24 +1412,18 @@ pub(crate) mod tests {
         assert!(err.contains("error 3 (CMDCOLLISION"), "{err}");
     }
 
-    /// "A change from one command to another must always go through" NOCMD
-    /// or NOOP (DS §11.5.1). The datasheet doesn't say what happens when it
-    /// doesn't; the ATDF's caption for code 3 is "Selecting new write command
-    /// while write command already seleted" (sic), so the fake reports that.
     #[test]
     fn a_change_of_command_without_nocmd_between_is_a_collision() {
+        // Unconfirmed: the datasheet is silent, so this follows the ATDF's code 3.
         let mut p = Programmer::connect_for_programming(Dd20::new()).unwrap();
         p.nvm_command(NVM_FLASH_PAGE_ERASE).unwrap();
         p.nvm_command(NVM_FLASH_WRITE).unwrap();
         let err = p.wait_nvm().unwrap_err();
         assert!(err.contains("CMDCOLLISION"), "{err}");
-        // The error stays until it's written to 0 (§11.5.3).
         p.nvm_command(NVM_NO_COMMAND).unwrap();
         assert!(p.wait_nvm().is_err());
     }
 
-    /// A store to flash with no command selected writes nothing. The ATDF
-    /// captions code 1 "Write command not selected".
     #[test]
     fn a_store_with_no_command_selected_is_refused() {
         let mut p = Programmer::connect_for_programming(Dd20::new()).unwrap();
@@ -1747,10 +1433,6 @@ pub(crate) mod tests {
         assert_eq!(p.read(map::UPDI_FLASH, 1).unwrap(), [0xFF]);
     }
 
-    /// Writing only clears bits, and "before a write is performed to an
-    /// address, its content needs to be erased" (DS §11.3.2.3.1). The fake
-    /// ANDs and counts each byte that wasn't erased, and the tests above
-    /// check the programmer leaves that at 0.
     #[test]
     fn the_fake_counts_words_written_over_flash_that_was_not_erased() {
         let mut dd = Dd20::new();
@@ -1761,8 +1443,6 @@ pub(crate) mod tests {
         assert_eq!(p.wire.unerased_writes, 2);
     }
 
-    /// A page erase clears the whole 512-byte page the store lands in, and
-    /// no more (DS §11.3.1.1, §11.3.2.3.2).
     #[test]
     fn the_fake_erases_a_page_at_a_time() {
         let mut dd = Dd20::new();
@@ -1775,9 +1455,6 @@ pub(crate) mod tests {
         assert!(dd.flash[0x400..].iter().all(|&b| b == 0x42));
     }
 
-    /// On a locked chip UPDI can read the device ID (DS §8.6), and other
-    /// reads "may appear to be successful, but the data is not valid" (DS
-    /// table 8-6). The fake reads them as 0.
     #[test]
     fn a_locked_chip_shows_its_signature_and_nothing_else() {
         let mut dd = with_contents(Dd20::new());
@@ -1790,8 +1467,6 @@ pub(crate) mod tests {
 
     #[test]
     fn a_chip_that_never_stops_being_busy_times_out_with_an_error() {
-        // The quickest adapter `wait_nvm`'s notes allow for, which still has
-        // to give the chip a second.
         let mut dd = with_contents(Dd20::new());
         dd.chip_erase_time = Duration::MAX;
         dd.round_trip = Duration::from_micros(100);
@@ -1802,7 +1477,6 @@ pub(crate) mod tests {
         let waited = p.wire.elapsed.checked_sub(before).unwrap();
         assert!(waited >= Duration::from_secs(1), "gave up after {waited:?}");
 
-        // It stopped there, so no page went out, and it can still leave.
         let dd = p.leave().unwrap();
         assert_eq!(dd.page_erases + dd.word_writes, 0);
         assert_eq!(dd.lost_while_busy, 0);
@@ -1814,15 +1488,11 @@ pub(crate) mod tests {
     fn a_write_error_is_reported_and_stops_the_flash() {
         let (image, _) = images();
         let mut dd = Dd20::new();
-        // The first page is an erase and 256 words, so this is the second
-        // page's erase.
         dd.write_error_at = Some(1 + map::FLASH_PAGE / 2);
         let mut p = Programmer::connect_for_programming(dd).unwrap();
         let err = p.erase_and_write_flash(&image).unwrap_err();
         assert!(err.contains("error 2 (WRITEPROTECT"), "{err}");
 
-        // One page went in, the second's erase failed, and its words were
-        // never sent.
         let dd = p.leave().unwrap();
         assert_eq!(dd.page_erases, 1);
         assert_eq!(dd.word_writes, map::FLASH_PAGE / 2);
@@ -1843,16 +1513,8 @@ pub(crate) mod tests {
         assert_eq!(p.wire.eeprom_writes, 0);
     }
 
-    /// A pretend AVR32DD20 on the far end of the wire, enough to exercise
-    /// the instruction framing, 24-bit addressing, the ACK rules and the NVM
-    /// controller. It's written from the same datasheet as the programmer,
-    /// so it catches slips, not misreadings. Only a real chip catches those.
-    /// `main.rs`'s tests back it up and restore it too.
-    ///
-    /// It panics on anything the programmer must never do: the Chip Erase or
-    /// USERROW-Write key, a store to the fuses, lock bits, user row or
-    /// signature row, a store outside programming mode, and the 16-bit
-    /// address forms, which would reach the wrong memory on this chip.
+    /// Written from the same datasheet as the programmer, so it catches slips
+    /// and not misreadings.
     pub(crate) mod fake {
         use super::super::*;
         use kr1k::regs::{
@@ -1862,19 +1524,15 @@ pub(crate) mod tests {
         use std::collections::VecDeque;
         use std::ops::Range;
 
-        /// LOCK.KEY set to the ATDF's RWLOCK, one of the values that lock
-        /// the chip (DS §8.9.2.1).
         pub const LOCKED: [u8; map::LOCK_SIZE] = LOCK_KEY_RWLOCK.to_le_bytes();
 
-        /// The other two keys in DS table 36-5, which the programmer never
-        /// sends.
+        /// DS table 36-5.
         const KEY_CHIP_ERASE: &[u8; 8] = b"NVMErase";
         const KEY_USERROW: &[u8; 8] = b"NVMUs&te";
 
         const fn span(start: u32, size: usize) -> Range<u32> {
             start..start + size as u32
         }
-        /// The same for a data-space address.
         const fn data(start: u16, size: usize) -> Range<u32> {
             span(start as u32, size)
         }
@@ -1891,7 +1549,7 @@ pub(crate) mod tests {
             kr1k::regs::mem::INTERNAL_SRAM_START as u32,
             kr1k::regs::mem::INTERNAL_SRAM_SIZE,
         );
-        /// SIGROW, all of it, which UPDI can't write (DS table 8-5).
+        /// UPDI can't write any of SIGROW (DS table 8-5).
         const SIGROW: Range<u32> = data(map::SIGNATURE, 0x80);
 
         fn at(range: &Range<u32>, addr: u32) -> usize {
@@ -1908,125 +1566,65 @@ pub(crate) mod tests {
             StsData(u32),
             PtrAddress(Vec<u8>),
             RepeatCount,
-            /// Words left in an ST ptr++ of words, and the low byte of the
-            /// one arriving.
+            /// Words left, and the low byte of the one arriving.
             StIncWord(usize, Option<u8>),
         }
 
         pub struct Dd20 {
             pub flash: Vec<u8>,
             pub eeprom: Vec<u8>,
-            /// SRAM, all 4 KB, which reads 0 until a test fills it. UPDI
-            /// reads it while the firmware runs.
             pub sram: Vec<u8>,
             pub signature: [u8; 3],
-            /// SIGROW.SERNUM0 to SERNUM15. The bytes are made up.
+            /// The bytes are made up.
             pub serial: [u8; map::SERIAL_SIZE],
-            /// FUSE.WDTCFG on, as avrdude read them off the torch on
-            /// 2026-11-16.
+            /// As avrdude read them off the torch.
             pub fuses: [u8; map::FUSES_SIZE],
-            /// LOCK.KEY, low byte first. Anything but [`map::UNLOCKED`] is
-            /// locked.
             pub lock: [u8; map::LOCK_SIZE],
             pub userrow: [u8; map::USERROW_SIZE],
-            /// What the SIB reads.
             pub sib: [u8; 16],
             pub asleep: bool,
             pub breaks: usize,
-            /// Bytes the programmer has sent, to anything.
             pub sent: usize,
-            /// KEY instructions that arrived, of any key.
             pub keys: usize,
-            /// LDS, LD, STS and ST instructions that reached data space.
             pub data_accesses: usize,
-            /// Stores that reached data space, of anything, NVMCTRL's
-            /// registers included. A read-only command leaves this at 0.
             pub stores_in: usize,
             pub updi_disabled: bool,
             pub in_reset: bool,
-            /// Reset requests that were applied and then released.
             pub resets: usize,
-            /// PROGSTART, with the CPU held.
             pub progmode: bool,
-            /// How long after a reset the chip's still starting up, reading
-            /// as locked and without PROGSTART.
             pub start_up: Duration,
-            /// How long each reply takes to come back, which is the adapter's
-            /// USB latency, near enough. The fake clock moves on by this much
-            /// per `recv`.
+            /// Per `recv`.
             pub round_trip: Duration,
-            /// How long a byte takes on the wire, a 12-bit frame. The fake
-            /// clock moves on by this much per byte sent, which is what lets
-            /// it tell a burst of words from a slow trickle.
             pub byte_time: Duration,
-            /// The fake clock, as time since `clock_start`.
             pub elapsed: Duration,
             clock_start: Instant,
-            /// When the start-up after the last reset ends.
             started_at: Duration,
-            /// The EESAVE fuse, which makes EEPROM survive a chip erase.
             pub eesave: bool,
-            /// Chip and page erases that silently do nothing.
             pub ignores_erases: bool,
-            /// Chip erases carried out.
             pub chip_erases: usize,
-            /// Flash page erases carried out.
             pub page_erases: usize,
-            /// Flash word writes carried out.
             pub word_writes: usize,
-            /// EEPROM erase-writes carried out.
             pub eeprom_writes: usize,
-            /// Flash bytes written that weren't erased first.
             pub unerased_writes: usize,
-            /// What STATUSA reads. The UPDI revision is in its high nibble,
-            /// so nothing with UPDI in it reads 0 there.
             pub statusa: u8,
-            /// A chip that doesn't take the NVM programming key, so
-            /// ASI_KEY_STATUS never shows it. Nothing here says why a real
-            /// one wouldn't.
             pub ignores_key: bool,
-            /// What ASI_SYS_STATUS reads once the chip's been through a
-            /// reset, in place of what its state says. Nothing says a real
-            /// chip reads any of these. It's for showing the programmer
-            /// each reading it should refuse, such as one that's unlocked
-            /// and never has PROGSTART.
+            /// Nothing says a real chip reads any of these.
             pub sys_status_after_reset: Option<u8>,
-            /// How long a word write keeps FBUSY up. The defaults are DS
-            /// table 38-8's typical times. `Duration::MAX` is a controller
-            /// that never finishes.
+            /// Defaults are DS table 38-8's typical times.
             pub word_time: Duration,
-            /// The same for a page erase.
             pub page_erase_time: Duration,
-            /// The same for a chip erase.
             pub chip_erase_time: Duration,
-            /// How long an EEPROM erase-write keeps EEBUSY up.
             pub eeprom_time: Duration,
-            /// Reads of NVMCTRL.STATUS that came back busy.
             pub busy_polls: usize,
-            /// Stores to flash or EEPROM that arrived while the controller
-            /// was busy. The datasheet says they meet a bus wait (§11.3.2.1),
-            /// and with RSD set "a loss of data may occur" (§36.5.3). The
-            /// ATDF has a fourth error code, "Starting a new programming
-            /// operation before previous is completed", which the datasheet
-            /// calls reserved. This one drops them, so the memory ends up
-            /// wrong, and counts them here.
+            /// Dropping these is a strict reading of §11.3.2.1 and §36.5.3.
             pub lost_while_busy: usize,
-            /// Programming commands refused as collisions, while busy or
-            /// without NOCMD between.
             pub collisions: usize,
-            /// Which store to flash or EEPROM, counting from 0 and whatever
-            /// the command, fails with WRITEPROTECT. Nothing here models what
-            /// makes a real controller report one.
+            /// Counting from 0.
             pub write_error_at: Option<usize>,
-            /// Stores so far, the failed one too.
             stores: usize,
-            /// NVMCTRL.CTRLA.
             command: u8,
-            /// NVMCTRL.STATUS's ERROR, which stays until it's written to 0
-            /// (DS §11.5.3) or the chip resets.
+            /// Stays until written to 0 or a reset (DS §11.5.3).
             error: u8,
-            /// The busy flags NVMCTRL.STATUS has up, until `busy_until` on
-            /// the fake clock.
             busy: u8,
             busy_until: Duration,
             expect: Expect,
@@ -2053,10 +1651,7 @@ pub(crate) mod tests {
                     fuses,
                     lock: map::UNLOCKED,
                     userrow: [0xFF; map::USERROW_SIZE],
-                    // NVM_VERSION is what avrdude read off the torch ("NVM
-                    // type 2"). The rest is the layout of DS figure 36-20 as
-                    // pymcuprog shows it for AVR Dx parts, and unconfirmed on
-                    // this chip.
+                    // Only NVM_VERSION is confirmed; the rest is DS figure 36-20.
                     sib: *b"AVR     P:2D:1-3",
                     asleep: false,
                     breaks: 0,
@@ -2069,10 +1664,8 @@ pub(crate) mod tests {
                     resets: 0,
                     progmode: false,
                     start_up: Duration::ZERO,
-                    // A full-speed USB adapter's frame, about the best a
-                    // round trip gets.
                     round_trip: Duration::from_millis(1),
-                    // 12 bits at 115,200 baud, `serial.rs`'s rate.
+                    // 12 bits at 115,200 baud.
                     byte_time: Duration::from_nanos(104_167),
                     elapsed: Duration::ZERO,
                     clock_start: Instant::now(),
@@ -2109,12 +1702,10 @@ pub(crate) mod tests {
                 }
             }
 
-            /// Erases and writes of any kind that were carried out.
             pub fn nvm_operations(&self) -> usize {
                 self.chip_erases + self.page_erases + self.word_writes + self.eeprom_writes
             }
 
-            /// Writes STATUS.ERROR to 0, as a test's shortcut.
             pub fn clear_error(&mut self) {
                 self.error = 0;
             }
@@ -2270,9 +1861,7 @@ pub(crate) mod tests {
                 }
             }
 
-            /// What a system reset does to the NVM controller: the command
-            /// and error go back to 0 (DS §11.5.1, §11.5.3) and an operation
-            /// under way is "aborted" (§11.3.3).
+            /// DS §11.5.1, §11.5.3 and §11.3.3.
             fn system_reset(&mut self) {
                 self.command = NVM_NO_COMMAND;
                 self.error = 0;
@@ -2285,9 +1874,7 @@ pub(crate) mod tests {
                     CS_CTRLB => {
                         self.updi_disabled = value & CTRLB_UPDIDIS != 0;
                         if self.updi_disabled {
-                            // Turning UPDI off resets the system, puts the
-                            // CPU back in the run state whatever it was in,
-                            // and resets any keys (DS §36.3.2.2.2).
+                            // A System Reset (DS §36.3.2.2.2).
                             self.progmode = false;
                             self.key_status = 0;
                             self.system_reset();
@@ -2301,9 +1888,8 @@ pub(crate) mod tests {
                         }
                         self.in_reset = false;
                         self.started_at = self.elapsed + self.start_up;
-                        // NVMPROG needs the lock bits cleared (table 36-4),
-                        // and the key status clears as PROGSTART sets
-                        // (§36.5.5).
+                        // NVMPROG needs the lock bits cleared (DS table 36-4),
+                        // and the key status clears as PROGSTART sets (§36.5.5).
                         self.progmode = self.key_status & KEY_STATUS_NVMPROG != 0 && !self.locked();
                         self.key_status = 0;
                     }
@@ -2311,12 +1897,10 @@ pub(crate) mod tests {
                 }
             }
 
-            /// Whether an erase or a write is still going on.
             fn is_busy(&self) -> bool {
                 self.elapsed < self.busy_until
             }
 
-            /// NVMCTRL.STATUS, counting the reads that find it busy.
             fn nvm_status(&mut self) -> u8 {
                 if self.is_busy() {
                     self.busy_polls += 1;
@@ -2327,15 +1911,11 @@ pub(crate) mod tests {
             }
 
             fn load(&mut self, addr: u32) -> u8 {
-                // The data-space window onto flash reads flash on a real chip
-                // too, but the programmer's meant to use UPDI's own address
-                // for it, so a read there is a slip.
                 assert!(
                     !data(map::FLASH, map::FLASH_SIZE).contains(&addr),
                     "flash read through the data-space window at 0x{addr:04X}, not at 0x800000"
                 );
-                // A locked chip shows UPDI its device ID (DS §8.6) and
-                // nothing else that's valid (table 8-6).
+                // Locked, only the device ID is valid (DS §8.6, table 8-6).
                 if self.locked() && !SIGNATURE.contains(&addr) {
                     return 0;
                 }
@@ -2353,7 +1933,6 @@ pub(crate) mod tests {
                 }
             }
 
-            /// One store, a byte or a word, from STS or ST.
             fn store(&mut self, addr: u32, bytes: &[u8]) {
                 self.stores_in += 1;
                 assert!(
@@ -2373,15 +1952,12 @@ pub(crate) mod tests {
                 }
             }
 
-            /// Raises `flags` in NVMCTRL.STATUS for the next `time` of the
-            /// fake clock.
             fn start(&mut self, flags: u8, time: Duration) {
                 self.busy = flags;
                 self.busy_until = self.elapsed.saturating_add(time);
             }
 
-            /// A write to NVMCTRL.CTRLA (DS §11.5.1). CHER starts at once;
-            /// the others only enable stores to start operations.
+            /// Only CHER starts at once (DS §11.5.1).
             fn nvm_command(&mut self, command: u8) {
                 if command == NVM_NO_COMMAND || command == NVM_NOOP {
                     self.command = command;
@@ -2397,8 +1973,7 @@ pub(crate) mod tests {
                 match command {
                     NVM_CHIP_ERASE if self.ignores_erases => {}
                     NVM_CHIP_ERASE => {
-                        // Flash and EEPROM both, so both flags go up here.
-                        // Which a real chip raises is unconfirmed.
+                        // Which flags a real chip raises is unconfirmed.
                         self.start(NVM_FBUSY | NVM_EEBUSY, self.chip_erase_time);
                         self.flash.fill(0xFF);
                         if !self.eesave {
@@ -2411,8 +1986,6 @@ pub(crate) mod tests {
                 }
             }
 
-            /// A store to flash or EEPROM, which does whatever the selected
-            /// command says.
             fn program(&mut self, addr: u32, bytes: &[u8]) {
                 if self.is_busy() {
                     self.lost_while_busy += 1;
@@ -2428,7 +2001,6 @@ pub(crate) mod tests {
                 match self.command {
                     NVM_NO_COMMAND | NVM_NOOP => self.error = NVM_ERROR_INVALID_COMMAND,
                     NVM_FLASH_WRITE if flash => {
-                        // A write only clears bits; only an erase sets them.
                         let start = at(&FLASH, addr);
                         for (cell, &b) in
                             self.flash[start..start + bytes.len()].iter_mut().zip(bytes)
@@ -2460,7 +2032,6 @@ pub(crate) mod tests {
                          0x{addr:06X}"
                     ),
                 }
-                // Not a code the programmer should ever see from the fake.
                 debug_assert_ne!(self.error, NVM_ERROR_RESERVED);
             }
         }
@@ -2473,7 +2044,6 @@ pub(crate) mod tests {
             fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
                 self.sent += bytes.len();
                 for &b in bytes {
-                    // Each byte arrives once its frame's on the wire.
                     self.elapsed += self.byte_time;
                     self.byte(b);
                 }
@@ -2509,8 +2079,6 @@ pub(crate) mod tests {
             }
         }
 
-        /// Lets a test keep hold of the chip while a programmer drives it, to
-        /// see how a connection that failed left it.
         impl Wire for &mut Dd20 {
             fn send(&mut self, bytes: &[u8]) -> io::Result<()> {
                 (**self).send(bytes)

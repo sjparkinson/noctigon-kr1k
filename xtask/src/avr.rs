@@ -1,90 +1,26 @@
-//! An AVR CPU, the AVRxt flavour the AVR32DD20 has, so the real firmware can
-//! run on the host. `sim.rs` puts a fake AVR32DD20 around it. Section numbers
-//! are DS40002413B, the AVR32/16DD14/20 datasheet, unless they say otherwise.
-//!
-//! It counts instructions, not cycles. Anything it doesn't decode is an
-//! error naming the opcode, so a new instruction from a compiler upgrade
-//! shows up as a clear failure rather than a wrong answer. Encodings and
-//! flag rules come from Microchip's AVR Instruction Set Manual (DS40002198),
-//! whose AVRxt column is the one that applies.
-//!
-//! Interrupts work the AVRxt way (§15, and §7.6.3 for SREG.I; the
-//! instruction set manual's `reti` says it sets I, and its AVRxt note only
-//! covers CPUINT.STATUS). With SREG.I set, the CPU takes the lowest-numbered
-//! pending vector the bus offers, pushes PC and jumps to the vector's slot,
-//! two words each on a part with more than 8 KB of flash (table 15-1).
-//! Taking one doesn't clear I and `reti` doesn't set it; what stops a second
-//! level-0 interrupt nesting is CPUINT.STATUS.LVL0EX (§15.5.2), which is set
-//! on the way in and cleared by `reti`. The instruction after `sei` always
-//! runs before a pending interrupt (the instruction set manual's `sei`),
-//! which is what lets `sei; sleep` close the race AN2515D describes. Only
-//! level 0 is modelled, so there's no NMI, no level 1 vector and no round
-//! robin.
-//!
-//! Between instructions, then, an interrupt waits while SREG.I is clear,
-//! while LVL0EX is set, for the instruction after `sei`, for four
-//! instructions after a write to SPL or until the next I/O write if that's
-//! sooner (§7.6.2), and for as long as the bus says (`holds_interrupts`,
-//! which is the CCP window, §7.6.1). Each of those leaves the request
-//! pending. `out SREG` setting I gets no hold, since the instruction set
-//! manual only promises one for `sei`. None of this has been seen on a real
-//! chip.
-//!
-//! `sleep` asks the bus whether the chip would sleep, and whether any
-//! interrupt is enabled that could wake it. With none, only a reset wakes it
-//! (§13.3.1), whatever SREG.I says, and that's how firmware stops for good.
-//! With one, `sleep` is an error with SREG.I clear. Figure 15-1 takes the
-//! wake-up from the interrupt request after the global enable has gated it,
-//! so that interrupt couldn't wake the CPU. That's a block diagram, though,
-//! and no text says it. So firmware that means to stop turns the enables off
-//! as well, and firmware that doesn't has made a mistake. With one enabled
-//! it's an error inside a handler too, where LVL0EX holds every other
-//! interrupt off. With none, a handler that sleeps has stopped for good like
-//! any other code, which is `hw::halt` reached from `__unhandled_interrupt`.
-//! Asleep, each step either takes a pending interrupt or lets the bus move
-//! time on.
-//!
-//! Errata DS80001026D §2.2.3 loses a write: "An ST/STD/STS instruction to
-//! address >= 64 followed by an ST/STD instruction to address < 64 or
-//! SLPCTRL.CTRLA will cause a loss of the last write." The CPU can tell
-//! instructions apart where the bus can't, so it notes each instruction that
-//! stored to 64 or over with `st`, `std` or `sts`, and tells the bus
-//! (`Bus::consecutive_store`) when the very next instruction stores with
-//! anything but `out`, `push` or a call. The errata names `st` and `std` for
-//! the second store and not `sts`, `sbi` or `cbi`, and says nothing either
-//! way, so this takes those as caught too. `push` and the return address a
-//! call or an interrupt stores aren't named as either store, and those stay
-//! out, since the stack is never under 64.
+//! The AVRxt CPU the simulator runs firmware on, from DS40002198's AVRxt column
+//! and DS40002413B. Counts instructions, not cycles, and models level 0 only.
 
 use std::ops::Range;
 
 use kr1k::regs::addr;
 
-/// CPU.SPL, CPU.SPH and CPU.SREG. The CPU keeps these itself rather than
-/// passing them to the bus. The ATDF has SP as one 16-bit register, low byte
-/// at its address and high byte after it (§7.6.2).
 pub const SPL: u16 = addr::CPU_SP as u16;
 pub const SPH: u16 = SPL + 1;
 pub const SREG: u16 = addr::CPU_SREG as u16;
 
-/// The data addresses `out` reaches, which are also the ones under errata
-/// 2.2.3's 64 (§8.10.1).
 pub const IO_LOW_END: u16 = 0x40;
 
-/// How an instruction stores to data space, which errata 2.2.3 cares about.
+/// Errata DS80001026D §2.2.3 names `st`/`std` as the lost second store. `sts`,
+/// `sbi` and `cbi` are taken as lost too, which the errata doesn't say.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Store {
-    /// `st`, `std` or `sts`.
     Data,
-    /// `out`, the errata's workaround.
     Out,
-    /// `sbi` or `cbi`.
     Bit,
-    /// `push`, or the return address of a call or an interrupt.
     Stack,
 }
 
-// SREG bits.
 const C: u8 = 0;
 const Z: u8 = 1;
 const N: u8 = 2;
@@ -92,50 +28,33 @@ const V: u8 = 3;
 const S: u8 = 4;
 const H: u8 = 5;
 const T: u8 = 6;
-/// SREG.I, global interrupt enable.
 pub const I: u8 = 7;
 
-/// Words in each vector slot. Parts with more than 8 KB of flash use a
-/// two-word `jmp` per slot, so vector n is at word 2n (table 15-1's note).
+/// Table 15-1's note: more than 8 KB of flash means a two-word slot.
 pub const VECTOR_WORDS: u32 = 2;
 
-/// Instructions a write to SPL holds interrupts off for (§7.6.2).
+/// §7.6.2.
 const SPL_HOLD: u8 = 4;
-/// Where I/O memory ends, the 64 I/O registers and the extended ones
-/// (§8.10.2). A write below this ends SPL's hold early.
+/// End of I/O memory (§8.10.2). A write below it ends SPL's hold early.
 const IO_END: u16 = 0x1040;
 
-/// Everything outside the CPU, meaning program memory, data space and the
-/// interrupt lines.
 pub trait Bus {
-    /// The program word at word address `pc`, if there's flash there.
     fn fetch(&self, pc: u32) -> Option<u16>;
     fn read(&mut self, addr: u16) -> Result<u8, String>;
     fn write(&mut self, addr: u16, value: u8) -> Result<(), String>;
-    /// The `wdr` instruction, where the program fed the watchdog. An error
-    /// means the real chip would have reset.
     fn wdr(&mut self) -> Result<(), String> {
         Ok(())
     }
-    /// The highest-priority interrupt that's both enabled and flagged, as a
-    /// vector number. The CPU checks SREG.I and LVL0EX itself.
+    /// The CPU checks SREG.I and LVL0EX itself.
     fn interrupt(&self) -> Option<u8>;
-    /// Whether something outside the CPU is holding interrupts off for now.
-    /// Requests stay pending until it stops.
+    /// The CCP window (§7.6.1).
     fn holds_interrupts(&self) -> bool {
         false
     }
-    /// The CPU has run `sleep`. Errors if the chip wouldn't sleep. Otherwise
-    /// says whether an interrupt is enabled that could wake it. With none,
-    /// only a reset does (§13.3.1).
+    /// Whether an enabled interrupt could wake it. With none, only a reset
+    /// does (§13.3.1).
     fn sleep(&mut self) -> Result<bool, String>;
-    /// The CPU's asleep and nothing's pending, so move time on to the next
-    /// thing that happens.
     fn idle(&mut self) -> Result<(), String>;
-    /// An instruction is storing to `addr` with `st`, `std`, `sts`, `sbi` or
-    /// `cbi`, straight after one that stored to 64 or over with `st`, `std`
-    /// or `sts`. Errata 2.2.3 says that loses the store if it's under 64 or
-    /// to SLPCTRL.CTRLA, and the bus knows where that is.
     fn consecutive_store(&mut self, addr: u16) -> Result<(), String> {
         let _ = addr;
         Ok(())
@@ -144,38 +63,26 @@ pub trait Bus {
 
 pub struct Cpu {
     pub r: [u8; 32],
-    /// A word address, as the hardware counts it.
+    /// A word address.
     pub pc: u32,
     pub sp: u16,
     pub sreg: u8,
-    /// Stopped by `sleep`, until an interrupt.
     pub asleep: bool,
-    /// The vector whose handler is running, which is CPUINT.STATUS.LVL0EX.
-    /// No other level-0 interrupt is taken until its `reti`.
+    /// CPUINT.STATUS.LVL0EX (§15.5.2).
     pub handling: Option<u8>,
-    /// Set by `sei`, so the next instruction runs before any interrupt.
+    /// Only `sei` promises the next instruction, so `out SREG` sets no hold.
     hold: bool,
-    /// Set by a write to SPL, and counts the instructions still to run before
-    /// any interrupt.
     spl_hold: u8,
-    /// The SP bits that exist. Only the ones needed to address SRAM are
-    /// implemented and the rest are fixed "so the Stack Pointer (SP) always
-    /// points to the SRAM" (§7.6.2). That says "set", which taken literally
-    /// would put SP above data space on this part, so this takes the fixed
-    /// bits as whatever keeps SP inside SRAM, which is SRAM's start.
+    /// §7.6.2 says the unimplemented SP bits are "set", which would put SP
+    /// outside data space here, so they're taken as SRAM's start instead.
     sp_bits: u16,
-    /// What the fixed bits hold.
     sp_fixed: u16,
-    /// The instruction running has stored to 64 or over with `st`, `std` or
-    /// `sts` (errata 2.2.3).
     stored_high: bool,
-    /// The instruction before it did.
     stored_high_before: bool,
 }
 
 impl Cpu {
-    /// The state after reset, with PC at 0, SP at the top of SRAM and SREG
-    /// clear. `sram`'s size has to be a power of two, aligned to itself.
+    /// `sram`'s size has to be a power of two, aligned to itself.
     pub const fn new(sram: &Range<u16>) -> Self {
         let sp_bits = sram.end.wrapping_sub(sram.start).wrapping_sub(1);
         Self {
@@ -194,16 +101,10 @@ impl Cpu {
         }
     }
 
-    /// Takes a pending interrupt, or runs one instruction, or sleeps on.
-    /// Errors carry the instruction's byte address.
     pub fn step(&mut self, bus: &mut impl Bus) -> Result<(), String> {
         let hold = std::mem::take(&mut self.hold);
         let spl_hold = self.spl_hold;
         self.spl_hold = spl_hold.saturating_sub(1);
-        // Whatever this step does, the instruction that ran last is the one
-        // before it. Taking an interrupt or sleeping on runs none, and the
-        // next is then a vector's `jmp` or another wait, so the errata's pair
-        // can't straddle either.
         self.stored_high_before = std::mem::take(&mut self.stored_high);
         if self.flag(I)
             && self.handling.is_none()
@@ -212,8 +113,6 @@ impl Cpu {
             && !bus.holds_interrupts()
             && let Some(vector) = bus.interrupt()
         {
-            // Asleep, PC already points past the `sleep`, which is where
-            // the handler returns to.
             self.asleep = false;
             self.push_pc(bus)
                 .map_err(|e| format!("taking interrupt {vector}: {e}"))?;
@@ -234,7 +133,6 @@ impl Cpu {
     }
 
     fn execute(&mut self, bus: &mut impl Bus, w: u16) -> Result<(), String> {
-        // Operand fields, most instructions use one or two of these.
         let d = usize::from((w >> 4) & 0x1F);
         let r = usize::from(w & 0x0F | (w >> 5) & 0x10);
         let hi = 16 + usize::from((w >> 4) & 0x0F);
@@ -263,7 +161,6 @@ impl Cpu {
                             self.r[16 + usize::from((w >> 4) & 7)],
                             self.r[16 + usize::from(w & 7)],
                         );
-                        // Which operands are signed, and whether it's fractional.
                         let (sa, sb, fractional) = match w & 0x88 {
                             0x00 => (true, false, false), // mulsu
                             0x08 => (false, false, true), // fmul
@@ -325,8 +222,7 @@ impl Cpu {
             }
             0x9 => self.execute_9(bus, w, d)?,
             0xB => {
-                // in/out use an I/O address A that's the same as its data
-                // address.
+                // in/out, whose I/O address is also its data address.
                 let a = ((w >> 5) & 0x30) | (w & 0x0F);
                 if w & 0x0800 != 0 {
                     self.store_as(bus, a, rd, Store::Out)?;
@@ -370,8 +266,6 @@ impl Cpu {
         Ok(())
     }
 
-    /// The 1001 xxxx block, which holds loads and stores, one-operand maths,
-    /// jumps and calls, word maths and single-bit I/O.
     fn execute_9(&mut self, bus: &mut impl Bus, w: u16, d: usize) -> Result<(), String> {
         let rd = self.r[d];
         match (w >> 9) & 7 {
@@ -435,7 +329,7 @@ impl Cpu {
                     self.r[d] = self.nzs(v);
                 }
                 0x8 if w & 0x0100 == 0 => {
-                    // bset/bclr, which covers sei, cli, sec, clc and friends.
+                    // bset/bclr
                     let (bit, on) = (((w >> 4) & 7) as u8, w & 0x80 == 0);
                     self.set(bit, on);
                     if bit == I && on {
@@ -496,14 +390,13 @@ impl Cpu {
                 self.set(S, self.flag(N) != self.flag(V));
             }
             4 | 5 => {
-                // cbi, sbic, sbi, sbis on the first 32 I/O addresses.
+                // cbi, sbic, sbi, sbis
                 let a = (w >> 3) & 0x1F;
                 let mask = 1u8 << (w & 7);
                 let value = self.load(bus, a)?;
                 match (w >> 8) & 3 {
                     0 => self.store_as(bus, a, value & !mask, Store::Bit)?,
                     2 => self.store_as(bus, a, value | mask, Store::Bit)?,
-                    // sbic (1) and sbis (3)
                     op => {
                         if (value & mask != 0) == (op == 3) {
                             self.skip(bus)?;
@@ -520,12 +413,8 @@ impl Cpu {
         Ok(())
     }
 
-    /// `sleep`. The bus says whether an enabled interrupt could wake the CPU.
-    /// With none it sleeps until a reset, SREG.I set or not, inside a handler
-    /// or out (§11.3.1). With one inside a handler, LVL0EX holds it off, so
-    /// it couldn't be taken, and firmware that does it is refused. With one
-    /// and SREG.I clear, only a block diagram says that interrupt couldn't
-    /// wake it (figure 13-1), so that's refused too.
+    /// No text says an enabled interrupt can't wake the CPU with SREG.I
+    /// clear, only a block diagram, so that's refused rather than modelled.
     fn sleep(&mut self, bus: &mut impl Bus) -> Result<(), String> {
         let enabled = bus.sleep()?;
         if let Some(vector) = self.handling
@@ -595,8 +484,7 @@ impl Cpu {
         self.nzs(v)
     }
 
-    /// `a - b - carry`. With `chain` set (sbc, sbci, cpc), Z only stays set
-    /// if it already was, so multi-byte compares work.
+    /// With `chain` (sbc, sbci, cpc), Z only stays set if it already was.
     fn sub(&mut self, a: u8, b: u8, carry: bool, chain: bool) -> u8 {
         let c = u8::from(carry);
         let v = a.wrapping_sub(b).wrapping_sub(c);
@@ -609,9 +497,7 @@ impl Cpu {
         v
     }
 
-    /// Every multiply leaves its result in r1:r0, with C from bit 15 and Z
-    /// set if it's zero. The fractional ones (fmul, fmuls, fmulsu) shift the
-    /// result left one place, and C comes from bit 15 before the shift.
+    /// The fractional multiplies take C from bit 15 before the shift.
     const fn product(&mut self, p: u16, fractional: bool) {
         let v = if fractional { p << 1 } else { p };
         self.set_pair(0, v);
@@ -632,7 +518,6 @@ impl Cpu {
         Ok(w)
     }
 
-    /// Steps over the next instruction, which may be two words long.
     fn skip(&mut self, bus: &impl Bus) -> Result<(), String> {
         let next = self.next_word(bus)?;
         if is_two_words(next) {
@@ -648,7 +533,6 @@ impl Cpu {
         Ok(w.to_le_bytes()[usize::from(addr & 1)])
     }
 
-    /// Data-space loads and stores, with SP and SREG kept in the CPU.
     fn load(&self, bus: &mut impl Bus, addr: u16) -> Result<u8, String> {
         match addr {
             SPL => Ok(self.sp.to_le_bytes()[0]),
@@ -658,7 +542,6 @@ impl Cpu {
         }
     }
 
-    /// A store by `st`, `std` or `sts`.
     fn store(&mut self, bus: &mut impl Bus, addr: u16, value: u8) -> Result<(), String> {
         self.store_as(bus, addr, value, Store::Data)
     }
@@ -693,8 +576,6 @@ impl Cpu {
         Ok(())
     }
 
-    /// The pointer register's post-increment (low bit 1) and pre-decrement
-    /// (low bit 2) forms. X's plain form (0xC) leaves it alone.
     const fn step_pointer(&mut self, reg: usize, w: u16) -> u16 {
         let p = self.pair(reg);
         match w & 3 {
@@ -738,8 +619,7 @@ impl Cpu {
         self.load(bus, self.sp)
     }
 
-    /// Return addresses are two bytes on a part with a 16-bit PC, which 32 KB
-    /// of flash needs, low byte pushed first.
+    /// Two bytes, low first, since 32 KB of flash needs only a 16-bit PC.
     fn push_pc(&mut self, bus: &mut impl Bus) -> Result<(), String> {
         let [lo, hi] = (self.pc as u16).to_le_bytes();
         self.push(bus, lo)?;
@@ -753,14 +633,11 @@ impl Cpu {
     }
 }
 
-/// The four 32-bit instructions are `lds` 1001 000d dddd 0000, `sts`
-/// 1001 001d dddd 0000, `jmp` 1001 010k kkkk 110k and `call` 1001 010k
-/// kkkk 111k. Their second word is an address, so a walk through code skips it.
+/// `lds`, `sts`, `jmp` and `call`.
 pub(crate) const fn is_two_words(w: u16) -> bool {
     w & 0xFC0F == 0x9000 || w & 0xFE0C == 0x940C
 }
 
-/// `ldi rd, k` is 1110 kkkk dddd kkkk, for r16 to r31.
 pub(crate) fn ldi(d: u8, k: u8) -> u16 {
     let (d, k) = (u16::from(d), u16::from(k));
     0xE000 | (k & 0xF0) << 4 | (d - 16) << 4 | k & 0x0F
@@ -775,28 +652,20 @@ mod tests {
     use super::*;
     use crate::elf::SRAM as RAM;
 
-    /// A data address the test programs' handlers write to. Each write is
-    /// logged, and clears those bits of `pending`, like an INTFLAGS.
+    /// Writes are logged and clear those bits of `pending`, like an INTFLAGS.
     const FLAGS: u16 = 0x00FF;
-    /// A data address that adds what's written to it to `pending`, so a
-    /// test program can flag an interrupt partway through.
+    /// Writes set those bits of `pending`.
     const RAISE: u16 = 0x00FE;
 
     struct TestBus {
         flash: Vec<u16>,
         data: Vec<u8>,
-        /// How many `wdr`s the program ran.
         wdrs: u32,
-        /// Interrupts flagged, a bit per vector. All count as enabled.
         pending: u32,
-        /// `holds_interrupts`, as the CCP window would.
         held: bool,
-        /// What the handlers wrote to `FLAGS`.
         log: Vec<u8>,
-        /// Bits of `pending` that time flags each `idle`.
+        /// Bits of `pending` set on each `idle`.
         wake: u32,
-        /// No interrupt's enabled, so `sleep` says nothing can wake it, and
-        /// `idle` only passes the time.
         nothing_enabled: bool,
         sleeps: u32,
         idles: u32,
@@ -861,7 +730,6 @@ mod tests {
         }
     }
 
-    /// Runs `program` until PC reaches its end.
     fn run(program: &[u16], setup: impl FnOnce(&mut Cpu, &mut TestBus)) -> (Cpu, TestBus) {
         try_run(program, setup).unwrap()
     }
@@ -891,7 +759,6 @@ mod tests {
 
     #[test]
     fn adds_with_carry_across_bytes() {
-        // r25:r24 = 0x01FF; r23:r22 = 0x0001; add r24,r22; adc r25,r23
         let (cpu, _) = run(
             &[
                 ldi(24, 0xFF),
@@ -909,8 +776,6 @@ mod tests {
 
     #[test]
     fn sets_overflow_and_half_carry_on_add() {
-        // 0x7F + 0x01 = 0x80, which sets signed overflow, half carry and
-        // negative.
         let (cpu, _) = run(&[ldi(16, 0x7F), ldi(17, 1), 0x0F01], |_, _| {});
         assert_eq!(cpu.r[16], 0x80);
         assert!(cpu.flag(V) && cpu.flag(H) && cpu.flag(N) && !cpu.flag(S) && !cpu.flag(C));
@@ -918,7 +783,6 @@ mod tests {
 
     #[test]
     fn compares_16_bit_values_with_cp_and_cpc() {
-        // cp r24,r22; cpc r25,r23 with equal high bytes but different low.
         let program = [0x1786, 0x0797];
         let (cpu, _) = run(&program, |cpu, _| {
             cpu.set_pair(24, 0x3801);
@@ -939,7 +803,6 @@ mod tests {
 
     #[test]
     fn subtracts_immediates_and_borrows() {
-        // subi r16,1 on 0 gives 0xFF with carry; sbci r17,0 carries it on.
         let (cpu, _) = run(&[ldi(16, 0), ldi(17, 1), 0x5001, 0x4010], |_, _| {});
         assert_eq!((cpu.r[16], cpu.r[17]), (0xFF, 0x00));
         assert!(!cpu.flag(Z), "sbci only keeps Z if it was already set");
@@ -947,7 +810,6 @@ mod tests {
 
     #[test]
     fn adiw_and_sbiw_work_on_word_pairs() {
-        // adiw r24,1 then sbiw r30,2
         let (cpu, _) = run(&[0x9601, 0x9732], |cpu, _| {
             cpu.set_pair(24, 0x00FF);
             cpu.set_pair(30, 0x0001);
@@ -959,17 +821,14 @@ mod tests {
 
     #[test]
     fn shifts_and_rotates_through_carry() {
-        // lsr r24; ror r25 moves bit 0 of r24 into bit 7 of r25.
         let (cpu, _) = run(&[ldi(24, 0x03), ldi(25, 0), 0x9586, 0x9597], |_, _| {});
         assert_eq!((cpu.r[24], cpu.r[25]), (0x01, 0x80));
-        // asr keeps the sign bit.
         let (cpu, _) = run(&[ldi(24, 0x80), 0x9585], |_, _| {});
         assert_eq!(cpu.r[24], 0xC0);
     }
 
     #[test]
     fn loads_and_stores_through_pointers() {
-        // X = 0x3800, st X+, r16; st X+, r17; then Z = 0x3802, ld r18, -Z
         let program = [
             ldi(26, 0x00),
             ldi(27, 0x38),
@@ -989,7 +848,6 @@ mod tests {
 
     #[test]
     fn uses_displacement_from_y_and_z() {
-        // std Y+5, r16; ldd r17, Z+5 with Y = Z.
         let (cpu, bus) = run(&[0x830D, 0x8115], |cpu, _| {
             cpu.r[16] = 0x42;
             cpu.set_pair(28, 0x3810);
@@ -1001,7 +859,6 @@ mod tests {
 
     #[test]
     fn calls_and_returns_through_the_stack() {
-        // 0: rcall +2; 1: ldi r16,1; 2: rjmp +2; 3: ldi r17,2; 4: ret
         let program = [0xD002, ldi(16, 1), 0xC002, ldi(17, 2), 0x9508];
         let (cpu, bus) = run(&program, |_, _| {});
         assert_eq!((cpu.r[16], cpu.r[17]), (1, 2));
@@ -1011,14 +868,12 @@ mod tests {
 
     #[test]
     fn calls_and_jumps_with_two_word_instructions() {
-        // 0: call 4; 2: jmp 6; 4: ldi r16,7; 5: ret; 6: (end)
         let (cpu, _) = run(&[0x940E, 4, 0x940C, 6, ldi(16, 7), 0x9508], |_, _| {});
         assert_eq!(cpu.r[16], 7);
     }
 
     #[test]
     fn skips_over_a_whole_two_word_instruction() {
-        // cpse r16,r16 skips the sts; then ldi r17,1 runs.
         let (cpu, bus) = run(&[0x1300, 0x9300, 0x3800, ldi(17, 1)], |cpu, _| {
             cpu.r[16] = 9
         });
@@ -1028,7 +883,6 @@ mod tests {
 
     #[test]
     fn branches_backwards_on_flags() {
-        // r16 = 3; loop: dec r16; brne loop
         let (cpu, _) = run(&[ldi(16, 3), 0x950A, 0xF7F1], |_, _| {});
         assert_eq!(cpu.r[16], 0);
         assert!(cpu.flag(Z));
@@ -1036,7 +890,6 @@ mod tests {
 
     #[test]
     fn keeps_sp_and_sreg_in_the_cpu() {
-        // in r28,SPL; in r29,SPH; out SREG,r1 (r1 = 0); out SPL,r16
         let (cpu, bus) = run(&[0xB7CD, 0xB7DE, 0xBE1F, 0xBF0D], |cpu, _| {
             cpu.sreg = 0xFF;
             cpu.r[16] = 0x80;
@@ -1052,7 +905,6 @@ mod tests {
 
     #[test]
     fn reads_program_memory() {
-        // lpm r16, Z+; lpm r17, Z+; rjmp over the data word at byte 6.
         let (cpu, _) = run(&[0x9105, 0x9115, 0xC001, 0x1234], |cpu, _| {
             cpu.set_pair(30, 6)
         });
@@ -1061,7 +913,6 @@ mod tests {
 
     #[test]
     fn bit_instructions() {
-        // bst r16,3; bld r17,7; sbrs r17,7; ldi r18,1 (skipped); sbi 0x05,2
         let (cpu, bus) = run(&[0xFB03, 0xF917, 0xFF17, ldi(18, 1), 0x9A2A], |cpu, _| {
             cpu.r[16] = 0x08;
         });
@@ -1071,15 +922,12 @@ mod tests {
 
     #[test]
     fn sp_only_has_the_bits_sram_needs_and_stays_in_sram() {
-        // ldi r16, 0xFF; out SPH, r16; out SPL, r16
         let (cpu, _) = run(&[ldi(16, 0xFF), 0xBF0E, 0xBF0D], |_, _| {});
         assert_eq!(cpu.sp, 0x7FFF);
-        // ldi r16, 0; out SPH, r16; out SPL, r16
         let (cpu, _) = run(&[ldi(16, 0), 0xBF0E, 0xBF0D], |_, _| {});
         assert_eq!(cpu.sp, 0x7000);
     }
 
-    /// Errata 2.2.3's pair, as the CPU tells the bus about it.
     #[test]
     fn tells_the_bus_of_a_store_straight_after_a_store_to_64_or_over() {
         struct Pairs(TestBus, Vec<u16>);
@@ -1116,21 +964,16 @@ mod tests {
             }
             bus.1
         };
-        // sts 0x0100, r16 then sts 0x0011, r16; st X, r16; out 0x12, r16;
-        // push r16; sbi 0x13, 0.
         let program = [
             0x9300, 0x0100, 0x9300, 0x0011, 0x930C, 0xBB02, 0x930F, 0x9A98,
         ];
         assert_eq!(pairs(&program), [0x0011]);
-        // A store under 64 doesn't start a pair, and `push` doesn't either.
         assert_eq!(pairs(&[0x930C, 0x930C, 0x930F, 0x930C]), Vec::<u16>::new());
-        // `sbi` straight after `sts` is told too.
         assert_eq!(pairs(&[0x9300, 0x0100, 0x9A98]), [0x0013]);
     }
 
     #[test]
     fn refuses_unknown_opcodes() {
-        // 0x0001 sits next to nop, movw and the multiplies.
         let mut bus = TestBus::new(&[0x0001, 0xFFFF]);
         let mut cpu = Cpu::new(&RAM);
         assert!(
@@ -1146,8 +989,6 @@ mod tests {
         assert!(cpu.step(&mut bus).unwrap_err().contains("outside flash"));
     }
 
-    /// Runs one multiply with `a` in its Rd and `b` in its Rr, and returns
-    /// r1:r0, C and Z. r1:r0 start non-zero, so Z has to be earned.
     fn multiply(w: u16, (d, a): (usize, u8), (r, b): (usize, u8)) -> (u16, bool, bool) {
         let (cpu, _) = run(&[w], |cpu, _| {
             cpu.set_pair(0, 0xA5A5);
@@ -1157,12 +998,10 @@ mod tests {
         (cpu.pair(0), cpu.flag(C), cpu.flag(Z))
     }
 
-    // The multiply words in these tests come from LLVM's AVR assembler (llc
-    // -mcpu=attiny1616, then llvm-objdump), as a check on the decoding.
+    // The multiply words below are LLVM's AVR assembler output, not hand-encoded.
 
     #[test]
     fn mul_is_unsigned_on_any_registers() {
-        // mul r22, r24
         assert_eq!(
             multiply(0x9F68, (22, 200), (24, 100)),
             (20_000, false, false)
@@ -1172,22 +1011,18 @@ mod tests {
             (0xFE01, true, false)
         );
         assert_eq!(multiply(0x9F68, (22, 0), (24, 0x80)), (0, false, true));
-        // mul r1, r31 reads r1 before overwriting it.
         assert_eq!(multiply(0x9E1F, (1, 3), (31, 5)), (15, false, false));
-        // mul r24, r24
         assert_eq!(multiply(0x9F88, (24, 16), (24, 16)), (256, false, false));
     }
 
     #[test]
     fn muls_is_signed_on_r16_to_r31() {
-        // muls r16, r31
         let muls = |a: i8, b: i8| multiply(0x020F, (16, a as u8), (31, b as u8));
         assert_eq!(muls(-128, -128), (0x4000, false, false));
         assert_eq!(muls(-1, -1), (1, false, false));
         assert_eq!(muls(-1, 1), (0xFFFF, true, false));
         assert_eq!(muls(127, -128), (-16_256i16 as u16, true, false));
         assert_eq!(muls(0, -5), (0, false, true));
-        // muls r22, r25
         assert_eq!(
             multiply(0x0269, (22, 0xFE), (25, 3)),
             (-6i16 as u16, true, false)
@@ -1196,7 +1031,6 @@ mod tests {
 
     #[test]
     fn mulsu_is_signed_by_unsigned_on_r16_to_r23() {
-        // mulsu r17, r22
         let mulsu = |a: i8, b: u8| multiply(0x0316, (17, a as u8), (22, b));
         assert_eq!(mulsu(-1, 255), (-255i16 as u16, true, false));
         assert_eq!(mulsu(-128, 255), (-32_640i16 as u16, true, false));
@@ -1207,36 +1041,28 @@ mod tests {
 
     #[test]
     fn fmul_shifts_left_and_takes_c_from_before_the_shift() {
-        // fmul r18, r21. 0.5 * 0.5 in 1.7 format is 0.25, 0x2000 in 1.15.
         let fmul = |a: u8, b: u8| multiply(0x032D, (18, a), (21, b));
         assert_eq!(fmul(0x40, 0x40), (0x2000, false, false));
-        // 1.5 * 1.5 doesn't fit, so the product 0x9000 loses bit 15 to C.
         assert_eq!(fmul(0xC0, 0xC0), (0x2000, true, false));
         assert_eq!(fmul(0xFF, 0xFF), (0xFC02, true, false));
-        // The product 0x4000 shifts into bit 15, but C comes from before.
         assert_eq!(fmul(0x80, 0x80), (0x8000, false, false));
         assert_eq!(fmul(0x80, 0), (0, false, true));
     }
 
     #[test]
     fn fmuls_and_fmulsu_are_signed() {
-        // fmuls r23, r16. -1 * -1 in 1.7 format overflows to -1 in 1.15.
         let fmuls = |a: i8, b: i8| multiply(0x03F0, (23, a as u8), (16, b as u8));
         assert_eq!(fmuls(-128, -128), (0x8000, false, false));
         assert_eq!(fmuls(-1, -1), (2, false, false));
         assert_eq!(fmuls(-1, 1), (0xFFFE, true, false));
         assert_eq!(fmuls(0, -1), (0, false, true));
-        // fmulsu r20, r19
         let fmulsu = |a: i8, b: u8| multiply(0x03CB, (20, a as u8), (19, b));
         assert_eq!(fmulsu(-1, 255), (-510i16 as u16, true, false));
         assert_eq!(fmulsu(64, 0x80), (0x4000, false, false), "Rr isn't signed");
-        // -128 * 128 is 0xC000, which shifts to 0x8000.
         assert_eq!(fmulsu(-128, 0x80), (0x8000, true, false));
         assert_eq!(fmulsu(0, 0x80), (0, false, true));
     }
 
-    /// What the pinned nightly compiles `a.wrapping_mul(b)` on two `u16`s,
-    /// and `a % 10` on a `u8`, to for the ATtiny1616, with the `ret` left off.
     #[test]
     fn runs_what_llvm_emits_for_u16_multiply_and_u8_remainder() {
         let mul_u16 = [
@@ -1305,9 +1131,6 @@ mod tests {
         0xC000 | (to as i32 - from as i32 - 1) as u16 & 0x0FFF
     }
 
-    /// A vector table for vectors 0 to 7, two words a slot, with `rjmp`s to
-    /// `handlers` placed after it and `main` last, so `run` stops when
-    /// `main` finishes. Reset jumps to `main`.
     fn program(handlers: &[(u8, &[u16])], main: &[u16]) -> Vec<u16> {
         let mut words = vec![NOP; 16];
         for (vector, body) in handlers {
@@ -1320,7 +1143,6 @@ mod tests {
         words
     }
 
-    /// A handler that logs `bits` to FLAGS, clearing those interrupts.
     fn clears(bits: u8) -> Vec<u16> {
         let mut body = vec![ldi(16, bits)];
         body.extend(LOG_R16);
@@ -1330,8 +1152,6 @@ mod tests {
 
     #[test]
     fn takes_the_lowest_vector_first_without_nesting() {
-        // Vector 3 copies r17 to r19, logs, then sets r18. Vector 7 copies
-        // r18 to r20. Both are pending from the start.
         let mut three = vec![0x2F31]; // mov r19, r17
         three.extend(clears(1 << 3));
         three.insert(4, ldi(18, 1));
@@ -1360,9 +1180,6 @@ mod tests {
     /// out SPH, r18
     const OUT_SPH: u16 = 0xBF2E;
 
-    /// Runs `main` with vector 3 pending from reset, under a handler that
-    /// copies r17 to r19, and says how many `inc r17`s ran before it. r16 and
-    /// r18 hold SP where it is.
     fn incs_before_the_handler(main: &[u16]) -> u8 {
         let mut handler = vec![0x2F31]; // mov r19, r17
         handler.extend(clears(1 << 3));
@@ -1377,7 +1194,6 @@ mod tests {
 
     #[test]
     fn a_write_to_spl_holds_interrupts_off_for_four_instructions() {
-        // sei's own hold covers the `out`, which starts the four.
         assert_eq!(
             incs_before_the_handler(&[SEI, OUT_SPL, INC_R17, INC_R17, INC_R17, INC_R17, INC_R17]),
             4
@@ -1391,10 +1207,8 @@ mod tests {
             1,
             "SPH"
         );
-        // sts 0x001C, r18
         let main = [SEI, OUT_SPL, 0x9320, 0x001C, INC_R17, INC_R17];
         assert_eq!(incs_before_the_handler(&main), 0, "any I/O register");
-        // sts 0x3800, r18 is data memory, so it only uses up one of the four.
         let main = [
             SEI, OUT_SPL, 0x9320, 0x3800, INC_R17, INC_R17, INC_R17, INC_R17,
         ];
@@ -1409,24 +1223,18 @@ mod tests {
         assert_eq!(incs_before_the_handler(&main), 6);
     }
 
-    /// `out SREG` isn't `sei`, and only `sei` promises the next instruction.
     #[test]
     fn setting_i_through_sreg_takes_a_pending_interrupt_straight_away() {
-        // ldi r20, 0x80; out SREG, r20
         let main = [ldi(20, 0x80), 0xBF4F, INC_R17, INC_R17];
         assert_eq!(incs_before_the_handler(&main), 0);
     }
 
-    /// Flags vector 3 through `RAISE`, then runs `body`.
     fn raises(body: &[u16]) -> Vec<u16> {
-        // sts RAISE, r20
         let mut words = vec![ldi(20, 1 << 3), 0x9340, RAISE];
         words.extend_from_slice(body);
         words
     }
 
-    /// Mid-program, with the CPU awake, the handler lands between two
-    /// instructions and the program carries on from where it was.
     #[test]
     fn an_interrupt_lands_between_two_instructions_awake() {
         let main = [&[SEI, INC_R17][..], &raises(&[INC_R17, INC_R17])].concat();
@@ -1443,8 +1251,6 @@ mod tests {
         assert_eq!(incs_before_the_handler_raised(&main), (3, 5));
     }
 
-    /// Like `incs_before_the_handler`, with nothing pending until `main`
-    /// raises it. Also says how many `inc`s ran in all.
     fn incs_before_the_handler_raised(main: &[u16]) -> (u8, u8) {
         let mut handler = vec![0x2F31]; // mov r19, r17
         handler.extend(clears(1 << 3));
@@ -1457,7 +1263,6 @@ mod tests {
     fn the_bus_can_hold_interrupts_off() {
         let mut handler = vec![0x2F31]; // mov r19, r17
         handler.extend(clears(1 << 3));
-        // The words are sei, nop, inc, inc, then the bus lets go.
         let image = program(&[(3, &handler)], &[SEI, NOP, INC_R17, INC_R17, NOP, NOP]);
         let mut bus = TestBus::new(&image);
         let mut cpu = Cpu::new(&RAM);
@@ -1496,11 +1301,7 @@ mod tests {
         assert!(!cpu.asleep);
     }
 
-    /// AN2515C §4.5 says to check the flag with interrupts off, then `sei;
-    /// sleep`.
-    /// An interrupt that's arrived since the check is taken straight after
-    /// the `sleep`, so it wakes the CPU at once instead of being slept
-    /// through.
+    /// AN2515C §4.5's `sei; sleep`.
     #[test]
     fn sei_then_sleep_wakes_at_once_for_an_interrupt_already_pending() {
         let image = program(&[(7, &clears(1 << 7))], &[SEI, SLEEP, ldi(17, 1)]);
@@ -1521,14 +1322,12 @@ mod tests {
             .unwrap();
         assert!(err.contains("inside the handler for interrupt 3"), "{err}");
 
-        // The bus has the last word, and here nothing will ever flag.
         let image = program(&[], &[SEI, SLEEP, NOP]);
         let err = try_run(&image, |_, _| {}).err().unwrap();
         assert!(err.contains("asleep: nothing to wake on"), "{err}");
     }
 
-    /// §13.3.1 says that with no interrupt enabled, only a reset
-    /// wakes it. SREG.I makes no difference to that.
+    /// §13.3.1.
     #[test]
     fn sleeps_for_good_with_no_interrupt_enabled() {
         for start in [&[SLEEP, NOP][..], &[SEI, SLEEP, NOP]] {
@@ -1545,8 +1344,6 @@ mod tests {
         }
     }
 
-    /// The same holds inside a handler, which is how `__unhandled_interrupt`
-    /// ends, in `hw::halt`. LVL0EX stays set, since there's no `reti`.
     #[test]
     fn a_handler_sleeps_for_good_with_no_interrupt_enabled() {
         let image = program(&[(3, &[SLEEP, NOP])], &[SEI, NOP, NOP]);
