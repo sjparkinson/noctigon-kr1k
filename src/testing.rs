@@ -562,6 +562,10 @@ pub struct Rig {
     /// Whether [`Rig::tick`] tells the torch VDDIO2 is there. A scene says
     /// for [`Rig::tick_in`].
     pub vddio2: bool,
+    /// Whether both tell the torch the watchdog's lit setting is in force
+    /// (`Torch::tick`'s `lit_window`). Always, but for [`Paced`], which
+    /// asks its pacer.
+    pub lit_window: bool,
 }
 
 impl Default for Rig {
@@ -580,20 +584,25 @@ impl Rig {
             torch: Torch::new(CALIBRATION, faults),
             adc: Adc::new(),
             vddio2: true,
+            lit_window: true,
         }
     }
 
     /// One tick, the ADC reading `adc`'s `voltage` and `temperature`, and
     /// MVIO saying what `vddio2` does.
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
-        let event = self.torch.tick(pressed, self.adc.result(), self.vddio2);
+        let event = self
+            .torch
+            .tick(pressed, self.adc.result(), self.vddio2, self.lit_window);
         self.adc.start(self.torch.convert());
         event
     }
 
     /// One tick, the ADC and MVIO reading what `scene` says.
     pub fn tick_in(&mut self, pressed: bool, scene: &Scene) -> Option<Event> {
-        let event = self.torch.tick(pressed, self.adc.result(), scene.vddio2);
+        let event = self
+            .torch
+            .tick(pressed, self.adc.result(), scene.vddio2, self.lit_window);
         // A dead ADC is started on but never answers, so nothing's pending.
         let convert = self.torch.convert().filter(|_| !scene.adc_dead);
         self.adc
@@ -718,10 +727,9 @@ impl Paced {
         }
     }
 
-    /// What `main` sends to the driver, the torch's output through
-    /// `Pacer::guard`.
+    /// What `main` sends to the driver, the torch's output.
     pub fn output(&self) -> Output {
-        self.pacer.guard(self.rig.torch.output())
+        self.rig.torch.output()
     }
 
     /// The PIT's period as the last pass left it.
@@ -774,6 +782,7 @@ impl Paced {
             self.rig.torch.quiet_for()
         );
         self.rig.torch.rest_for(begin.rested);
+        self.rig.lit_window = self.pacer.lit();
         self.rig.tick_in(self.pressed, scene);
         if self.aux.step(self.rig.torch.aux()).is_some() && self.bus_fails {
             self.aux.failed();

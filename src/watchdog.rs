@@ -38,7 +38,6 @@
 //! the same as there being nothing.
 
 use crate::TICKS_PER_SECOND;
-use crate::ramp::Output;
 
 /// Cycles of the WDT's 1.024 kHz clock in one tick.
 pub const CLOCKS_PER_TICK: u16 = 1024 / TICKS_PER_SECOND;
@@ -356,8 +355,13 @@ impl End {
 /// Where the [`Pacer`] is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// The lit setting and the 64 Hz tick, fed by the [`Feeder`]. The only
-    /// state the light can be on in.
+    /// The first pass after `hw::start_watchdog`, which wrote the lit
+    /// setting and the 64 Hz tick, and no `wdr` behind it yet. This pass
+    /// feeds, and it's [`State::Fast`] from there.
+    First,
+    /// The lit setting and the 64 Hz tick, fed by the [`Feeder`], with a
+    /// `wdr` since the setting was written. The only state the light can be
+    /// on in.
     Fast,
     /// The pass after a lit feed, which writes the rest setting.
     Entering,
@@ -418,31 +422,22 @@ impl Default for Pacer {
 }
 
 impl Pacer {
-    /// Fast and lit, as `hw::init` and `hw::start_watchdog` leave the chip.
+    /// Fast with the lit setting, as `hw::init` and `hw::start_watchdog`
+    /// leave the chip, but not [lit](Self::lit) until the first pass has fed
+    /// it.
     pub const fn new() -> Self {
         Self {
-            state: State::Fast,
+            state: State::First,
             feeder: Feeder::new(),
             settle: 0,
         }
     }
 
     /// Whether the lit setting is in force, with a `wdr` since it was
-    /// written, so PC1 may rise.
+    /// written, so PC1 may rise. `main` hands it to `torch::Torch::tick`,
+    /// which keeps the light's level at 0 without it.
     pub const fn lit(&self) -> bool {
         matches!(self.state, State::Fast)
-    }
-
-    /// `output`, or [`Output::OFF`] unless the lit setting is in force.
-    ///
-    /// The torch only lights after a click or a hold, which can't count
-    /// before the lit setting is back ([`EXIT_PASSES`]), so this never
-    /// changes anything the firmware does today. It's there so that a way to
-    /// light the torch added later, one that doesn't wait for the switch,
-    /// can't raise PC1 under the rest setting or with the PIT slow. `main`
-    /// sends every output through it.
-    pub const fn guard(&self, output: Output) -> Output {
-        if self.lit() { output } else { Output::OFF }
     }
 
     /// Whether the PIT is slow for the sleep the last pass ended in.
@@ -480,7 +475,7 @@ impl Pacer {
         };
         let settled = self.settle >= SETTLE_TICKS;
         let (next, end) = match self.state {
-            State::Fast => {
+            State::First | State::Fast => {
                 let feed = self.feeder.tick();
                 let end = End {
                     synced: false,
@@ -803,12 +798,11 @@ mod tests {
         assert_eq!(&feeds[..7], &[t, f, f, t, f, f, t]);
     }
 
-    /// Whatever the torch asks for, nothing lights outside the fast state,
-    /// on every pass of a rest and a way back from it.
+    /// The lit setting is in force in the fast state alone, on every pass
+    /// of a rest and a way back from it, and only once the pass that wrote
+    /// it has fed it.
     #[test]
-    fn the_guard_only_lets_a_light_through_with_the_lit_setting_in_force() {
-        use crate::ramp;
-        let light = ramp::output(ramp::CEILING);
+    fn the_lit_setting_is_in_force_only_in_the_fast_state() {
         let mut pacer = Pacer::new();
         let mut states = std::vec::Vec::new();
         let mut wake = Wake::Tick;
@@ -817,13 +811,13 @@ mod tests {
             if n == 300 {
                 wake = Wake::Switch;
             }
-            pass(&mut pacer, wake, quiet, quiet);
+            let was = pacer.state;
+            let (begin, end) = pass(&mut pacer, wake, quiet, quiet);
             wake = Wake::Tick;
             states.push(pacer.state);
-            let want = if pacer.lit() { light } else { Output::OFF };
-            assert_eq!(pacer.guard(light), want, "{:?}", pacer.state);
-            assert_eq!(pacer.guard(Output::STARTING).enable, pacer.lit());
-            assert_eq!(pacer.guard(Output::OFF), Output::OFF);
+            assert_eq!(pacer.lit(), pacer.state == State::Fast, "{:?}", pacer.state);
+            assert!(!pacer.lit() || was == State::Fast || end.feed, "{was:?}");
+            assert!(begin.watchdog != Some(Setting::Rest) || !pacer.lit());
         }
         for state in [
             State::Fast,

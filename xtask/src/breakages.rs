@@ -86,6 +86,7 @@ const AW2016: &str = "src/aw2016.rs";
 const LIMITS: &str = "src/limits.rs";
 const BATTERY: &str = "src/battery.rs";
 const SENSORS: &str = "src/sensors.rs";
+const TORCH: &str = "src/torch.rs";
 
 /// The mistakes, each one a different alarm. Every one of them has been run
 /// and seen refused for the reason it gives, and `cargo xtask breakages`
@@ -117,10 +118,10 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "dac-before-the-boost-starts",
         file: MAIN,
-        find: "        if let Some(output) = output_changes.update(pacer.guard(torch.output())) {\n            \
+        find: "        if let Some(output) = output_changes.update(torch.output()) {\n            \
                hw::set_output(output);\n",
         replace: "        if let Some(output) = \
-                  output_changes.update(pacer.guard(kr1k::ramp::output(torch.level()))) {\n            \
+                  output_changes.update(kr1k::ramp::output(torch.level())) {\n            \
                   hw::set_output(output);\n            hw::set_output(output);\n",
         stage: Stage::Simulator,
         expect: "the stock firmware gives the boost converter",
@@ -342,8 +343,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "vddio2-not-watched",
         file: MAIN,
-        find: "hw::adc_result(), hw::vddio2_ok());\n",
-        replace: "hw::adc_result(), true);\n",
+        find: "            hw::vddio2_ok(),\n",
+        replace: "            true,\n",
         stage: Stage::Simulator,
         expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
@@ -386,20 +387,22 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "raises PC1 with WDT.CTRLA at 0x0b",
     },
-    // Every output goes through `Pacer::guard`, so nothing lights outside
-    // the lit window. Taking the guard out alone changes nothing today, since
-    // only a click or a hold lights the torch. This takes it out and adds the
-    // mistake it's there for, a way to light that doesn't wait for the
-    // switch, here the boost converter on at every slow tick.
+    // `Torch::tick` keeps the light at level 0 outside the lit window. Taking
+    // that out alone changes nothing today, since only a click or a hold
+    // lights the torch. This takes it out and adds the mistake it's there
+    // for, a way to light that doesn't wait for a click, here level 1 for as
+    // long as the switch is down. A press at rest asks for it on the pass
+    // that wakes on it, under the rest setting, and a switch held from
+    // power-on on the first pass, before the lit setting's first `wdr`.
     Breakage {
         name: "unguarded-light-at-rest",
-        file: MAIN,
-        find: "output_changes.update(pacer.guard(torch.output()))",
-        replace: "output_changes.update(if pacer.slow() {\n            \
-                  kr1k::ramp::Output::STARTING\n        } else {\n            \
-                  torch.output()\n        })",
+        file: TORCH,
+        find: "            let asked = if lit_window {\n                \
+               self.ui.output_level()\n            } else {\n                0\n            };\n",
+        replace: "            let _ = lit_window;\n            \
+                  let asked = self.ui.output_level().max(u8::from(pressed));\n",
         stage: Stage::Simulator,
-        expect: "raises PC1 with WDT.CTRLA at 0x0b",
+        expect: "the light only comes on with the lit window in force and a wdr since it was written",
     },
     // A write to WDT.CTRLA syncs before the sleep or the `wdr` that follows
     // it. The pass that goes to rest powers down after its write, and that's
@@ -488,10 +491,10 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "bounds-check",
         file: MAIN,
-        find: "        torch.tick(hw::switch_pressed(), hw::adc_result(), hw::vddio2_ok());\n",
+        find: "        torch.tick(\n            hw::switch_pressed(),\n            hw::adc_result(),\n",
         replace: "        let reading = hw::adc_result();\n        \
                   let pressed = [hw::switch_pressed(); 4][usize::from(reading.unwrap_or(0))];\n        \
-                  torch.tick(pressed, reading, hw::vddio2_ok());\n",
+                  torch.tick(\n            pressed,\n            reading,\n",
         stage: Stage::Layout,
         expect: "panic_bounds_check",
     },
