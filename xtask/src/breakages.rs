@@ -184,7 +184,6 @@ const BREAKAGES: &[Breakage] = &[
         name: "twi-line-driven",
         file: HW,
         find: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW;\n\
-               // The 0xF2 the stock build on this torch writes to VPORTA.DIR at reset.\n\
                const _: () = assert!(PORTA_OUTPUTS == 0xF2);\n",
         replace: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW | 1 << 2;\n",
         stage: Stage::Simulator,
@@ -289,8 +288,9 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "halt-leaves-the-light-on",
         file: HW,
-        find: "    set_output(Output::OFF);\n    // TWI0's host off,",
-        replace: "    write(reg::TCB0_INTCTRL, 0);\n    // TWI0's host off,",
+        find: "    unsafe { asm!(\"cli\", options(nostack)) };\n    set_output(Output::OFF);\n",
+        replace: "    unsafe { asm!(\"cli\", options(nostack)) };\n    \
+                  write(reg::TCB0_INTCTRL, 0);\n",
         stage: Stage::Simulator,
         expect: "sleeps with TCB0 running and PC1 high",
     },
