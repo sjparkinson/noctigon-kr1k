@@ -215,19 +215,23 @@ impl Torch {
     }
 
     /// `ticks` calls of [`Torch::tick`] with the switch up and no ADC result,
-    /// for the firmware's slow tick at rest (`watchdog::Pacer`). With
-    /// [`Torch::quiet_for`] at `ticks` or more that's a few sums, and
-    /// otherwise it's the ticks themselves, so it always lands where they
-    /// would. Resting ticks don't look at VDDIO2, and the fallback's take it
-    /// as there, since nothing was read in the time they stand for.
+    /// for the firmware's slow tick at rest (`watchdog::Pacer`), in a few
+    /// sums. It lands exactly where those ticks would with
+    /// [`Torch::quiet_for`] at `ticks` or more, which is the only way the
+    /// pacer asks for it, since it only slows down after a pass that found
+    /// [`Torch::can_slow`], over a slow tick's worth. `testing::Paced` checks
+    /// that on every pass of every host test and simulator run. Resting
+    /// ticks don't look at VDDIO2, so neither does this.
+    ///
+    /// Asked for more, it rests only as many as are quiet, and none while
+    /// something's showing, so a timer can run late but never early, and a
+    /// check of the cell is never skipped.
     pub fn rest_for(&mut self, ticks: u16) {
+        let ticks = match self.quiet_for() {
+            Some(quiet) => ticks.min(quiet),
+            None => 0,
+        };
         if ticks == 0 {
-            return;
-        }
-        if self.quiet_for().is_none_or(|quiet| quiet < ticks) {
-            for _ in 0..ticks {
-                self.tick(false, None, true);
-            }
             return;
         }
         // Resting, so the light's off, `showing` is 0 and no click is
@@ -473,6 +477,7 @@ mod tests {
     fn resting_for_a_while_is_resting_tick_by_tick() {
         let mut rng = Rng::new(9);
         let mut torch = Rig::default();
+        let mut exact = 0u32;
         for round in 0..3000 {
             // Somewhere random, with the switch up for a moment at the end.
             let pressed = rng.next_u16() % 3 == 0;
@@ -483,8 +488,10 @@ mod tests {
                 run(&mut torch, false, rng.next_u16() % 20_000);
             }
             let ticks = rng.next_u16() % 200;
+            // Asked for more than it's quiet for, it rests what it can.
+            let quiet = torch.quiet_for().map_or(0, |quiet| quiet.min(ticks));
             let mut by_tick = torch.torch.clone();
-            for _ in 0..ticks {
+            for _ in 0..quiet {
                 by_tick.tick(false, None, true);
             }
             let mut at_once = torch.torch.clone();
@@ -492,10 +499,31 @@ mod tests {
             assert_eq!(
                 std::format!("{at_once:?}"),
                 std::format!("{by_tick:?}"),
-                "round {round}, {ticks} ticks"
+                "round {round}, {ticks} ticks, quiet for {quiet}"
             );
+            exact += u32::from(quiet == ticks && ticks > 0);
             torch.torch = at_once;
         }
+        assert!(exact > 300, "only {exact} rounds rested in full");
+    }
+
+    /// More than it's quiet for, it rests up to the check of the cell and
+    /// stops, so the check still comes, and nothing while showing a colour.
+    #[test]
+    fn resting_for_more_than_its_quiet_for_never_skips_a_check() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, 8);
+        let quiet = torch.quiet_for().unwrap();
+        run(&mut torch, false, quiet - 10);
+        torch.torch.rest_for(watchdog::SLOW_TICKS);
+        assert_eq!(torch.quiet_for(), Some(0), "rested only to the check");
+        torch.tick(false);
+        assert!(!torch.resting(), "the check's on");
+        let mut torch = Rig::default();
+        tap(&mut torch, 3, Event::Click(3));
+        let before = std::format!("{:?}", torch.torch);
+        torch.torch.rest_for(watchdog::SLOW_TICKS);
+        assert_eq!(std::format!("{:?}", torch.torch), before, "red's showing");
     }
 
     #[test]

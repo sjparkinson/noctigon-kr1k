@@ -760,6 +760,19 @@ impl Paced {
 
     fn pass(&mut self, wake: Wake, at: u32, scene: &Scene) -> End {
         let begin = self.pacer.begin(wake);
+        // `Torch::rest_for` is only exact with this, which the pacer only
+        // asks for after a pass the torch called quiet. Every host test and
+        // every simulator run comes through here.
+        assert!(
+            begin.rested == 0
+                || self
+                    .rig
+                    .torch
+                    .quiet_for()
+                    .is_some_and(|quiet| quiet >= begin.rested),
+            "a slow tick with the torch not quiet for it: {:?}",
+            self.rig.torch.quiet_for()
+        );
         self.rig.torch.rest_for(begin.rested);
         self.rig.tick_in(self.pressed, scene);
         if self.aux.step(self.rig.torch.aux()).is_some() && self.bus_fails {
