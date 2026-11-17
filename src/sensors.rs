@@ -156,6 +156,10 @@ pub const SUPPLIES_AT: usize = crate::regs::mem::INTERNAL_SRAM_START;
 /// taken with the light off, two ticks apart, against the same 1.024 V
 /// reference.
 ///
+/// A pair is only kept when each reading's tick and the two before it were
+/// dark, so a light that went out or came on partway through the round puts
+/// no load sag in either (`limits::Limits::tick`).
+///
 /// It's a measurement aid and nothing else. The firmware keeps it at
 /// [`SUPPLIES_AT`] for `cargo xtask peek`, so one programmer session shows
 /// whether VDDIO2, which PC1 hangs off, follows VDD. Nothing in the
