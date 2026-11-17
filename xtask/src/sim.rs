@@ -185,7 +185,9 @@
 //!    held low (`bad_bus`).
 //! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
 //!    Then long rests between presses, so the tick slows to 1 Hz, once in
-//!    each of the PIT's phases (`resting`).
+//!    each of the PIT's phases (`resting`), and once more with a switch edge
+//!    put up with every slow tick, which mustn't end the slow sleep after
+//!    that tick's pass (`stale_edges`).
 //! 7. Twenty thousand ticks of random clicks and holds.
 //! 8. Both of those again with a switch bounce, and a TCB0 period ending
 //!    while the light's on, landing on every instruction the main loop
@@ -534,7 +536,7 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     ];
     // VDDIO2 going while lit, and the collapsing cell, come last too, since
     // they hold the light on and ramp it, and the rests after them.
-    let late_faults: [(FaultCheck, &str); 8] = [
+    let late_faults: [(FaultCheck, &str); 9] = [
         (cell_collapses, "with a collapsing cell"),
         (aw2016_absent, "with the AW2016 never answering"),
         (sda_held_low, "with SDA held low"),
@@ -543,6 +545,7 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (resting_aligned, "resting, the PIT aligned"),
         (resting_early, "resting, the PIT's first tick early"),
         (resting_late, "resting, the PIT's first tick late"),
+        (stale_edges, "resting, with an edge on every slow tick"),
     ];
     let power_on = &power_on;
     let reports: Vec<Result<Report, String>> = thread::scope(|scope| {
@@ -1163,6 +1166,37 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
     Ok(())
 }
 
+/// Rests with an edge on the switch, the switch not moving, put up with
+/// every slow tick, so its handler runs with the tick already due and before
+/// that tick's pass reads the switch, the way a real edge could land just
+/// after the PIT's. That pass sees whatever the edge did, so the slow sleep
+/// after it has to run its full second, in step with a library that's told
+/// of no edge, where a firmware that left the edge up would wake straight
+/// away for nothing. A click between the rests, so the edges also meet the
+/// pacer's way back to the lit window and down again.
+fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
+    sim.chip.edge_with_slow_tick = true;
+    let second = TICKS_PER_SECOND;
+    let script = [
+        Action::Wait(12 * second),
+        Action::Clicks(1),
+        Action::Wait(2 * second),
+        Action::Clicks(1),
+        Action::Wait(12 * second),
+    ];
+    let end = in_step(&mut sim, testing::samples(script), report)?;
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    if sim.chip.edges_with_ticks < 10 {
+        return Err(format!(
+            "only {} edges came with slow ticks, so this checked little",
+            sim.chip.edges_with_ticks
+        ));
+    }
+    Ok(())
+}
+
 fn resting_aligned(sim: Sim, report: &mut Report) -> Result<(), String> {
     resting(sim, PitPhase::Aligned, report)
 }
@@ -1455,11 +1489,11 @@ fn in_step(
             vddio2: sim.chip.vddio2_ok(),
             ..sample.scene
         };
-        let (power_downs, reads, feeds, bounces) = (
+        let (power_downs, reads, feeds, late_edges) = (
             sim.chip.power_downs,
             sim.chip.switch_reads,
             sim.chip.wdt.feeds,
-            sim.bounces,
+            sim.late_edges,
         );
         let took = sim.tick(sample.pressed).map_err(at)?;
         // The library's passes on this grid point, which is none at all with
@@ -1467,9 +1501,10 @@ fn in_step(
         // of the switch.
         let mut ends: Vec<End> = rig.sample(sample.pressed, &scene).into_iter().collect();
         let passes = (sim.chip.switch_reads - reads) as usize;
-        // A bounce landed mid-pass wakes a slow sleep with nothing to see,
-        // which the library has to be told about.
-        while passes > ends.len() && sim.bounces > bounces {
+        // A bounce landed after the pass read the switch wakes a slow sleep
+        // with nothing to see, which the library has to be told about. One
+        // the pass read the switch after mustn't wake it.
+        while passes > ends.len() && sim.late_edges > late_edges {
             match rig.bounce(&scene) {
                 Some(end) => ends.push(end),
                 None => break,
@@ -2134,8 +2169,13 @@ struct Sim {
     landed: u32,
     /// Handlers so far that landed with a 16-bit access half done.
     mid_access: u32,
-    /// Switch bounces `land` has put up so far.
-    bounces: u32,
+    /// Edges on the switch whose handler ran after the main loop last read
+    /// it, with no tick taken since, so the pass that reads it next hasn't
+    /// seen them. Only those can end a slow sleep with no pass of the
+    /// library's to match. One whose handler ran once a tick was taken and
+    /// before that tick's pass read the switch is one that pass sees, so it
+    /// mustn't end the sleep after it.
+    late_edges: u32,
 }
 
 /// What `Sim::land` does the first time the main loop reaches an instruction
@@ -2180,7 +2220,7 @@ impl Sim {
             last_new: 0,
             landed: 0,
             mid_access: 0,
-            bounces: 0,
+            late_edges: 0,
         })
     }
 
@@ -2215,7 +2255,6 @@ impl Sim {
             if let Landing::Until(_) = self.landing {
                 if bounce {
                     chip.portd_flags |= SWITCH;
-                    self.bounces += 1;
                 }
                 if period && !chip.tcb.capt {
                     chip.tcb.capt = true;
@@ -2317,6 +2356,9 @@ impl Sim {
     fn watch_handler(&mut self, before: Option<u8>) -> Result<(), String> {
         match (before, self.cpu.handling) {
             (None, Some(vector)) => {
+                if vector == VECTOR_PORTD && self.chip.switch_read_at >= self.chip.tick_taken_at {
+                    self.late_edges += 1;
+                }
                 if self.chip.forced == Some(vector) {
                     self.chip.forced = None;
                     self.forced = Some(vector);
@@ -2720,6 +2762,14 @@ struct Chip {
     pit_phase: PitPhase,
     /// Reads of VPORTD.IN by the main loop, which reads it once a pass.
     switch_reads: u32,
+    /// When the main loop last read VPORTD.IN.
+    switch_read_at: u64,
+    /// Puts PD4's flag up with every slow PIT tick, as an edge with the
+    /// switch not moving, so its handler runs with the tick already due and
+    /// before that tick's pass reads the switch (`stale_edges`).
+    edge_with_slow_tick: bool,
+    /// Edges `edge_with_slow_tick` has put up.
+    edges_with_ticks: u32,
     /// Instructions the main loop has spent waiting on WDT.STATUS.SYNCBUSY.
     wdt_waits: u64,
     /// Whether the firmware's gone to sleep since this was cleared.
@@ -2807,6 +2857,9 @@ impl Chip {
             pit_next: 0,
             pit_phase: PitPhase::Aligned,
             switch_reads: 0,
+            switch_read_at: 0,
+            edge_with_slow_tick: false,
+            edges_with_ticks: 0,
             wdt_waits: 0,
             tick_polled: false,
             tcb: Tcb::default(),
@@ -3069,6 +3122,10 @@ impl Chip {
                     Pit::Fast => self.grid + 1,
                     Pit::Slow => {
                         self.slow_ticks += 1;
+                        if self.edge_with_slow_tick && senses(self.io[SWITCH_CTRL] & PORT_ISC) {
+                            self.portd_flags |= SWITCH;
+                            self.edges_with_ticks += 1;
+                        }
                         testing::next_slow(self.grid)
                     }
                 };
@@ -4220,6 +4277,7 @@ impl Bus for Chip {
                 }
                 if !self.in_handler {
                     self.switch_reads += 1;
+                    self.switch_read_at = self.now;
                 }
                 Ok(if self.pressed { !SWITCH } else { 0xFF })
             }

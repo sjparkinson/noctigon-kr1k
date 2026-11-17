@@ -445,6 +445,17 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the firmware ran 0 passes on this tick, but the library 1",
     },
+    // A pass forgets the switch edges it reads the switch after. This leaves
+    // them up, so an edge just after a slow tick ends the slow sleep after
+    // that tick's pass at once, for nothing the pass hadn't seen.
+    Breakage {
+        name: "stale-switch-edge",
+        file: HW,
+        find: "    out!(reg::GPR_GPR2, 0);\n    let pressed = switch_pressed();\n",
+        replace: "    let pressed = switch_pressed();\n",
+        stage: Stage::Simulator,
+        expect: "resting, with an edge on every slow tick: tick",
+    },
     // 16-bit registers go low byte first.
     Breakage {
         name: "high-byte-first",
@@ -491,9 +502,9 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "bounds-check",
         file: MAIN,
-        find: "        torch.tick(\n            hw::switch_pressed(),\n            hw::adc_result(),\n",
+        find: "        torch.tick(\n            hw::take_switch(),\n            hw::adc_result(),\n",
         replace: "        let reading = hw::adc_result();\n        \
-                  let pressed = [hw::switch_pressed(); 4][usize::from(reading.unwrap_or(0))];\n        \
+                  let pressed = [hw::take_switch(); 4][usize::from(reading.unwrap_or(0))];\n        \
                   torch.tick(\n            pressed,\n            reading,\n",
         stage: Stage::Layout,
         expect: "panic_bounds_check",
