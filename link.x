@@ -28,6 +28,16 @@ SECTIONS {
     *(.rodata .rodata.*)
   } > MAPPED
 
+  /*
+   * The firmware's last supply readings, first in SRAM so `cargo xtask peek`
+   * finds them at a fixed address (kr1k::sensors::SUPPLIES_AT), whatever
+   * other statics come and go. NOLOAD and outside .bss, so src/avr/rt.rs
+   * doesn't touch it, and `main` zeroes it itself straight after reset.
+   */
+  .supplies (NOLOAD) : {
+    KEEP(*(.supplies))
+  } > RAM
+
   .data : AT(LOADADDR(.rodata) + SIZEOF(.rodata)) {
     __data_start = .;
     *(.data .data.*)

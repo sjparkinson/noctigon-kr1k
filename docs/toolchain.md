@@ -27,6 +27,8 @@ From `vendor/AVR32DD20.atdf` (confirmed)
 | Signature | 0x1100 | `1E 95 3A` |
 | Vectors | 0x0000 | 36, two words each, with the RTC's PIT at 6 |
 
+In SRAM, `link.x` puts a 4-byte `.supplies` section first, at 0x7000, then `.data`, then `.bss`, and the stack grows down from the top. `.supplies` holds the last raw readings of VDD / 10 and VDDIO2 / 10 for `cargo xtask peek`, which reads them at that fixed address (`kr1k::sensors::SUPPLIES_AT`, checked by the simulator). It's NOLOAD and outside `.bss`, so startup doesn't zero it, and `main` zeroes it straight after holding PC1 low.
+
 AVR ELF files put data space at 0x800000, so in `link.x` SRAM is 0x807000 and the mapped flash 0x808000. Read-only data is linked at its flash address plus 0x808000 and read with ordinary loads through that window, so there's no `lpm`. The whole of flash fits the 32 KB window, so nothing needs `FLMAP` (DS40002413B chapter 11).
 
 ## Linking with rust-lld

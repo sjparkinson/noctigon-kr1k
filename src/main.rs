@@ -52,6 +52,9 @@ extern "C" fn main() -> ! {
 
     // PC1 floats from reset until it's an output.
     hw::hold_enable_low();
+    // The supply readings for `cargo xtask peek` sit outside .bss, so
+    // startup leaves them as SRAM had them. Nothing's been read yet.
+    hw::record_supplies([0; 4]);
 
     let faults = Faults {
         hang: selftest::hung(hw::take_reset_flags()),

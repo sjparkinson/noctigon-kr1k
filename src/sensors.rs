@@ -87,9 +87,10 @@
 //! thrown away. It does say the temperature sensor wants about 40 µs after
 //! MUXPOS moves to it, and a reference about 10 µs to start (DS40002413B
 //! tables 38-25 and 38-18), and the channels don't all use one reference,
-//! 1.024 V for the cell and ground and 2.048 V for the temperature, so the
-//! input moves at every switch and the reference at some. It says nothing
-//! about settling after a move to GND or VDDDIV10. The stock firmware throws
+//! 1.024 V for the cell, VDDIO2 and ground and 2.048 V for the temperature,
+//! so the input moves at every switch and the reference at some. It says
+//! nothing about settling after a move to GND, VDDDIV10 or VDDIO2DIV10. The
+//! stock firmware throws
 //! the first one away too ("first result is unstable"). It costs a tick, so
 //! it's cheap insurance, and every turn does it, ground's included.
 //!

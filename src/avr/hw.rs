@@ -584,12 +584,15 @@ pub fn adc_result() -> Option<u16> {
 
 /// The last raw readings of the cell and VDDIO2, as
 /// `kr1k::sensors::Supplies::to_bytes` lays them out, for `cargo xtask peek`
-/// to read over UPDI while the firmware runs. It's the firmware's only
-/// static, so it's at the start of .bss, which is the start of SRAM, and
-/// xtask's simulator checks the ELF puts it at `kr1k::sensors::SUPPLIES_AT`.
-/// Startup zeroes it, which `peek` reads as nothing read yet. Nothing in the
-/// firmware reads it back.
+/// to read over UPDI while the firmware runs. It's in its own section,
+/// `.supplies`, which link.x puts first in SRAM, so it stays at
+/// `kr1k::sensors::SUPPLIES_AT` whatever other statics the firmware gains,
+/// and xtask's simulator checks the ELF has it there. That section is
+/// outside .bss, so startup doesn't zero it. `main` does, with
+/// [`record_supplies`], as soon as PC1 is held low, and zeros are what
+/// `peek` reads as nothing read yet. Nothing in the firmware reads it back.
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".supplies")]
 static mut SUPPLIES: [u8; 4] = [0; 4];
 
 /// Keeps `bytes` in [`SUPPLIES`]. `main` calls it every pass. It's four
