@@ -137,8 +137,9 @@ extern "C" fn main() -> ! {
 }
 
 // Turns the light off and powers down for good (`hw::halt`). The watchdog
-// isn't fed there, so it resets the chip within 64 WDT clocks of the last
-// feed, about 63 ms, and the next boot comes up as a fault, dark until the
+// isn't fed there, so it resets the chip, within 64 WDT clocks of the last
+// feed under the lit setting, about 63 ms, or within 8,192 under the rest
+// setting, about 8 s, and the next boot comes up as a fault, dark until the
 // cell comes out.
 //
 // Spinning here would end the same way while the watchdog runs. `halt` is for

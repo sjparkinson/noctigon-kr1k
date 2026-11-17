@@ -547,8 +547,9 @@ pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
 ///
 /// What comes next depends on the 32 kHz oscillator. If it's running, so is
 /// the watchdog, which counts in every sleep mode. Nothing here feeds it, so
-/// it resets the chip within 64 WDT clocks of the last feed, and that boot
-/// comes up off and as a fault. If the oscillator's stopped there's no reset.
+/// it resets the chip, within 64 WDT clocks of the last feed under the lit
+/// setting (about 63 ms), or within 8,192 under the rest setting (about 8 s,
+/// `kr1k::watchdog::REST_CLOCKS`), and that boot comes up off and as a fault. If the oscillator's stopped there's no reset.
 /// The chip stays here, off, at power-down current, until the cell comes out.
 pub fn halt() -> ! {
     // SAFETY: `cli` only clears SREG.I. With no `nomem`, it's also a compiler
