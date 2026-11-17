@@ -1,25 +1,18 @@
-//! Enough terminal for `cargo xtask simulate`. Keys arrive one at a time,
-//! without echo.
-//!
-//! Raw mode properly means termios, and termios means libc or `unsafe`, so
-//! this does what `serial.rs` does and asks `stty`, which acts on the
-//! terminal it inherits as stdin. `Drop` puts the settings back, panic or
-//! not. `-isig` means Ctrl-C arrives as a key rather than killing the
-//! process with the terminal still raw.
+//! Enough terminal for `cargo xtask simulate`, with keys arriving one at a time
+//! and no echo. It asks `stty`, since termios would need libc or `unsafe`.
 
 use std::io::{self, IsTerminal, Read, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
-/// Ctrl-C, as it arrives with `-isig`.
+/// Arrives as a key, since `-isig` stops it killing the process in raw mode.
 pub const CTRL_C: char = '\x03';
 
 pub struct Terminal {
     saved: String,
     input: Receiver<u8>,
     decoder: Decoder,
-    /// Columns, for keeping the status line to one row.
     pub width: usize,
 }
 
@@ -60,7 +53,6 @@ impl Terminal {
         Ok(terminal)
     }
 
-    /// Every key typed since the last call, or `None` once stdin closes.
     pub fn poll(&mut self) -> Option<Vec<char>> {
         let mut keys = Vec::new();
         loop {
@@ -74,7 +66,6 @@ impl Terminal {
 
     pub fn write(&self, text: &str) {
         let mut out = io::stdout().lock();
-        // Nothing useful to do if the terminal's gone.
         let _ = out.write_all(text.as_bytes()).and_then(|()| out.flush());
     }
 }
@@ -105,17 +96,11 @@ fn stty(args: &[&str]) -> Result<String, String> {
     String::from_utf8(output.stdout).map_err(|e| format!("stty: {e}"))
 }
 
-/// Bytes from the terminal in, keys out. Arrow keys and the like arrive as
-/// escape sequences (`ESC [ 1 ; 5 D`), which it swallows whole so their
-/// digits don't come out as clicks. A sequence can arrive split across
-/// reads, so it remembers where it's up to.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum Decoder {
     #[default]
     Ground,
-    /// After `ESC`.
     Escape,
-    /// Inside `ESC [ ...`, waiting for its final byte.
     Sequence,
 }
 
@@ -124,7 +109,6 @@ impl Decoder {
         let (next, key) = match (*self, byte) {
             (Self::Ground, 0x1B) => (Self::Escape, None),
             (Self::Escape, b'[') => (Self::Sequence, None),
-            // Escape then anything but `[` is Alt and a key, or Esc alone.
             (Self::Ground | Self::Escape, _) => (Self::Ground, key(byte)),
             (Self::Sequence, 0x40..=0x7E) => (Self::Ground, None),
             (Self::Sequence, _) => (Self::Sequence, None),
@@ -134,7 +118,6 @@ impl Decoder {
     }
 }
 
-/// Printable ASCII, and Ctrl-C.
 fn key(byte: u8) -> Option<char> {
     let key = char::from(byte);
     (key.is_ascii_graphic() || key == ' ' || key == CTRL_C).then_some(key)

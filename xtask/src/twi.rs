@@ -1,60 +1,5 @@
-//! TWI0's host and the AW2016 on its bus, for sim.rs's fake chip.
-//!
-//! Like the rest of the simulator, this is one reading of two datasheets, run
-//! against code written from the same reading, and it proves nothing. Section
-//! numbers are DS40002413B's. The AW2016's facts are its datasheet's (Awinic,
-//! V1.3), which has no section numbers, so they're named by heading.
-//!
-//! # The host
-//!
-//! - MBAUD is only written with the host off (§29.5.7). An SCL period is
-//!   `10 + 2 × BAUD` main clocks, equation 1 of §29.3.2.2.1 with no rise time,
-//!   which is the quickest the bus can go, and it has to be within the
-//!   AW2016's 400 kHz with an SCL low of at least its 1.3 µs, by equation 3.2
-//!   with the 250 ns fall time table 38-22 allows.
-//! - MCTRLA is off or on, and nothing else: no interrupts, no smart mode, no
-//!   quick command and no time-out. Turning the host on leaves the bus state
-//!   unknown, and MSTATUS.BUSSTATE has to be forced idle before an address
-//!   goes out (§29.3.2.1.1). Turning it off leaves it unknown again (§29.3.2.2.2).
-//! - An address in MADDR takes a start and nine SCL periods, a byte in MDATA
-//!   nine, and each ends in WIF and CLKHOLD with RXACK saying whether the
-//!   AW2016 acknowledged (§29.3.2.2.3, §29.3.2.2.4). Nothing in MADDR, MDATA
-//!   or MCTRLB is written while a byte's on the bus (§29.5.9), no data goes
-//!   after a NACK, and no address goes out again in the same update after a
-//!   NACK or a bus error, since the firmware gives up rather than retrying.
-//!   Only writes are modelled, since the firmware never reads.
-//! - MCTRLB only takes STOP, with the host owning the bus and holding SCL.
-//!   The bus is idle a period later. The host stops in every sleep mode
-//!   (§29.3.5), so `sleep` with it on is refused by sim.rs.
-//! - A completed byte lands when MSTATUS is next read, or anything else of
-//!   the host's is touched, like the ADC's result, so it's timed by the
-//!   simulated clock and nothing else.
-//!
-//! # The AW2016
-//!
-//! - Its address is 0x64. Anything else goes unacknowledged.
-//! - A write's first byte is the register, and each byte after it goes in
-//!   the next one up ("Write Cycle").
-//! - It comes up in standby with every register at 0. In standby only RSTR
-//!   and GCR1 take a write, and writing anything else is an error here, since
-//!   the real chip drops it ("Operating Mode"). RSTR takes 0x55, which resets
-//!   every register ("Software Reset").
-//! - For a millisecond after CHIPEN rises, writes to anything but RSTR and
-//!   GCR1 are refused too. That's likely, not the datasheet's, which gives no
-//!   wait. A driver for it in PebbleOS found such writes acknowledged and
-//!   dropped, and the Linux driver waits 2 ms.
-//! - Only GCR1's CHIPEN and CHGDIS, GCR2's IMAX, LCTR's enables, LCFG1 to
-//!   LCFG3's current settings and PWM1 to PWM3 are modelled. Anything else
-//!   written is an error, so a pattern mode, a protection turned off or an
-//!   interrupt enable fails here until it's taught.
-//!
-//! # Faults on the bus
-//!
-//! A run can take the AW2016 off the bus, so every address goes
-//! unacknowledged, or hold SDA low, so every address loses arbitration with a
-//! bus error and leaves the bus busy (§29.3.2.2.3, case M4), or hold SCL low,
-//! so a byte never finishes and no flag ever comes up. The firmware has to
-//! give up on each without hanging and carry on.
+//! TWI0's host and the AW2016 on its bus, for sim.rs's fake chip. Sections
+//! are DS40002413B's and quoted headings the AW2016 datasheet's (Awinic V1.3).
 
 use kr1k::aw2016::{ADDRESS, CHGDIS, CHIPEN, GCR1, GCR2, IMAX_5MA, LCFG1, LCTR, PWM1, RESET, RSTR};
 use kr1k::board::{AUX_BLUE, AUX_GREEN, AUX_RED};
@@ -65,19 +10,18 @@ use kr1k::regs::{
 };
 use kr1k::ui::Aux;
 
-/// Main clocks a second, as sim.rs runs the chip.
+/// Main clocks a second.
 const CLK_PER: u64 = 4_000_000;
-/// The AW2016's fastest SCL ("I2C Interface Timing").
+/// The AW2016's fastest SCL and shortest SCL low ("I2C Interface Timing").
 const SCL_MAX_HZ: u64 = 400_000;
-/// Its shortest SCL low, 1.3 µs, in nanoseconds.
 const T_LOW_MIN_NS: u64 = 1300;
-/// The longest fall time table 38-22 allows at 400 kHz, in nanoseconds.
+/// The longest fall time table 38-22 allows at 400 kHz.
 const T_OF_MAX_NS: u64 = 250;
-/// Main clocks after CHIPEN rises before the AW2016 takes any register but
-/// RSTR and GCR1. A millisecond, likely, from the PebbleOS driver.
+/// Main clocks after CHIPEN rises before registers past GCR1 take a write.
+/// Likely, from PebbleOS's driver. The datasheet gives no wait.
 pub const WAKE_CLOCKS: u64 = CLK_PER / 1000;
 
-/// The registers this models, past RSTR and GCR1.
+/// Besides RSTR and GCR1.
 const MODELLED: [u8; 8] = [
     GCR2,
     LCTR,
@@ -88,36 +32,27 @@ const MODELLED: [u8; 8] = [
     PWM1 + 1,
     PWM1 + 2,
 ];
-/// The bits of each LCFG register that are CUR.
+// The bits modelled in LCFG1 to LCFG3, LCTR and GCR2.
 const CUR: u8 = 0x0F;
-/// LCTR's three enables.
 const ENABLES: u8 = 0x07;
-/// GCR2's IMAX.
 const IMAX: u8 = 0x03;
 
-/// What's wrong with the bus in a run, if anything.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Fault {
     None,
-    /// The AW2016 never acknowledges its address.
     Absent,
-    /// SDA is held low, so every address loses arbitration.
     SdaLow,
-    /// SCL is held low, so no byte ever finishes.
     SclLow,
 }
 
-/// What's on the bus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Byte {
     Address(u8),
     Data(u8),
 }
 
-/// The AW2016's registers, 0x00 to 0x3F, as far as this models them.
 pub struct Aw2016 {
     regs: [u8; 0x40],
-    /// When CHIPEN last rose.
     woke_at: u64,
 }
 
@@ -133,12 +68,10 @@ impl Aw2016 {
         self.regs[usize::from(at)]
     }
 
-    /// Whether GCR1.CHIPEN is set, so it's awake rather than in standby.
     pub fn awake(&self) -> bool {
         self.reg(GCR1) & CHIPEN != 0
     }
 
-    /// An output's current setting and PWM code, if it's lit.
     fn output(&self, channel: u8) -> Option<(u8, u8)> {
         let cur = self.reg(LCFG1 + channel) & CUR;
         let pwm = self.reg(PWM1 + channel);
@@ -146,15 +79,10 @@ impl Aw2016 {
         (on && cur > 0 && pwm > 0).then_some((cur, pwm))
     }
 
-    /// Whether any aux LED is lit.
     pub fn lit(&self) -> bool {
         (0..3).any(|channel| self.output(channel).is_some())
     }
 
-    /// The colour the aux show, through the board's channel map, and whether
-    /// it's bright, or `None` dark. A mix of outputs no docs/ui.md colour has,
-    /// a colour that's partly dim and partly bright, or dim at a global
-    /// current above the lowest, is an error.
     pub fn colour(&self) -> Result<Option<(Aux, bool)>, String> {
         let [red, green, blue] = [AUX_RED, AUX_GREEN, AUX_BLUE].map(|ch| self.output(ch));
         let colour = match (red.is_some(), green.is_some(), blue.is_some()) {
@@ -191,7 +119,7 @@ impl Aw2016 {
         Ok(Some((colour, bright)))
     }
 
-    /// Takes a byte into register `at`, at `now`.
+    /// Standby and reset are as "Operating Mode" and "Software Reset" have them.
     fn write(&mut self, now: u64, at: u8, value: u8) -> Result<(), String> {
         let late = now.saturating_sub(self.woke_at) < WAKE_CLOCKS;
         match at {
@@ -257,7 +185,6 @@ impl Aw2016 {
     }
 }
 
-/// TWI0 in host mode, and the bus it drives.
 pub struct Twi {
     pub fault: Fault,
     pub aw2016: Aw2016,
@@ -269,19 +196,16 @@ pub struct Twi {
     arblost: bool,
     buserr: bool,
     clkhold: bool,
-    /// The byte on the bus and when it finishes.
+    /// When the byte on the bus finishes, in main clocks, and the byte.
     sending: Option<(u64, Byte)>,
-    /// When the STOP that's going out leaves the bus idle.
     stopping: Option<u64>,
-    /// Whether this transfer's address was acknowledged, and the register
-    /// it's pointing at once its first byte's in.
+    /// `Some` once the address is acknowledged, and `Some(Some(_))` once the
+    /// first byte has set the register pointer ("Write Cycle").
     pointer: Option<Option<u8>>,
-    /// A NACK or a bus error has happened since the host was turned on.
     gave_up: bool,
     /// Times the host's been turned on.
     pub sessions: u32,
-    /// Times a transfer was refused, by a NACK or a bus error, or a byte
-    /// never finished.
+    /// Transfers refused by a NACK or a bus error, or given up on mid-byte.
     pub failures: u32,
 }
 
@@ -307,18 +231,15 @@ impl Twi {
         }
     }
 
-    /// Whether the host's on.
     pub const fn on(&self) -> bool {
         self.on
     }
 
-    /// Main clocks in an SCL period.
+    /// Main clocks in an SCL period, by equation 1 of §29.3.2.2.1 with no rise time.
     fn period(&self) -> u64 {
         10 + 2 * u64::from(self.baud)
     }
 
-    /// Lands whatever's finished by `now`. `pc1_high` says the light's on, and
-    /// lighting an aux LED then is an error.
     pub fn catch_up(&mut self, now: u64, pc1_high: bool) -> Result<(), String> {
         if let Some(at) = self.stopping
             && now >= at
@@ -335,6 +256,7 @@ impl Twi {
         self.sending = None;
         self.wif = true;
         match (byte, self.fault) {
+            // §29.3.2.2.3, case M4.
             (Byte::Address(_), Fault::SdaLow) => {
                 self.arblost = true;
                 self.buserr = true;
@@ -383,7 +305,6 @@ impl Twi {
         Ok(())
     }
 
-    /// MSTATUS as it reads at `now`.
     pub fn status(&mut self, now: u64, pc1_high: bool) -> Result<u8, String> {
         self.catch_up(now, pc1_high)?;
         let flag = |on: bool, bit: u8| if on { bit } else { 0 };
@@ -395,7 +316,6 @@ impl Twi {
             | self.state)
     }
 
-    /// A write to one of TWI0's registers at `now`.
     pub fn write(&mut self, now: u64, a: usize, value: u8, pc1_high: bool) -> Result<(), String> {
         self.catch_up(now, pc1_high)?;
         match a {
@@ -415,8 +335,7 @@ impl Twi {
                             "turns the TWI host off while its STOP is still going out".into()
                         );
                     }
-                    // A byte still on the bus is one the firmware gave up
-                    // waiting for.
+                    // Off leaves the bus state unknown again (§29.3.2.2.2).
                     let stranded = u32::from(self.sending.is_some());
                     *self = Self {
                         fault: self.fault,
@@ -430,6 +349,7 @@ impl Twi {
                 TWI_ENABLE => {
                     let ns = |clocks: u64| clocks * 1_000_000_000 / CLK_PER;
                     let period = self.period();
+                    // SCL low is by equation 3.2, less the fall time.
                     if CLK_PER / period > SCL_MAX_HZ
                         || ns(u64::from(self.baud) + 6).saturating_sub(T_OF_MAX_NS) < T_LOW_MIN_NS
                     {
@@ -504,6 +424,8 @@ impl Twi {
                 self.clear_flags();
                 self.state = TWI_BUSSTATE_OWNER;
                 self.pointer = None;
+                // A start and nine SCL periods, and nine for a data byte
+                // (§29.3.2.2.3, §29.3.2.2.4).
                 let done = match self.fault {
                     Fault::SclLow => u64::MAX,
                     _ => now + 10 * self.period(),
@@ -539,8 +461,7 @@ impl Twi {
         Ok(())
     }
 
-    /// Refuses `what` unless the host owns the bus and holds SCL between
-    /// bytes, which is when MDATA and MCTRLB take a write (§29.5.9).
+    /// MDATA and MCTRLB only take a write with the bus owned and SCL held (§29.5.9).
     fn ready(&self, what: &str) -> Result<(), String> {
         if !self.on || self.state != TWI_BUSSTATE_OWNER {
             return Err(format!("writes {what} without owning the bus"));
@@ -576,8 +497,6 @@ mod tests {
         twi
     }
 
-    /// Sends `bytes` to the AW2016 from `now` as one transfer, waiting out
-    /// each byte, then a STOP, and returns the time it ends.
     fn transfer(twi: &mut Twi, mut now: u64, bytes: &[u8]) -> u64 {
         twi.write(now, reg::TWI0_MADDR, ADDRESS << 1, false)
             .unwrap();

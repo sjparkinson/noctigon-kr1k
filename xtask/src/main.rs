@@ -1,9 +1,5 @@
 //! `cargo xtask <command>` is the AVR build and the steps around it that cargo
 //! can't do.
-//!
-//! No dependencies beyond the firmware's own library. ELF reading, Intel HEX,
-//! the UPDI programmer and the AVR simulator are all small enough to do by
-//! hand, which saves needing avr-objcopy, avrdude, pymcuprog or simavr.
 
 #[cfg(test)]
 mod atdf;
@@ -64,9 +60,7 @@ or /dev/ttyUSB0 on Linux. <dir> names one chip's backup, e.g. backup/torch.
 ";
 
 const ELF: &str = "target/avr-none/release/kr1k.elf";
-/// examples/link.rs, which `build` builds alongside the firmware.
 const PROBE: &str = "target/avr-none/release/examples/link.elf";
-/// examples/guards.rs, which `build` builds alongside the firmware too.
 const GUARDS: &str = "target/avr-none/release/examples/guards.elf";
 const HEX: &str = "target/noctigon-kr1k.hex";
 
@@ -107,16 +101,12 @@ fn main() -> ExitCode {
 }
 
 fn root() -> PathBuf {
-    // xtask/ sits one below the workspace root.
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("xtask has a parent directory")
         .to_path_buf()
 }
 
-/// Builds the firmware, the link probe and the guards probe, and refuses any
-/// of them if the layout checks or the simulator fail. `examples` is
-/// `sim::check`'s.
 fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     run(Command::new(cargo).current_dir(root()).args([
@@ -155,8 +145,8 @@ fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     Ok((elf, report))
 }
 
-/// The link probe is only worth checking if it really has something in each
-/// section, because `layout::memory` passes an empty .data without looking.
+/// `layout::memory` passes an empty .data without looking, so the probe has
+/// to have something in each section.
 fn probe_sections(elf: &elf::Elf) -> Result<(), String> {
     for name in [".rodata", ".data", ".bss"] {
         match elf.section(name) {
@@ -167,9 +157,6 @@ fn probe_sections(elf: &elf::Elf) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes the image `flash` would, which is the firmware padded to all of
-/// flash with 0xFF, a stamp of the commit and its CRC at the end (`crc.rs`).
-/// Then prints flash, RAM, stack, loop and handler use, and the stamp.
 fn hex(examples: bool) -> Result<(), String> {
     let (elf, sim) = build(examples)?;
     let firmware = elf.flash_image();
@@ -217,7 +204,6 @@ fn hex(examples: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// One line of the size report, in columns for used, out of, percent and unit.
 fn row(label: &str, used: u64, of: Option<u64>, unit: &str) -> String {
     let (of, percent) = match of {
         Some(of) => (
@@ -232,7 +218,6 @@ fn row(label: &str, used: u64, of: Option<u64>, unit: &str) -> String {
     )
 }
 
-/// `39062` as `39,062`.
 fn commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
@@ -245,17 +230,11 @@ fn commas(n: u64) -> String {
     out
 }
 
-/// Opens the adapter's port, which is where every command that talks to a
-/// chip starts. Anything that can refuse without a chip does it before this.
 fn open(port: &str) -> Result<Port, String> {
     eprintln!("connecting on {port}");
     Port::open(port)
 }
 
-/// For `ping` and `peek`, which leave the firmware running. `backup` and
-/// `flash` go through `Programmer::connect_for_programming` instead, and
-/// `restore` through `Programmer::connect_for_restore`, which does the same
-/// and then checks whose backup it's been given.
 fn connect(port: &str) -> Result<Programmer<Port>, String> {
     Programmer::connect(open(port)?)
 }
@@ -268,22 +247,8 @@ fn ping(port: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Reads what the running firmware has left behind, without a write, since
-/// UPDI reaches data space while the CPU runs. Turning UPDI off afterwards
-/// should reset the chip (DS40002413B §36.3.2.2.2), so a second read sees a
-/// fresh boot, not what the first one saw. Only `hw::init` sets the pin
-/// directions, DAC0, TCB0's period and the PIT, so those say whether it ran.
-/// VPORTC.OUT says whether PC1, the driver's enable, is high, VPORTA.OUT
-/// which paths are on, and DAC0.DATA what current it's asking for. MVIO.STATUS
-/// says whether VDDIO2, which PC1 hangs off, is there.
-///
-/// The addresses are the firmware's own, from src/regs.rs. src/regs.rs has no
-/// stack pointer, since the firmware never touches it, so that comes from the
-/// simulated CPU's.
-///
-/// It also decodes the last readings of the cell and of VDDIO2 that the
-/// firmware keeps at `kr1k::sensors::SUPPLIES_AT`, both taken with the light
-/// off ([`supply_lines`]). Those are SRAM, which the dump shows too.
+/// Writes nothing, but turning UPDI off afterwards should reset the chip
+/// (DS40002413B §36.3.2.2.2), so only the first read sees what was left.
 fn peek(port: &str) -> Result<(), String> {
     for line in peek_from(|| open(port))? {
         println!("{line}");
@@ -291,8 +256,6 @@ fn peek(port: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `peek`, with opening the port left to `open`, so the tests can hand it
-/// the fake chip. Gives back the lines to print.
 fn peek_from<W: Wire>(open: impl FnOnce() -> Result<W, String>) -> Result<Vec<String>, String> {
     use kr1k::regs::addr;
     let registers = [
@@ -343,13 +306,8 @@ fn peek_from<W: Wire>(open: impl FnOnce() -> Result<W, String>) -> Result<Vec<St
     Ok(lines)
 }
 
-/// The firmware's last readings of the cell (VDD / 10) and VDDIO2 (VDDIO2 /
-/// 10), from the four bytes at `kr1k::sensors::SUPPLIES_AT`, as volts, raw
-/// sums and the difference. Both go through `battery::centivolts`, so both
-/// get the stock firmware's slope of 1014, which is for VDD and is assumed for
-/// VDDIO2. They share the ADC and its 1.024 V reference, whose ±4 % moves both
-/// the same way, so the difference says more than either. Both zero is the
-/// firmware not having read them since it started.
+/// Both readings go through `battery::centivolts`, whose slope is for VDD and
+/// is assumed for VDDIO2.
 fn supply_lines(bytes: [u8; 4]) -> Vec<String> {
     use kr1k::battery::centivolts;
     let supplies = kr1k::sensors::Supplies::from_bytes(bytes);
@@ -387,8 +345,6 @@ fn supply_lines(bytes: [u8; 4]) -> Vec<String> {
     lines
 }
 
-/// `bytes` as one line per run of equal bytes, so a pattern and where it stops
-/// stand out from the 4 KB around it.
 fn runs(start: u16, bytes: &[u8]) -> Vec<String> {
     bytes
         .chunk_by(|a, b| a == b)
@@ -400,13 +356,8 @@ fn runs(start: u16, bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// Refuses a file whose name doesn't say it's for this board. An image has no
-/// model in it, so the name's all there is. It catches picking up another
-/// torch's hex by mistake, not a file that's been renamed.
-///
-/// Only `kr1k` counts. The stock firmware's model numbers don't, because its
-/// 0283 build is the 40 W one and this torch shipped the 32 W 0284, so a
-/// stock hex has to be renamed on purpose (docs/flashing.md).
+/// An image has no model in it, so the name is all there is to check, and a
+/// renamed file gets through.
 fn this_boards_hex(path: &Path) -> Result<(), String> {
     let name = path
         .file_name()
@@ -422,13 +373,7 @@ fn this_boards_hex(path: &Path) -> Result<(), String> {
     ))
 }
 
-/// Checks a file's image against the CRC the firmware checks at every power-on,
-/// since one that doesn't match would flash and verify cleanly, then cap itself
-/// at level 50 with nothing to say why. `cargo xtask hex` always writes all
-/// 32 KB, so a full image that doesn't check is refused. A shorter one isn't
-/// ours, or wasn't signed. The stock firmware's hex is like that and needs no
-/// CRC, so it gets a warning and goes ahead. Not for `restore`, since a
-/// factory backup has no CRC of ours.
+/// Not for `restore`, since a factory backup has no CRC from this repo.
 fn signed(image: &[u8]) -> Result<(), String> {
     if image.len() < map::FLASH_SIZE {
         eprintln!(
@@ -454,8 +399,6 @@ fn backup(port: &str, dir: &Path) -> Result<(), String> {
     backup_from(|| open(port), dir)
 }
 
-/// `backup`, with opening the port left to `open`, so the tests can hand it
-/// the fake chip and see what's refused before any port is opened.
 fn backup_from<W: Wire>(
     open: impl FnOnce() -> Result<W, String>,
     dir: &Path,
@@ -471,8 +414,7 @@ fn backup_from<W: Wire>(
 
     let mut p = Programmer::connect_for_programming(open()?)?;
     let read = read_chip(&mut p);
-    // Leave programming mode even after a failed read, so the chip isn't held
-    // in it until the next power cycle. The first error is the one to report.
+    // Leave programming mode even after a failed read, and report the first error.
     let left = p.leave();
     let chip = read?;
     report_stamp("the chip's flash", &chip.flash);
@@ -490,9 +432,6 @@ fn backup_from<W: Wire>(
         chip.serial,
         dir.display()
     );
-    // A serial number that can't tell chips apart doesn't stop the backup,
-    // since this may be the only copy of the factory firmware. It does stop
-    // `restore`, so say so now, before anything's been flashed over it.
     if chip.serial.is_blank() {
         eprintln!(
             "warning: that serial number can't tell one chip from another. The backup is \
@@ -500,25 +439,17 @@ fn backup_from<W: Wire>(
              was writing to the chip this came from"
         );
     }
-    // A backup that read whole is saved whatever leaving said, since it may be
-    // the only copy of the factory firmware.
+    // A backup that read whole is saved whatever leaving said.
     left?;
     Ok(())
 }
 
-/// What `backup` saves. Each memory but the serial number is one avrdude
-/// names too (`-U flash:r:...`, `eeprom`, `fuses`, `lock`, `userrow`), read
-/// from the same addresses, so the files compare with avrdude's once both are
-/// decoded.
 struct Chip {
     flash: Vec<u8>,
     eeprom: Vec<u8>,
-    /// FUSE.WDTCFG on, 16 bytes.
     fuses: Vec<u8>,
-    /// LOCK.KEY, low byte first.
     lock: Vec<u8>,
     userrow: Vec<u8>,
-    /// Which chip this is, for `restore` to check before it writes.
     serial: SerialNumber,
 }
 
@@ -541,7 +472,6 @@ fn read_chip<W: Wire>(p: &mut Programmer<W>) -> Result<Chip, String> {
     })
 }
 
-/// Says which build `flash` holds, or that it's none of ours.
 fn report_stamp(what: &str, flash: &[u8]) {
     match stamp::read(flash) {
         Some(text) => eprintln!("{what} has the stamp `{text}`"),
@@ -562,10 +492,6 @@ fn restore(port: &str, dir: &Path) -> Result<(), String> {
     restore_onto(|| open(port), dir)
 }
 
-/// `restore`, with opening the port left to `open`, for the same reason as
-/// [`backup_from`]. The backup is read first, and `program` checks its sizes
-/// before it connects, so a directory that's refused for what's in it never
-/// opens the port.
 fn restore_onto<W: Wire>(
     open: impl FnOnce() -> Result<W, String>,
     dir: &Path,
@@ -583,18 +509,13 @@ fn restore_onto<W: Wire>(
     program(connect, &backup.flash, Some(&backup.eeprom))
 }
 
-/// What `restore` takes from a backup's directory.
 struct Backup {
     flash: Vec<u8>,
     eeprom: Vec<u8>,
-    /// The serial number of the chip `backup` read these from, which is the
-    /// only chip `restore` writes them to.
     serial: SerialNumber,
 }
 
-/// Reads the backup in `dir`, the serial number first, since without one
-/// that can tell chips apart the rest won't be written. Fuses aren't read,
-/// because nothing writes them back.
+/// Fuses aren't read, because nothing writes them back.
 fn read_backup(dir: &Path) -> Result<Backup, String> {
     let serial_path = dir.join("serial.hex");
     if !serial_path.try_exists().map_err(at(&serial_path))? {
@@ -614,10 +535,8 @@ fn read_backup(dir: &Path) -> Result<Backup, String> {
     })
 }
 
-/// Erase, write, verify, restart, on whatever `connect` connects to. The
-/// chip erase wipes EEPROM too unless the EESAVE fuse is set; pass `Some` to
-/// put contents back. Images that don't fit are refused before `connect`
-/// runs, and `connect` refuses any chip but an AVR32DD20.
+/// The chip erase wipes EEPROM too unless the EESAVE fuse is set, so pass
+/// `Some` to put contents back.
 fn program<W: Wire>(
     connect: impl FnOnce() -> Result<Programmer<W>, String>,
     flash: &[u8],
@@ -639,8 +558,7 @@ fn program<W: Wire>(
 
     let mut p = connect()?;
     let written = write_and_verify(&mut p, flash, eeprom);
-    // Leave programming mode even after a failure, so the chip isn't held in
-    // it until the next power cycle. The first error is the one to report.
+    // Leave programming mode even after a failure, and report the first error.
     let left = p.leave();
     written?;
     left?;
@@ -673,7 +591,6 @@ fn write(path: &Path, contents: &str) -> Result<(), String> {
     fs::write(path, contents).map_err(at(path))
 }
 
-/// Prefixes an error with the file it came from.
 fn at<E: Display>(path: &Path) -> impl Fn(E) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
@@ -705,8 +622,6 @@ mod tests {
     use kr1k::sensors::{SUPPLIES_AT, Supplies};
     use kr1k::testing::voltage_reading;
 
-    /// A fake chip whose firmware has kept `supplies` where the real one
-    /// does.
     fn kept(supplies: Supplies) -> Dd20 {
         let mut dd = Dd20::new();
         let at = SUPPLIES_AT - kr1k::regs::mem::INTERNAL_SRAM_START;
@@ -733,12 +648,9 @@ mod tests {
                 "  VDDIO2 - VDD  -0.50 V  raw -808",
             ]
         );
-        // It only read, so the firmware's left running, and UPDI's off.
         assert_eq!(dd.stores_in, 0);
         assert!(dd.updi_disabled);
-        // And the SRAM dump still follows, with the four bytes in it.
         assert!(lines.iter().any(|line| line == "SRAM"));
-        // 6132 is 0x17F4, low byte first.
         assert!(lines.iter().any(|line| line.starts_with("  7000 F4 x1")));
     }
 
@@ -762,8 +674,6 @@ mod tests {
         );
     }
 
-    /// A directory of the test's own under the system's temporary one, gone
-    /// again when the test's done with it.
     struct Scratch(PathBuf);
 
     impl Scratch {
@@ -774,7 +684,6 @@ mod tests {
             Self(dir)
         }
 
-        /// Where a test keeps one chip's backup. `backup` makes it.
         fn backup(&self) -> PathBuf {
             self.0.join("backup").join("torch")
         }
@@ -786,7 +695,6 @@ mod tests {
         }
     }
 
-    /// A fake chip with something in flash and EEPROM worth backing up.
     fn chip() -> Dd20 {
         let mut dd = Dd20::new();
         for (i, byte) in dd.flash.iter_mut().take(1000).enumerate() {
@@ -798,12 +706,10 @@ mod tests {
         dd
     }
 
-    /// Stands in for opening the port, with the fake chip on the far end.
     fn on<'a>(dd: &'a mut Dd20) -> impl FnOnce() -> Result<&'a mut Dd20, String> {
         move || Ok(dd)
     }
 
-    /// Stands in for opening the port where nothing should get that far.
     fn no_port() -> Result<Dd20, String> {
         panic!("the port was opened");
     }
@@ -826,11 +732,9 @@ mod tests {
         assert_eq!(read_hex(&dir.join("fuses.hex")).unwrap(), dd.fuses);
         assert_eq!(read_hex(&dir.join("lock.hex")).unwrap(), dd.lock);
         assert_eq!(read_hex(&dir.join("userrow.hex")).unwrap(), dd.userrow);
-        // A backup is reads, the key and two resets, and stores nothing.
         assert_eq!(dd.stores_in, 0, "backup stored something");
         assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
 
-        // Something else has been flashed since.
         dd.flash.fill(0x42);
         dd.eeprom.fill(0x24);
         restore_onto(on(&mut dd), &dir).unwrap();
@@ -1012,7 +916,6 @@ mod tests {
     const FLASH_SIZE: usize = super::updi::map::FLASH_SIZE;
     const EEPROM_SIZE: usize = super::updi::map::EEPROM_SIZE;
 
-    /// Stands in for connecting where nothing should get that far.
     fn no_connection() -> Result<Programmer<Dd20>, String> {
         Programmer::connect_for_programming(no_port()?)
     }
@@ -1021,7 +924,6 @@ mod tests {
     fn an_image_bigger_than_flash_is_refused_before_the_port_is_opened() {
         let err = program(no_connection, &vec![0x12; FLASH_SIZE + 1], None).unwrap_err();
         assert_eq!(err, "the image is 32769 bytes; the AVR32DD20 has 32768");
-        // And with an EEPROM image that would fit.
         let eeprom = vec![0x34; EEPROM_SIZE];
         let err = program(no_connection, &vec![0x12; 2 * FLASH_SIZE], Some(&eeprom)).unwrap_err();
         assert_eq!(err, "the image is 65536 bytes; the AVR32DD20 has 32768");
@@ -1065,8 +967,6 @@ mod tests {
         }
     }
 
-    /// Checks a chip was let go after a flash that failed part way, which is
-    /// out of programming mode and reset, with UPDI off.
     fn assert_let_go(dd: &Dd20) {
         assert!(dd.updi_disabled, "UPDI was left on");
         assert!(!dd.progmode, "the chip was left in programming mode");
@@ -1108,9 +1008,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("WRITEPROTECT"), "{err}");
-        // 200 bytes is one page, erased first, and the first of its 100 words
-        // failed. The fake takes the rest of the burst, and the wait after it
-        // stops the flash there, before any of EEPROM.
         assert_eq!(dd.page_erases, 1);
         assert_eq!(dd.word_writes, 99);
         assert_eq!(dd.eeprom_writes, 0);

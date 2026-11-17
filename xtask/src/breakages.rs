@@ -1,31 +1,5 @@
 //! `cargo xtask breakages` breaks the firmware on purpose, one mistake at a
 //! time, and checks `cargo xtask hex` refuses each for the reason expected.
-//!
-//! Firmware that's right trips none of the simulator's alarms, nor
-//! `layout.rs`'s, so a `hex` that passes says nothing about whether they can
-//! still ring. sim.rs's tests ring the ones a test can reach by driving the
-//! fake chip. The rest only go off with the real firmware running, and
-//! `BREAKAGES` is a mistake for each kind of those.
-//!
-//! The checkout is never edited. The source is copied to a directory under
-//! the system's temporary one, and `cargo xtask hex` runs there as a child
-//! process, so it's the copy's own xtask judging the copy's firmware, built
-//! into the copy's own `target`. First the copy as it is, which has to pass,
-//! or a refusal further on would mean nothing. Then each breakage in turn,
-//! in that one copy, so xtask and `core` are only built once. Each puts back
-//! the file the last one broke, makes its one substitution, and wants `hex`
-//! to fail at the stage it names with the text it names. The copy goes when
-//! the run ends, pass or fail, though not if the run's killed.
-//!
-//! They run one after another. `hex` already runs its simulations side by
-//! side, and a second copy would have to build xtask and `core` again, which
-//! takes longer than every breakage put together. Most are refused in under
-//! a second, before the simulator gets to its long runs.
-//!
-//! Like the simulator, this finds mistakes and proves nothing. A breakage
-//! that's refused shows one alarm rings for one mistake. It doesn't show the
-//! alarm rings for every mistake of that kind, and a mistake nobody thought
-//! to list here is as unchecked as it was.
 
 use std::env;
 use std::fs;
@@ -33,8 +7,6 @@ use std::path::{Path, PathBuf};
 use std::process::{self, Command};
 use std::time::Instant;
 
-/// What gets copied, from the workspace root. It's what `cargo xtask hex`
-/// needs to build xtask and the firmware, and nothing else.
 const COPIED: [&str; 10] = [
     ".cargo",
     "Cargo.lock",
@@ -48,32 +20,22 @@ const COPIED: [&str; 10] = [
     "xtask",
 ];
 
-/// Directories that are never copied, wherever they turn up.
 const SKIPPED: [&str; 2] = ["target", ".git"];
 
-/// How far `cargo xtask hex` got before it refused the firmware.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Stage {
-    /// The firmware didn't build. For the breakages here, that's the linker.
     Build,
-    /// `layout.rs` refused the linked image.
     Layout,
-    /// `sim.rs` refused it, running.
     Simulator,
 }
 
-/// One deliberate mistake.
 struct Breakage {
     name: &'static str,
-    /// The file to break, from the workspace root.
     file: &'static str,
-    /// Text that's in `file` exactly once.
     find: &'static str,
-    /// What goes in its place.
     replace: &'static str,
-    /// Where `hex` has to stop.
     stage: Stage,
-    /// Text `hex`'s output has to have in it.
+    /// A substring of what `hex` prints.
     expect: &'static str,
 }
 
@@ -85,13 +47,8 @@ const BATTERY: &str = "src/battery.rs";
 const SENSORS: &str = "src/sensors.rs";
 const TORCH: &str = "src/torch.rs";
 
-/// The mistakes, each one a different alarm. Every one of them has been run
-/// and seen refused for the reason it gives, and `cargo xtask breakages`
-/// sees to it that stays true.
 const BREAKAGES: &[Breakage] = &[
-    // PC1 only rises with DAC0 at 0. DAC0 above 0 with PC1 low is refused
-    // first, which is as close as a breakage gets, since the DAC can't be
-    // live before PC1 rises without that going off.
+    // DAC0 above 0 with PC1 low is refused first, as close as a breakage gets.
     Breakage {
         name: "dac-live-before-pc1",
         file: HW,
@@ -101,7 +58,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "sets DAC0 to 1 with PC1 low",
     },
-    // Turning off: DAC0 to 0 before PC1 drops.
     Breakage {
         name: "pc1-down-with-dac-live",
         file: HW,
@@ -110,8 +66,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "drops PC1 with DAC0 still at",
     },
-    // The level comes a tick after PC1 rises. This sets it in the same pass,
-    // by asking `set_output` twice with the level, never `Output::STARTING`.
     Breakage {
         name: "dac-before-the-boost-starts",
         file: MAIN,
@@ -123,7 +77,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the stock firmware gives the boost converter",
     },
-    // A reference or a path only goes up with DAC0 at 0.
     Breakage {
         name: "path-change-with-dac-live",
         file: HW,
@@ -132,8 +85,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with PC1 high and DAC0 at",
     },
-    // Coming down too, since how the paths combine is unknown. This drops
-    // the paths first at turn-off, with DAC0 still at the level's code.
+    // How the paths combine is unknown, so they wait for DAC0 coming down too.
     Breakage {
         name: "paths-off-before-dac",
         file: HW,
@@ -143,7 +95,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "off with PC1 high and DAC0 at",
     },
-    // ... and with DAC0's output given time to get there.
     Breakage {
         name: "dac-fall-not-waited",
         file: HW,
@@ -169,7 +120,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "gives PD4 a pull-up",
     },
-    // PD6's input buffer goes off before DAC0 drives it.
     Breakage {
         name: "pd6-input-left-on",
         file: HW,
@@ -178,7 +128,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "PD6's input buffer still on",
     },
-    // PA2 and PA3 are the AW2016's, and never driven.
     Breakage {
         name: "twi-line-driven",
         file: HW,
@@ -188,8 +137,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "PA2 and PA3 are the AW2016's TWI lines",
     },
-    // PA1 goes to something unknown, and the stock build on this torch holds
-    // it as an output at 0, so it never gets the stock source's pull-up back.
+    // PA1 goes to something unknown. This torch's stock build holds it at 0.
     Breakage {
         name: "pa1-pull-up",
         file: HW,
@@ -198,7 +146,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "gives PA1 a pull-up",
     },
-    // ... and is never driven high.
     Breakage {
         name: "pa1-driven-high",
         file: HW,
@@ -208,11 +155,8 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "setting PA1",
     },
-    // Errata 2.2.3: a store under 64 straight after one at 64 or over is
-    // lost, so the VPORTs and GPRs take `out`. This is every `out!` as the
-    // ATtiny1616 firmware would have written it, an `sts`. A plain `write`
-    // to a VPORT doesn't show it, since LLVM emits `out` for any constant
-    // address under 64 itself.
+    // Errata 2.2.3. A plain `write` to a VPORT doesn't show it, since LLVM
+    // emits `out` itself for any constant address under 64.
     Breakage {
         name: "sts-to-a-vport",
         file: HW,
@@ -221,9 +165,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "straight after a store to 64 or over",
     },
-    // ... and SLPCTRL.CTRLA gets a `nop` before it. This puts a store at 64
-    // or over there instead, as a store before `sleep_mode` would be if the
-    // `nop` went and the compiler put nothing between.
+    // A store at 64 or over stands in for what could precede it with no `nop`.
     Breakage {
         name: "sleep-mode-without-nop",
         file: HW,
@@ -232,8 +174,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "SLPCTRL.CTRLA straight after a store to 64 or over",
     },
-    // `prepare_sleep` idles rather than power down with PC1 high, whatever
-    // it's asked. The firmware never asks, so examples/guards.rs does.
+    // The firmware never asks for it, so examples/guards.rs does.
     Breakage {
         name: "power-down-with-the-light-on",
         file: HW,
@@ -250,7 +191,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with ADC0 still enabled",
     },
-    // TCB0, the deadline's timer, stops with the light.
     Breakage {
         name: "tcb0-left-running",
         file: HW,
@@ -259,8 +199,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with TCB0 running",
     },
-    // With the light on and no tick, the wait gives up and `main` halts.
-    // This count never runs out.
     Breakage {
         name: "no-tick-deadline",
         file: HW,
@@ -270,8 +208,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "past the deadline",
     },
-    // `hw::halt` clears SREG.I as well as turning every interrupt off, since
-    // the datasheet doesn't say either alone keeps the chip down.
+    // The datasheet doesn't say `cli` or turning every interrupt off is enough alone.
     Breakage {
         name: "halt-without-cli",
         file: HW,
@@ -280,10 +217,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "stops for good with SREG.I still set",
     },
-    // `hw::halt` is where the firmware ends up when it can't go on, and it
-    // has to leave the light off. This one still turns TCB0's interrupt off,
-    // so the `sleep` is one the chip would take, with PC1 high, and it's in
-    // idle, since `prepare_sleep` won't power down with the light on.
+    // TCB0's interrupt still goes off, so the chip would take the `sleep`.
     Breakage {
         name: "halt-leaves-the-light-on",
         file: HW,
@@ -293,7 +227,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "sleeps with TCB0 running and PC1 high",
     },
-    // PC1 is cleared in OUT before it's made an output.
     Breakage {
         name: "dir-before-out",
         file: HW,
@@ -302,8 +235,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "starting with PC1 high: the first register it writes leaves PC1 set",
     },
-    // The reset flags are read and cleared before anything can reset the
-    // chip again.
     Breakage {
         name: "watchdog-before-reset-flags",
         file: MAIN,
@@ -322,11 +253,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "start-up order: turns the watchdog on before clearing the reset flags",
     },
-    // Without VDDIO2, PC1 is tri-stated, so the light stays off as a fault.
-    // This reads MVIO.STATUS at power-on and ignores it. The first pass of
-    // the loop still finds it missing, so nothing lights, but it's a pass
-    // late, and the torch reads its cell as if nothing were wrong where one
-    // that failed the check rests. That's what's refused.
+    // The first pass still finds it missing, so only that pass's delay is refused.
     Breakage {
         name: "vddio2-ignored",
         file: MAIN,
@@ -335,8 +262,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with VDDIO2 missing: tick",
     },
-    // VDDIO2 is read again on every pass, since it can go with the light on.
-    // This reads it at power-on and never again, as the firmware used to.
     Breakage {
         name: "vddio2-not-watched",
         file: MAIN,
@@ -345,10 +270,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
-    // ... and the light's out in the pass that finds it gone, with no fade,
-    // since PC1 isn't holding the driver through one. This fades it out like
-    // any other fault. The library and the firmware agree on that, being the
-    // same code, so it's the chip's own rule that objects.
     Breakage {
         name: "vddio2-loss-fades-out",
         file: LIMITS,
@@ -373,8 +294,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "closed window",
     },
-    // The lit setting goes back before the light can come on. This never
-    // writes it after a rest, so the light comes on under the rest setting.
     Breakage {
         name: "lit-watchdog-never-restored",
         file: MAIN,
@@ -384,13 +303,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "raises PC1 with WDT.CTRLA at 0x0b",
     },
-    // `Torch::tick` keeps the light at level 0 outside the lit window. Taking
-    // that out alone changes nothing today, since only a click or a hold
-    // lights the torch. This takes it out and adds the mistake it's there
-    // for, a way to light that doesn't wait for a click, here level 1 for as
-    // long as the switch is down. A press at rest asks for it on the pass
-    // that wakes on it, under the rest setting, and a switch held from
-    // power-on on the first pass, before the lit setting's first `wdr`.
+    // The guard alone changes nothing, so this also lights while the switch is down.
     Breakage {
         name: "unguarded-light-at-rest",
         file: TORCH,
@@ -401,9 +314,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the light only comes on with the lit window in force and a wdr since it was written",
     },
-    // A write to WDT.CTRLA syncs before the sleep or the `wdr` that follows
-    // it. The pass that goes to rest powers down after its write, and that's
-    // refused first.
     Breakage {
         name: "watchdog-write-not-waited-for",
         file: MAIN,
@@ -412,8 +322,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with WDT.STATUS.SYNCBUSY still set",
     },
-    // A feed at rest is a trip back to the fast tick, never on the pass that
-    // changes the PIT's period, whose sleep can be power-down.
+    // The pass that changes the PIT's period can sleep in power-down.
     Breakage {
         name: "fed-as-the-pit-changes",
         file: MAIN,
@@ -422,8 +331,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the library feeds the watchdog 0 times on this tick, but the firmware 1",
     },
-    // The PIT goes back to 64 Hz whenever the torch isn't at rest. This
-    // never puts it back.
     Breakage {
         name: "pit-left-slow",
         file: MAIN,
@@ -432,8 +339,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the library has the PIT Fast, but the firmware Slow",
     },
-    // With the PIT slow, a switch edge runs a pass on the press. This sleeps
-    // through it until the next slow tick.
     Breakage {
         name: "switch-wake-dropped",
         file: HW,
@@ -442,9 +347,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the firmware ran 0 passes on this tick, but the library 1",
     },
-    // A pass forgets the switch edges it reads the switch after. This leaves
-    // them up, so an edge just after a slow tick ends the slow sleep after
-    // that tick's pass at once, for nothing the pass hadn't seen.
     Breakage {
         name: "stale-switch-edge",
         file: HW,
@@ -453,7 +355,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "resting, with an edge on every slow tick: tick",
     },
-    // 16-bit registers go low byte first.
     Breakage {
         name: "high-byte-first",
         file: HW,
@@ -462,7 +363,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "writes the high byte of DAC0.DATA without its low byte",
     },
-    // A protected register's write comes straight after its unlock.
     Breakage {
         name: "unlock-apart-from-its-write",
         file: HW,
@@ -471,9 +371,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Layout,
         expect: "isn't followed by `st Z`",
     },
-    // A handler never touches a 16-bit register of a peripheral the main
-    // loop might be halfway through. This one zeroes DAC0 from the switch's
-    // handler, which a bounce lands between `set_output`'s two bytes.
     Breakage {
         name: "handler-races-temp",
         file: HW,
@@ -482,7 +379,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "share its TEMP byte",
     },
-    // A handler gives back every register as it found it.
     Breakage {
         name: "handler-clobbers-a-register",
         file: HW,
@@ -493,9 +389,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the handler for RTC_PIT (vector 6): returns with r2",
     },
-    // Nothing in the firmware can panic. This is the check CONTRIBUTING.md
-    // wants shown to fire on every new nightly, since it goes by the names
-    // of symbols.
+    // The check goes by symbol names, so see this one fire on every new nightly.
     Breakage {
         name: "bounds-check",
         file: MAIN,
@@ -506,7 +400,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Layout,
         expect: "panic_bounds_check",
     },
-    // No 32-bit multiply, which dividing a `u16` by ten turns into.
+    // Dividing a `u16` by ten turns into a 32-bit multiply.
     Breakage {
         name: "wide-multiply",
         file: HW,
@@ -515,8 +409,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Build,
         expect: "undefined symbol: __mulsi3",
     },
-    // Every wait on TWI0 counts down the update's budget. This one waits for
-    // WIF for ever, which a held-down SCL never raises.
     Breakage {
         name: "twi-unbounded-wait",
         file: HW,
@@ -526,8 +418,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with SCL held low: tick",
     },
-    // The aux go dark before the light comes on. This keeps off's blue
-    // wanted while the light's on, so PC1 rises with it lit.
     Breakage {
         name: "aux-lit-while-lit",
         file: MAIN,
@@ -536,7 +426,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "raises PC1 with the aux lit",
     },
-    // Off is standby. This leaves CHIPEN set, the AW2016 awake at 100 µA.
     Breakage {
         name: "aux-off-not-standby",
         file: AW2016,
@@ -545,8 +434,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "isn't in standby",
     },
-    // A failed update is given up until the colour changes. Without this,
-    // the next tick carries on as if it had gone through.
     Breakage {
         name: "aux-retried-on-the-next-tick",
         file: MAIN,
@@ -555,9 +442,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "tries the AW2016 again",
     },
-    // A cell under the hard floor puts the light out within 12 ticks. This
-    // wants four readings in a row, which the worst tick of the round can't
-    // get inside that.
+    // Four readings in a row can't put the light out within 12 ticks.
     Breakage {
         name: "collapse-waits",
         file: BATTERY,
@@ -566,8 +451,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with a collapsing cell: the cell falls on tick",
     },
-    // ... and reads the cell between the four-a-second samples to do it.
-    // This drops the quick readings, so it's down to those four.
     Breakage {
         name: "no-quick-readings",
         file: SENSORS,
@@ -576,9 +459,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "A cell that collapses: expected Off",
     },
-    // An ADC that reads ground as anything but near zero is a fault. This
-    // lets any ground reading through, so an ADC stuck on a good cell's
-    // reading hides a flat cell for good.
     Breakage {
         name: "ground-ignored",
         file: SENSORS,
@@ -587,9 +467,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with the ADC stuck on one reading",
     },
-    // ... and ground is the GND input. This reads the cell for it, which
-    // the simulator's ADC answers as the cell, so every ground reading is
-    // well off zero and a good torch faults.
     Breakage {
         name: "ground-reads-the-cell",
         file: HW,
@@ -598,8 +475,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "but the library says",
     },
-    // The cell's and VDDIO2's readings are kept where `peek` reads them.
-    // This writes zeros there, so `peek` would say nothing's been read.
     Breakage {
         name: "supplies-not-kept",
         file: MAIN,
@@ -608,8 +483,6 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "keeping the supply readings",
     },
-    // ... and within an update, a NACK ends it. This tries each transfer
-    // until it goes through.
     Breakage {
         name: "aux-retried-after-a-nack",
         file: HW,
@@ -620,7 +493,6 @@ const BREAKAGES: &[Breakage] = &[
     },
 ];
 
-/// Runs the breakages named, or all of them with none named.
 pub fn run(root: &Path, names: &[&str]) -> Result<(), String> {
     let chosen = choose(names)?;
     let copy = Scratch::of(root)?;
@@ -668,7 +540,6 @@ pub fn run(root: &Path, names: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// The breakages called `names`, in the table's order, or all of them.
 fn choose(names: &[&str]) -> Result<Vec<&'static Breakage>, String> {
     if let Some(unknown) = names
         .iter()
@@ -686,9 +557,6 @@ fn choose(names: &[&str]) -> Result<Vec<&'static Breakage>, String> {
         .collect())
 }
 
-/// `source` with `find` swapped for `replace`. `find` has to be there exactly
-/// once, so a refactor that moves or rewords the line fails here, loudly, and
-/// can't turn a breakage into one that changes nothing.
 fn substitute(source: &str, find: &str, replace: &str) -> Result<String, String> {
     if find.is_empty() || find == replace {
         return Err("the substitution changes nothing".into());
@@ -701,11 +569,6 @@ fn substitute(source: &str, find: &str, replace: &str) -> Result<String, String>
     }
 }
 
-/// Where `hex` stopped, and the line it stopped with, from what it printed.
-/// xtask's last word is the last line starting `error: `. If that names an
-/// ELF, the build worked and the image was refused, by the simulator if it
-/// says so and by `layout.rs` if not. If it doesn't, it's cargo having
-/// failed, and what the compiler or the linker said is further up.
 fn verdict(output: &str) -> Option<(Stage, &str)> {
     let line = output
         .lines()
@@ -721,9 +584,6 @@ fn verdict(output: &str) -> Option<(Stage, &str)> {
     Some((stage, line))
 }
 
-/// Whether `output` is `hex` refusing the firmware at `stage` with `expect`
-/// in what it said. Gives back the line that has `expect` in it, less the
-/// path of the ELF.
 fn refused<'a>(output: &'a str, stage: Stage, expect: &str) -> Result<&'a str, String> {
     let Some((stopped, _)) = verdict(output) else {
         return Err(format!("it failed without saying why:\n{output}"));
@@ -742,14 +602,11 @@ fn refused<'a>(output: &'a str, stage: Stage, expect: &str) -> Result<&'a str, S
     Ok(said.trim())
 }
 
-/// The copy of the source, which goes when this does.
 struct Scratch {
     dir: PathBuf,
 }
 
 impl Scratch {
-    /// Copies `COPIED` from `root` to a fresh directory under the system's
-    /// temporary one, named for this process.
     fn of(root: &Path) -> Result<Self, String> {
         let dir = env::temp_dir().join(format!("kr1k-breakages-{}", process::id()));
         if dir.exists() {
@@ -763,8 +620,6 @@ impl Scratch {
         Ok(copy)
     }
 
-    /// Runs `cargo xtask hex` in the copy. Gives back whether it passed, and
-    /// everything it printed.
     fn hex(&self) -> Result<(bool, String), String> {
         let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let output = Command::new(&cargo)
@@ -779,13 +634,9 @@ impl Scratch {
         Ok((output.status.success(), text))
     }
 
-    /// Breaks the copy as `breakage` says, having put back whatever the last
-    /// one broke, and checks `hex` refuses it for the reason it gives.
     fn refuses(&self, root: &Path, breakage: &Breakage) -> Result<String, String> {
-        // Written afresh rather than copied, and only if it differs, so it's
-        // newer than the last build. A copy can keep the file's old
-        // modification time (it does on macOS), which leaves cargo sure the
-        // last breakage's build of a library file is still fresh.
+        // Written afresh, not copied, and only if it differs. A copy can keep
+        // the old modification time (on macOS it does), so cargo won't rebuild.
         for other in BREAKAGES {
             let file = Path::new(other.file);
             let original = fs::read(root.join(file)).map_err(at(file))?;
@@ -810,12 +661,10 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        // Nothing to be done if it won't go, and the run's verdict stands.
         _ = fs::remove_dir_all(&self.dir);
     }
 }
 
-/// Copies a file, or a directory and all that's in it but `SKIPPED`.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     if !from.is_dir() {
         if let Some(parent) = to.parent() {
@@ -834,7 +683,6 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Prefixes an error with the file it came from.
 fn at<E: std::fmt::Display>(path: &Path) -> impl Fn(E) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
@@ -843,7 +691,6 @@ fn at<E: std::fmt::Display>(path: &Path) -> impl Fn(E) -> String + '_ {
 mod tests {
     use super::*;
 
-    /// The checkout these tests were built from.
     fn root() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -867,8 +714,6 @@ mod tests {
         assert!(substitute("a b c", "", "x").is_err());
     }
 
-    /// The slow part isn't run here, so this is what catches a table gone
-    /// stale: a file that's moved, or a line a refactor reworded.
     #[test]
     fn every_breakage_finds_its_text_exactly_once_in_the_source_as_it_is() {
         for breakage in BREAKAGES {
@@ -953,10 +798,8 @@ error: cargo failed (exit status: 101)
         let line = refused(LINKER, Stage::Build, "undefined symbol: __mulsi3").unwrap();
         assert_eq!(line, "= note: rust-lld: error: undefined symbol: __mulsi3");
 
-        // Refused, but for something else.
         let err = refused(SIMULATOR, Stage::Simulator, "without wdr").unwrap_err();
         assert!(err.contains("not with `without wdr`"), "{err}");
-        // A breakage that doesn't compile hasn't been refused by anything.
         let err = refused(COMPILER, Stage::Build, "undefined symbol: __mulsi3").unwrap_err();
         assert!(err.contains("not with"), "{err}");
         let err = refused(COMPILER, Stage::Simulator, "x").unwrap_err();
