@@ -592,8 +592,10 @@ pub fn adc_result() -> Option<u16> {
 #[unsafe(no_mangle)]
 static mut SUPPLIES: [u8; 4] = [0; 4];
 
-/// Keeps `bytes` in [`SUPPLIES`]. Ordinary SRAM, so errata 2.2.3 doesn't
-/// come into it.
+/// Keeps `bytes` in [`SUPPLIES`]. `main` calls it every pass. It's four
+/// stores to ordinary SRAM, which have no side effect, so writing the same
+/// bytes again costs less code than checking for a change first, and errata
+/// 2.2.3 doesn't come into it.
 pub fn record_supplies(bytes: [u8; 4]) {
     let to = (&raw mut SUPPLIES).cast::<u8>();
     for (i, byte) in bytes.into_iter().enumerate() {

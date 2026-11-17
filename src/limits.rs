@@ -211,6 +211,13 @@ impl Limits {
     /// one costs a torch that's dark until the cell comes out, which is what
     /// one watchdog reset costs too. Nobody has seen the bit read 0 on this
     /// torch, with or without cause.
+    ///
+    /// Never inlined. It's called from one place, `torch::Torch::tick`, and
+    /// left to itself LLVM inlines it and what it calls into the firmware's
+    /// loop on the AVR build, which costs flash and a bigger stack frame for
+    /// `main` (`cargo xtask hex` has the figures). It changes nothing about
+    /// what it does.
+    #[inline(never)]
     pub fn tick(&mut self, ui: u8, result: Option<u16>, vddio2: bool) -> Step {
         let on = ui != 0;
         if on && !self.on {

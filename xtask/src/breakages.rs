@@ -593,8 +593,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "supplies-not-kept",
         file: MAIN,
-        find: "            hw::record_supplies(supplies.to_bytes());\n",
-        replace: "            let _ = supplies;\n            hw::record_supplies([0; 4]);\n",
+        find: "        hw::record_supplies(torch.supplies().to_bytes());\n",
+        replace: "        hw::record_supplies([0; 4]);\n",
         stage: Stage::Simulator,
         expect: "keeping the supply readings",
     },
