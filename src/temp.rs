@@ -1,56 +1,21 @@
-//! The MCU's internal temperature sensor, turned into sixteenths of a kelvin.
-//!
-//! The datasheet (DS40002413B section 33.3.3.8) gives kelvin from one 12-bit
-//! conversion against the 2.048 V reference as
-//!
-//! ```text
-//! kelvin  ==  ((offset - reading) * slope + 2048) >> 12
-//! ```
-//!
-//! with the offset from `SIGROW.TEMPSENSE1` and the slope from
-//! `SIGROW.TEMPSENSE0`, both 16-bit words. The reading falls as the die warms.
-//! That's whole kelvin, and at about a quarter of a kelvin a count, most of
-//! what rounds away is real. `thermal` predicts from how the temperature's
-//! moving, so a reading that sits still and then jumps a kelvin misleads it.
-//!
-//! So the ADC accumulates four conversions, and this works in their sum `s`.
-//! Four conversions are four times the reading, and sixteenths are sixteen
-//! times the kelvin, so the sum works out like this.
-//!
-//! ```text
-//! sixteenths  ==  ((4 * offset - s) * slope + 512) >> 10
-//! ```
-//!
-//! The product runs to 32 bits, and there's no runtime 32-bit multiply on
-//! this chip (docs/toolchain.md). [`multiply`] builds it from four 8-by-8
-//! products, which the chip's `mul` does, and adds them up with shifts, which
-//! need no library call. Every step is exact, so this is the formula above to
-//! the bit.
+//! The MCU's temperature sensor in sixteenths of a kelvin, from four accumulated
+//! 12-bit conversions against 2.048 V (the formula in DS40002413B §33.3.3.8).
 
-/// The factory calibration for this chip's temperature sensor, from the
-/// signature row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Calibration {
-    /// `SIGROW.TEMPSENSE1`, the reading at absolute zero, in counts of one
-    /// conversion.
+    /// `SIGROW.TEMPSENSE1`, in counts of one conversion.
     pub offset: u16,
     /// `SIGROW.TEMPSENSE0`, 4096ths of a kelvin a count.
     pub slope: u16,
 }
 
 impl Calibration {
-    /// Sixteenths of a kelvin from four accumulated conversions, as
-    /// [`sixteenths`] works it out.
     pub fn sixteenths(self, sum: u16) -> u16 {
         sixteenths(sum, self.offset, self.slope)
     }
 }
 
-/// `a × b`, exactly, from four 8-by-8 products.
-///
-/// Each partial product is at most 255 × 255, which fits a `u16`, so it's a
-/// single `mul` on the chip. The sum is at most 65,535 squared, under
-/// `u32::MAX`.
+/// Built from 8-by-8 products because the chip has no runtime 32-bit multiply.
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "each byte product is at most 65,025, and the sum of the shifted products is \
@@ -63,13 +28,6 @@ pub fn multiply(a: u16, b: u16) -> u32 {
     byte(al, bl) + (byte(al, bh) << 8) + (byte(ah, bl) << 8) + (byte(ah, bh) << 16)
 }
 
-/// Sixteenths of a kelvin from four accumulated temperature sensor
-/// conversions, using the factory calibration from the signature row.
-///
-/// A sum at or over four times the offset (which would mean a broken sensor,
-/// a bad read or a die below absolute zero) comes out as 0 rather than
-/// wrapping, and anything over `u16::MAX` sixteenths comes out as that. Neither
-/// is plausible to `thermal`.
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "the product is at most 65,535 squared, so adding 512 stays under 2^32"
@@ -86,13 +44,12 @@ pub fn sixteenths(sum: u16, offset: u16, slope: u16) -> u16 {
 mod tests {
     use super::*;
 
-    /// The sum above, done the slow way with room to spare.
     fn reference(sum: u16, offset: u16, slope: u16) -> u16 {
         let d = (4 * i64::from(offset) - i64::from(sum)).clamp(0, i64::from(u16::MAX));
         ((d * i64::from(slope) + 512) >> 10).min(i64::from(u16::MAX)) as u16
     }
 
-    /// The backup of this torch's signature row (backup/stock/prodsig.hex).
+    /// Read off this torch's signature row.
     const BACKUP: Calibration = Calibration {
         offset: 0x0D24,
         slope: 0x03EE,
@@ -126,8 +83,6 @@ mod tests {
 
     #[test]
     fn four_conversions_land_within_half_a_kelvin_of_the_datasheet() {
-        // Its formula for one conversion rounds to the nearest kelvin, so
-        // four of the same conversion can only differ from it by that.
         for reading in 0..4096_i64 {
             let offset = i64::from(BACKUP.offset);
             let slope = i64::from(BACKUP.slope);
@@ -139,9 +94,8 @@ mod tests {
 
     #[test]
     fn the_backups_calibration_reads_room_temperature_about_where_it_should() {
-        // 25 °C is 298 K, and 4 × (3364 - 298 × 4096 / 1006) is about 8603.
+        // 298 K is 25 °C, where four conversions sum to about 8603.
         assert_eq!(BACKUP.sixteenths(8603) / 16, 298);
-        // A count of the sum is about a sixteenth.
         let step = BACKUP.sixteenths(8603) - BACKUP.sixteenths(8604);
         assert!(step <= 1, "{step}");
     }
@@ -159,7 +113,6 @@ mod tests {
 
     #[test]
     fn a_sum_nothing_could_produce_stays_far_from_plausible() {
-        // An ADC stuck at zero.
         assert!(BACKUP.sixteenths(0) > 423 * 16);
         assert_eq!(sixteenths(0, u16::MAX, u16::MAX), u16::MAX);
     }

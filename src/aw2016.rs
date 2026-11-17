@@ -1,83 +1,31 @@
 //! The AW2016, the I2C LED driver the KR1K's RGB aux hang off, and what to
-//! write to it for each [`Aux`].
-//!
-//! The facts are the AW2016 datasheet's (Awinic, V1.3, October 2023), which
-//! V1.1 agrees with. Its 7-bit address is 0x64, fixed, and a write
-//! auto-increments the register address after each byte, so one transfer
-//! can fill a run of registers. It comes up in standby, with every register
-//! at its reset value and every output off. In standby only RSTR and GCR1
-//! take a write, and its oscillator is off. GCR1.CHIPEN wakes it, and
-//! clearing CHIPEN puts it back in standby, which the datasheet gives as
-//! 2 µA typical and 10 µA at most, against 100 µA typical (150 µA at most)
-//! awake with every output off. Shutdown is lower, 2 µA at most, but it only
-//! comes from holding SCL low for over 130 ms, which the board's pull-ups
-//! would fight, so off here is standby.
-//!
-//! The datasheet gives no wait after CHIPEN rises. A driver for it in
-//! PebbleOS says writes in the first millisecond after are acknowledged and
-//! dropped, measured rather than from the datasheet, and the Linux driver
-//! waits 2 ms. So waking it is a step of its own, and its settings go in a
-//! tick later, 15.6 ms on. [`Aw2016`] is that order. It sends nothing else
-//! the tick it wakes the chip, the way `torch::Torch` raises PC1 a tick before
-//! the DAC.
-//!
-//! An output's current is `Imax × CUR / 15` (the datasheet's LED current
-//! setting), gated by its 8-bit PWM at 250 Hz. The PWM's curve from code to
-//! duty is "exponential", and the datasheet gives no formula, so a code's duty
-//! is unknown. It's at most the code over 255 if the curve is what the word
-//! suggests, and every estimate here takes that ceiling.
-//!
-//! Which AW2016 output each colour is on comes from the stock firmware (red
-//! on output 2, green on 1 and blue on 3, LED1 being output 1), in
-//! [`crate::board`]. Blue and red showed right on this torch on 2026-11-16,
-//! and green is likely right too, unseen.
+//! write to it for each [`Aux`]. The facts are its datasheet's (Awinic, V1.3).
 
 use crate::board::{AUX_BLUE, AUX_GREEN, AUX_RED};
 use crate::ui::Aux;
 
-/// The AW2016's 7-bit I2C address. It has no address pins.
+/// The 7-bit I2C address.
 pub const ADDRESS: u8 = 0x64;
 
-/// RSTR. Reads the chip ID, 0x09, and writing [`RESET`] resets every
-/// register.
 pub const RSTR: u8 = 0x00;
-/// GCR1, with CHIPEN and CHGDIS. It and RSTR are the only registers that
-/// take a write in standby.
 pub const GCR1: u8 = 0x01;
-/// GCR2, with the maximum current IMAX in bits 1:0. The rest of it is the
-/// under-voltage and over-temperature protection, which stays as it resets,
-/// on.
 pub const GCR2: u8 = 0x04;
-/// LCTR, with an enable bit per output. Bit 3 (EXP) and bit 5 (FREQ, 250 Hz
-/// or 125 Hz) stay as they reset.
 pub const LCTR: u8 = 0x30;
-/// LCFG1, the first of three configuration registers, one per output, with
-/// the current setting CUR in bits 3:0 and manual mode (MD clear). PWM1 to
-/// PWM3 follow straight after it at 0x34 to 0x36.
 pub const LCFG1: u8 = 0x31;
-/// PWM1, the first output's PWM code.
 pub const PWM1: u8 = 0x34;
 
-/// What RSTR takes to reset the chip.
 pub const RESET: u8 = 0x55;
-/// GCR1.CHIPEN, awake when set and in standby when clear.
 pub const CHIPEN: u8 = 1 << 0;
-/// GCR1.CHGDIS, set to stop the chip's own charging indication.
-///
-/// With it clear, the CHRG pin going high wakes the chip and breathes LED1 by itself.
-/// What CHRG is wired to on this board is unknown, and the datasheet says to
-/// set this once the host drives the chip.
+/// Set so the CHRG pin can't wake the chip and breathe LED1 by itself. What
+/// CHRG is wired to on this board is unknown.
 pub const CHGDIS: u8 = 1 << 1;
-/// GCR2.IMAX at 5 mA, the lowest of the four. The codes don't go in order
-/// (0 is 15 mA, 1 is 30 mA, 2 is 5 mA and 3 is 10 mA).
+/// The IMAX codes don't go in order (0 is 15 mA, 1 is 30 mA, 2 is 5 mA and 3 is 10 mA).
 pub const IMAX_5MA: u8 = 0b10;
-/// The highest current setting, 15 of 15.
 pub const CUR_MAX: u8 = 15;
-/// The highest PWM code, on all the time.
 pub const PWM_MAX: u8 = 255;
 
-/// How much of each colour's channel a setting asks for, as the AW2016's
-/// current setting and PWM code.
+/// An output's current is IMAX × `cur` / 15 while its PWM is on. The datasheet
+/// gives no formula for the duty a `pwm` code gives, so that is unknown.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Level {
     pub cur: u8,
@@ -88,53 +36,42 @@ impl Level {
     const OFF: Self = Self { cur: 0, pwm: 0 };
 }
 
-/// Every dim colour's PWM code.
-///
-/// The lowest global current with PWM is what
-/// keeps dim at a fraction of a milliamp, since the lowest setting with no
-/// PWM, 5 mA at a current setting of 1 in 15, is already a third of a
-/// milliamp a channel. A code of 64 is a quarter of the time at most. How dim
-/// that looks, and whether a lower code would still show, nobody has seen.
+/// How dim this looks, and whether a lower code would still show, nobody has seen.
 pub const DIM_PWM: u8 = 64;
-/// Dim blue or green, a current setting of 1, which is 0.33 mA while the PWM
-/// is on.
 pub const DIM: Level = Level {
     cur: 1,
     pwm: DIM_PWM,
 };
-/// Dim red, at twice the current setting of the others, since a red LED
-/// usually gives less light for its current. Unmeasured on these LEDs.
+/// Twice the current setting of the others, since a red LED usually gives
+/// less light for its current. Unmeasured on these LEDs.
 pub const DIM_RED: Level = Level {
     cur: 2,
     pwm: DIM_PWM,
 };
-/// Bright red, 5 mA with no PWM, the most the 5 mA setting gives.
 pub const BRIGHT_RED: Level = Level {
     cur: CUR_MAX,
     pwm: PWM_MAX,
 };
 
-/// One I2C write transfer, the register it starts at and the bytes that go
-/// in, one register each, auto-incrementing.
+/// One I2C write transfer. The register address goes up one after each byte.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Write {
     pub register: u8,
     pub data: &'static [u8],
 }
 
-/// The transfers for one step, in order.
 pub type Update = &'static [Write];
 
-/// Wakes the chip, CHIPEN with the charging indication off. Its outputs stay
-/// as LCTR has them, which every way into standby here leaves off.
+/// A step of its own, with the settings a tick later. The datasheet gives no
+/// wait after CHIPEN rises, PebbleOS's driver found writes in the first
+/// millisecond are dropped, and Linux's waits 2 ms.
 pub const WAKE: Update = &[Write {
     register: GCR1,
     data: &[CHGDIS | CHIPEN],
 }];
 
-/// Every output off, then standby. LCTR goes first, since it only takes a
-/// write while the chip's awake and keeps its value through standby, so a
-/// later wake can't bring back the old colour.
+/// LCTR goes first, since it only takes a write while awake and keeps its value
+/// through standby. Off is standby, as shutdown needs SCL held low for over 130 ms.
 pub const STANDBY: Update = &[
     Write {
         register: LCTR,
@@ -146,20 +83,14 @@ pub const STANDBY: Update = &[
     },
 ];
 
-/// Resets every register, which leaves the chip in standby with every output
-/// off (the datasheet's software reset).
-///
-/// For when nobody knows what state
-/// it's in, at power-on or after a transfer that failed, since in standby
-/// LCTR won't take the write [`STANDBY`] starts with. CHGDIS goes back to
-/// clear, and the next [`WAKE`] sets it.
+/// The datasheet's software reset, which leaves standby with every output
+/// off. [`STANDBY`] won't do from an unknown state, since a chip already in
+/// standby drops its LCTR write.
 pub const FROM_UNKNOWN: Update = &[Write {
     register: RSTR,
     data: &[RESET],
 }];
 
-/// An array of three with `value` at `channel`, or `array` as it was if
-/// `channel` isn't one.
 const fn put(array: [u8; 3], channel: u8, value: u8) -> [u8; 3] {
     let [a, b, c] = array;
     match channel {
@@ -170,8 +101,6 @@ const fn put(array: [u8; 3], channel: u8, value: u8) -> [u8; 3] {
     }
 }
 
-/// LCFG1 to LCFG3 then PWM1 to PWM3 for a red, green and blue level, each
-/// in its own output.
 const fn settings(red: Level, green: Level, blue: Level) -> [u8; 6] {
     let cur = put(
         put(put([0; 3], AUX_RED, red.cur), AUX_GREEN, green.cur),
@@ -188,7 +117,6 @@ const fn settings(red: Level, green: Level, blue: Level) -> [u8; 6] {
     [c1, c2, c3, p1, p2, p3]
 }
 
-/// LCTR's enable bit for `channel` if `level` lights it.
 const fn enable(level: Level, channel: u8) -> u8 {
     if level.cur > 0 && level.pwm > 0 && channel < 3 {
         1 << channel
@@ -197,12 +125,11 @@ const fn enable(level: Level, channel: u8) -> u8 {
     }
 }
 
-/// LCTR's enable bits for the outputs a level lights.
 const fn enables(red: Level, green: Level, blue: Level) -> u8 {
     enable(red, AUX_RED) | enable(green, AUX_GREEN) | enable(blue, AUX_BLUE)
 }
 
-/// Whether two colours are the same, in a `const fn`, where `==` can't be.
+/// `==` for a `const fn`. A new colour needs an arm here.
 const fn same(a: Aux, b: Aux) -> bool {
     matches!(
         (a, b),
@@ -214,9 +141,7 @@ const fn same(a: Aux, b: Aux) -> bool {
     )
 }
 
-/// The transfers that show a colour on a chip that's awake. The 5 mA setting
-/// first, then every output's current and PWM in one transfer, and the
-/// enables last, so nothing lights at a setting it isn't meant to have.
+/// The enables go last, so nothing lights at a setting it isn't meant to have.
 macro_rules! show {
     ($red:expr, $green:expr, $blue:expr) => {{
         const SETTINGS: [u8; 6] = settings($red, $green, $blue);
@@ -239,8 +164,7 @@ macro_rules! show {
     }};
 }
 
-/// The transfers that show `colour` on a chip that's awake. [`Aux::Off`]
-/// is [`STANDBY`], which works awake too.
+/// Only for a chip that's awake.
 pub const fn show(colour: Aux) -> Update {
     match colour {
         Aux::Off => STANDBY,
@@ -251,38 +175,19 @@ pub const fn show(colour: Aux) -> Update {
     }
 }
 
-/// What the firmware last left the chip doing, as far as it knows.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum State {
-    /// Nobody knows, which is how it starts.
     Unknown,
-    /// In standby with every output off.
     Standby,
-    /// Awake, with every output off, waiting a tick for its oscillator.
     Awake,
-    /// Showing this colour.
     Showing(Aux),
-    /// A transfer for this colour failed, so it's given up on until the
-    /// colour changes, and nobody knows what the chip's doing.
+    /// Given up on until the colour changes.
     Failed(Aux),
 }
 
-/// Steps the AW2016 towards the colour the torch wants, at most one step a
-/// tick.
-///
-/// From a state nobody knows, it resets the chip first. To show a colour from
-/// standby it wakes it, and the colour goes in on a later tick. For
-/// [`Aux::Off`] it puts it in standby. Once it's showing what's wanted it
-/// sends nothing.
-///
-/// A step that fails gives that colour up. Nothing more goes to the chip
-/// until the torch wants something else, and then it starts from a reset,
-/// since nobody knows how far the failed step got. So a chip that never
-/// answers costs one try for each change of colour, never one a tick.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Aw2016 {
     state: State,
-    /// What the last step was for.
     want: Aux,
 }
 
@@ -300,9 +205,8 @@ impl Aw2016 {
         }
     }
 
-    /// The transfers to send this tick to get towards `want`, if there are
-    /// any. Send them before the driver's output changes, so the aux go dark
-    /// before the light comes on, and only light a tick after it's gone out.
+    /// At most one step a tick. Send the transfers before the driver's output
+    /// changes, so the aux go dark before the light comes on.
     pub const fn step(&mut self, want: Aux) -> Option<Update> {
         self.want = want;
         let (update, next) = match (self.state, want) {
@@ -318,12 +222,8 @@ impl Aw2016 {
         Some(update)
     }
 
-    /// Whether [`Aw2016::step`] would send nothing for `want`, so the aux
-    /// need no more ticks. That's showing it already, standby for
-    /// [`Aux::Off`], or having given up on it after a failed step, which
-    /// [`Aw2016::shown`] alone wouldn't count. Written out rather than by
-    /// calling `step`, which is bigger, and a test holds the two to each
-    /// other in every state.
+    /// Whether [`Aw2016::step`] would send nothing for `want`. Written out
+    /// rather than by calling `step`, which is bigger.
     pub const fn settled(&self, want: Aux) -> bool {
         match self.state {
             State::Standby => matches!(want, Aux::Off),
@@ -332,14 +232,12 @@ impl Aw2016 {
         }
     }
 
-    /// The last step's transfers didn't all go through, so its colour is
-    /// given up on.
+    /// Gives the last step's colour up. Nothing is retried, and nothing more
+    /// goes to the chip until the torch wants another colour.
     pub const fn failed(&mut self) {
         self.state = State::Failed(self.want);
     }
 
-    /// The colour the chip's showing, if it's settled on one, with
-    /// [`Aux::Off`] for standby.
     pub const fn shown(&self) -> Option<Aux> {
         match self.state {
             State::Standby => Some(Aux::Off),
@@ -356,8 +254,6 @@ mod tests {
 
     const COLOURS: [Aux; 5] = [Aux::Off, Aux::Blue, Aux::Red, Aux::Yellow, Aux::White];
 
-    /// A fake AW2016's registers, from 0x00 to 0x3F, written as the
-    /// datasheet says, refusing what it says a chip in standby drops.
     struct Chip {
         regs: [u8; 0x40],
     }
@@ -389,8 +285,6 @@ mod tests {
             }
         }
 
-        /// The red, green and blue levels the outputs are at, and the IMAX
-        /// code, with an output that's off or disabled at [`Level::OFF`].
         fn lit(&self) -> ([Level; 3], u8) {
             let level = |channel: u8| {
                 let n = usize::from(channel);
@@ -412,8 +306,6 @@ mod tests {
         }
     }
 
-    /// Steps `aw` to `want` on `chip` for as many ticks as it takes, and
-    /// how many that was.
     fn settle(aw: &mut Aw2016, chip: &mut Chip, want: Aux) -> usize {
         let mut ticks = 0;
         while let Some(update) = aw.step(want) {
@@ -425,8 +317,6 @@ mod tests {
         ticks
     }
 
-    /// `settled` is exactly whether `step` would send nothing, in every state
-    /// the driver can be in and for every colour.
     #[test]
     fn settled_is_step_sending_nothing_in_every_state() {
         let colours = COLOURS
@@ -493,7 +383,6 @@ mod tests {
     #[test]
     fn the_channel_map_is_the_stock_firmwares() {
         assert_eq!((AUX_RED, AUX_GREEN, AUX_BLUE), (1, 0, 2));
-        // Blue is LED3, so its output and settings are the third of each.
         let blue = show(Aux::Blue);
         assert_eq!(blue[1].data, &[0, 0, 1, 0, 0, DIM_PWM]);
         assert_eq!(blue[2].data, &[1 << 2]);
@@ -540,7 +429,6 @@ mod tests {
         assert_eq!(aw.step(Aux::Blue), Some(WAKE));
         chip.send(WAKE);
         assert_eq!(chip.lit().0, [Level::OFF; 3], "dark the tick it wakes");
-        // The torch changes its mind while the chip's waking.
         assert_eq!(aw.step(Aux::Red), Some(show(Aux::Red)));
         let mut aw2 = Aw2016::new();
         settle(&mut aw2, &mut Chip::new(), Aux::Off);
@@ -576,7 +464,6 @@ mod tests {
         assert_eq!(aw.shown(), None);
         assert_eq!(aw.step(Aux::Off), Some(FROM_UNKNOWN));
         assert_eq!(aw.step(Aux::Off), None);
-        // One failing mid-wake gives up too.
         aw.step(Aux::Red);
         aw.failed();
         assert_eq!(aw.step(Aux::Red), None);
@@ -610,11 +497,6 @@ mod tests {
         }
     }
 
-    /// Every docs/ui.md example, ticked through a torch and this, with the
-    /// transfers sent to a fake chip each tick before the output changes, as
-    /// the firmware does. The aux are dark whenever the driver's on, and
-    /// whatever shows matches what the torch wants within two ticks of it
-    /// changing.
     #[test]
     fn through_every_example_the_aux_are_dark_while_lit_and_catch_up() {
         for example in EXAMPLES {

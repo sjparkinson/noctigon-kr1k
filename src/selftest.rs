@@ -1,32 +1,8 @@
-//! What the checks at power-on found.
-//!
-//! The firmware reads the fuses back before it turns anything on (AN2632
-//! §11), and checks the fields it relies on, not whole bytes. The datasheet,
-//! the errata and the ATDF disagree about the factory bytes, so a whole-byte
-//! compare would fail on a chip that's fine. It never writes them.
-//!
-//! It also has the chip's CRCSCAN check all of flash against the CRC-16 that
-//! `cargo xtask hex` stores in its last two bytes (AN2632 §9.1), which catches
-//! a flash that a `cargo xtask flash` left half-written. The hardware does the
-//! sums, so all that's here is what a failure means.
-//!
-//! A watchdog reset means something hung ([`hung`]). And MVIO saying VDDIO2
-//! is missing means PC1, the driver's enable, can't be driven at all
-//! ([`Faults::supply`]).
-//!
-//! A failure keeps the light off until the cell comes out
-//! (`limits::Health::Fault`). The aux show white for a few seconds after each
-//! press, so a torch that won't come on still says why, through the AW2016
-//! (`aw2016`), which has only met the simulator.
-//!
-//! That's the whole of the safety net. The RAM and register tests, the clock
-//! check and a proof that the watchdog bites are left out on purpose (see
-//! `watchdog`).
+//! What the checks at power-on found. The fuses are read back, never written
+//! (AN2632 §11), and CRCSCAN checks flash (AN2632 §9.1).
 
 use crate::regs;
 
-/// The AVR32DD20's fuse bytes, FUSE.WDTCFG to FUSE.BOOTSIZE without the two
-/// reserved ones, as read from data space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fuses {
     pub wdtcfg: u8,
@@ -39,38 +15,9 @@ pub struct Fuses {
 }
 
 impl Fuses {
-    /// Whether every field the firmware relies on is something it can cope
-    /// with. The intent is that UPDI stays usable and nothing starts that
-    /// the firmware doesn't set up itself. The backup of this torch
-    /// (2026-11-16, `backup/stock/fuses.hex`) read the factory defaults, and
-    /// they pass.
-    ///
-    /// Section numbers are DS40002413B, the AVR32/16DD14/20 datasheet.
-    ///
-    /// - `WDTCFG` is 0. A non-zero PERIOD starts the watchdog at boot with
-    ///   LOCK set (§22.3.1), so the firmware can't set it up. Nothing says
-    ///   what a WINDOW alone does, so the whole byte has to be 0.
-    /// - `BODCFG` isn't checked. Whether the brown-out detector runs, and at
-    ///   what level, only decides when a sagging cell holds the chip in reset,
-    ///   which the firmware already has to survive as a power cut. It's off on
-    ///   this torch, so a sagging cell gets no reset at all (docs/safety.md),
-    ///   and the firmware never writes fuses to change that.
-    /// - `OSCCFG.CLKSEL` is the internal high-frequency oscillator. The 32 kHz
-    ///   one as the main clock would leave every timing hundreds of times slow.
-    /// - `SYSCFG0.UPDIPINCFG` is UPDI, so the light can still be reflashed.
-    ///   On this chip UPDI has its own pin (PF7), and `RSTPINCFG` only says
-    ///   whether PF6 is a reset or an input (§8.8.2.4), which the firmware
-    ///   never uses.
-    /// - `SYSCFG0.CRCSEL` is CRC-16. CRCSCAN has no CRC type of its own, so
-    ///   this fuse picks it for the scan the firmware starts too (§8.8.2.4),
-    ///   and `cargo xtask hex` only stores a CRC-16. `CRCSRC` and `EESAVE`
-    ///   are left alone.
-    /// - `SYSCFG1.MVSYSCFG` is dual or single supply, not one of the two
-    ///   reserved values (§8.8.2.5). `SUT`, the start-up time, can be
-    ///   anything.
-    /// - `CODESIZE` and `BOOTSIZE` are 0, so all of flash is one boot section
-    ///   (§11.3.1.1). The vector table is linked at 0, and only a whole-flash
-    ///   CRC scan expects the checksum where `xtask` puts it (table 30-1).
+    /// Sections are DS40002413B. A non-zero `WDTCFG` PERIOD starts the watchdog
+    /// locked (§22.3.1), `CRCSEL` also picks the CRC for a scan the firmware
+    /// starts (§8.8.2.4), and a whole-flash scan wants one boot section (§11.3.1.1).
     pub const fn ok(self) -> bool {
         let supply = self.syscfg1 & regs::FUSE_MVSYSCFG;
         self.wdtcfg == 0
@@ -83,33 +30,22 @@ impl Fuses {
     }
 }
 
-/// Whether `RSTCTRL.RSTFR`, as this boot found it, says the watchdog reset
-/// the chip. The firmware's only ever reset by the watchdog if the loop
-/// stopped feeding it, so that's [`Faults::hang`].
+/// `flags` is `RSTCTRL.RSTFR` as this boot found it.
 pub const fn hung(flags: u8) -> bool {
     flags & regs::RSTCTRL_WDRF != 0
 }
 
-/// Which checks failed at power-on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Faults {
-    /// Flash doesn't match the CRC `cargo xtask hex` put at its end, by
-    /// CRCSCAN's sums.
     pub flash: bool,
-    /// The fuses aren't what the firmware expects.
     pub fuses: bool,
-    /// The watchdog reset the chip, so something hung.
     pub hang: bool,
-    /// MVIO says VDDIO2 isn't there (`MVIO.STATUS.VDDIO2S`, DS40002413B
-    /// section 19.5.3). PORTC is on VDDIO2 and the fuses have it as a
-    /// separate supply, so without it PC1, the driver's enable, is
-    /// tri-stated and nothing the firmware writes reaches it (section
-    /// 19.3.2.1).
+    /// `MVIO.STATUS.VDDIO2S` says VDDIO2 is missing (DS40002413B §19.5.3),
+    /// which tri-states PC1, the driver's enable (§19.3.2.1).
     pub supply: bool,
 }
 
 impl Faults {
-    /// Every check passed.
     pub const NONE: Self = Self {
         flash: false,
         fuses: false,
@@ -117,7 +53,6 @@ impl Faults {
         supply: false,
     };
 
-    /// Whether anything failed, which keeps the light off.
     pub const fn any(self) -> bool {
         self.flash || self.fuses || self.hang || self.supply
     }
@@ -127,12 +62,7 @@ impl Faults {
 mod tests {
     use super::*;
 
-    /// This torch's fuses, from the backup of it read with the stock firmware
-    /// on it (2026-11-16, `backup/stock/fuses.hex`): `WDTCFG 00, BODCFG 00,
-    /// OSCCFG 00, FF, FF, SYSCFG0 D0, SYSCFG1 08, CODESIZE 00, BOOTSIZE 00`.
-    /// Those are the factory defaults (DS40002413B section 8.8.2). The
-    /// brown-out detector's off, the start-up delay is 0 ms, MVIO is dual
-    /// supply, UPDI is on PF7 and PF6 is an input.
+    /// Read off this torch, and the factory defaults (DS40002413B §8.8.2).
     const STOCK: Fuses = Fuses {
         wdtcfg: 0x00,
         bodcfg: 0x00,
@@ -162,8 +92,6 @@ mod tests {
 
     #[test]
     fn checks_fields_not_whole_bytes() {
-        // (what, which byte, its value), the bytes in `Fuses`' order. Each
-        // changes only fields the firmware doesn't depend on.
         let fine = [
             ("BOD off", 1, 0x00),
             ("BOD sampled at 2.85 V and on in sleep", 1, 0x79),
@@ -208,7 +136,6 @@ mod tests {
         assert!(!erased.ok());
     }
 
-    /// [`STOCK`] with byte `byte`, in `Fuses`' order, set to `value`.
     fn with(byte: usize, value: u8) -> Fuses {
         let mut fuses = STOCK;
         let field = match byte {
