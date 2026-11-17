@@ -9,8 +9,7 @@ license = "MIT"
 
 [workspace.lints.rust]
 # Only src/avr/hw.rs, src/avr/rt.rs, the #[unsafe(no_mangle)] on main and the
-# no_mangle items in examples/link.rs, examples/guards.rs and
-# examples/first_light.rs may opt back in.
+# no_mangle items in examples/link.rs and examples/guards.rs may opt back in.
 unsafe_code = "deny"
 unsafe_op_in_unsafe_fn = "deny"
 
@@ -58,13 +57,6 @@ bench = false
 # Runs src/avr/hw.rs's guards that the firmware never reaches. Never flashed.
 [[example]]
 name = "guards"
-test = false
-bench = false
-
-# The first-light image, the first thing flashed on the torch. Built and
-# simulated by `cargo xtask hex`, which writes its own hex for `flash`.
-[[example]]
-name = "first_light"
 test = false
 bench = false
 

@@ -208,11 +208,8 @@
 //! to give each update up without hanging or retrying while the light still
 //! follows the library.
 //! `probe` separately runs examples/link.rs, which has real statics,
-//! `guards` runs examples/guards.rs, which asks src/avr/hw.rs for power-down
-//! with the light on, and `first_light` runs examples/first_light.rs, the
-//! first-light image, with no ticks at all, holding it to its promises of no
-//! interrupt, no sleep, no watchdog and no timer (`Chip::bare`) as well as
-//! the board's rules above.
+//! and `guards` runs examples/guards.rs, which asks src/avr/hw.rs for
+//! power-down with the light on.
 
 use std::iter;
 use std::ops::Range;
@@ -1706,235 +1703,6 @@ pub fn guards(elf: &Elf) -> Result<(), String> {
     }
 }
 
-/// Main clocks in a millisecond, which is how many instructions the
-/// simulator counts as one.
-const MS: u64 = CLK_PER as u64 / 1000;
-
-/// One of `first_light`'s runs, on a chip started with the switch as the
-/// `bool` says, and what it's called.
-type FirstLightRun = (fn(Sim) -> Result<(), String>, bool, &'static str);
-
-/// Runs the first-light image, examples/first_light.rs, from reset, through
-/// clicks, bounces, presses while it arms and a switch held down, and holds
-/// it to its promises as well as every rule the firmware has. It never sets
-/// SREG.I or enables an interrupt, never runs `sleep` or `wdr`, never writes
-/// WDT.CTRLA and never starts TCB0 or the PIT (`Chip::bare`). PC1, DAC0, its
-/// reference and the paths keep every rule they have for the firmware,
-/// including DAC0's 8 ms after PC1 rises, which here only a busy-wait can
-/// meet.
-///
-/// The level is `ui::FLOOR`, and the example's waits are its own constants,
-/// so the runs press well inside and well outside them, 400 ms against
-/// 500 ms of arming, 10 ms and 200 ms against 30 ms of debounce.
-pub fn first_light(elf: &Elf) -> Result<(), String> {
-    let linked = Linked::of(elf)?;
-    let image = elf.flash_image();
-    let fresh = || -> Result<Sim, String> {
-        let mut sim = Sim::new(image.clone(), linked.layout.bss.end, linked.ends)?;
-        sim.chip.bare = true;
-        Ok(sim)
-    };
-    found_lit(fresh()?).map_err(|e| format!("starting with PC1 high: {e}"))?;
-    let power_on = |pressed: bool| -> Result<Sim, String> {
-        let mut sim = fresh()?;
-        sim.chip.set_switch(pressed)?;
-        sim.run_to(linked.main, BOOT_BUDGET)
-            .and_then(|()| check_startup(&sim.chip, &linked.layout))
-            .map_err(|e| format!("startup: {e}"))?;
-        Ok(sim)
-    };
-
-    let runs: [FirstLightRun; 6] = [
-        (at_rest, false, "from reset"),
-        (clicks, false, "clicked on and off"),
-        (pressed_arming, false, "pressed while it arms"),
-        (held_from_reset, true, "held from reset"),
-        (held_on, false, "held once on"),
-        (bounces, false, "with a bouncing switch"),
-    ];
-    let power_on = &power_on;
-    thread::scope(|scope| {
-        let runs = runs.map(|(run, pressed, name)| {
-            scope.spawn(move || run(power_on(pressed)?).map_err(|e| format!("{name}: {e}")))
-        });
-        runs.into_iter()
-            .try_for_each(|run| run.join().unwrap_or_else(|_| Err("a run panicked".into())))
-    })
-}
-
-/// Runs `sim` for `clocks` with the switch as `pressed` says.
-fn hold(sim: &mut Sim, pressed: bool, clocks: u64) -> Result<(), String> {
-    sim.chip.set_switch(pressed)?;
-    let until = sim.chip.now + clocks;
-    while sim.chip.now < until {
-        sim.step()?;
-    }
-    Ok(())
-}
-
-/// A press, or a release with `pressed` false, that bounces for 5 ms before
-/// it settles, then `ms` settled.
-fn bounced(sim: &mut Sim, pressed: bool, ms: u64) -> Result<(), String> {
-    for i in 0..20 {
-        hold(sim, pressed == (i % 2 == 0), MS / 4)?;
-    }
-    hold(sim, pressed, ms * MS)
-}
-
-/// The driver at first light's level.
-fn lit_at_floor(sim: &Sim) -> Result<(), String> {
-    sim.chip
-        .shows(kr1k::ramp::output(kr1k::ui::FLOOR))
-        .map_err(|e| format!("should be lit: {e}"))
-}
-
-fn dark(sim: &Sim) -> Result<(), String> {
-    sim.chip
-        .shows(Output::OFF)
-        .map_err(|e| format!("should be dark: {e}"))
-}
-
-/// PC1 has risen `n` times.
-fn rises(sim: &Sim, n: u32) -> Result<(), String> {
-    match sim.chip.pc1_rises {
-        rises if rises == n => Ok(()),
-        rises => Err(format!("PC1 has risen {rises} times, not {n}")),
-    }
-}
-
-/// Two seconds with the switch left alone. PC1 never rises, and the chip
-/// rests as `peek` saw the stock firmware rest on this torch (docs/breakout.md's
-/// results), PC1 an output
-/// and low, DAC0 driving PD6 at 0 against 1.024 V with PD6's input buffer
-/// off, and the paths outputs and low. PA1 is an output at 0 with no
-/// pull-up, as the stock build had it. PD4 reads with no pull-up and no
-/// sense, and the unused pins have their pull-ups, as board.rs has them.
-fn at_rest(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, false, 2000 * MS)?;
-    rises(&sim, 0)?;
-    dark(&sim)?;
-    let io = &sim.chip.io;
-    let pin = |base: usize, n: u8| io[base + usize::from(n)];
-    let checks = [
-        (io[reg::VPORTC_DIR] & ENABLE != 0, "PC1 isn't an output"),
-        (
-            io[reg::DAC0_CTRLA] == DAC_DRIVING,
-            "DAC0 isn't on and driving PD6",
-        ),
-        (
-            io[DAC_PIN_CTRL] & PORT_ISC == ISC_INPUT_DISABLE,
-            "PD6's input buffer is on",
-        ),
-        (
-            io[reg::VPORTA_DIR] & PATHS == PATHS,
-            "the paths aren't outputs",
-        ),
-        (io[reg::VPORTA_DIR] & HELD_LOW != 0, "PA1 isn't an output"),
-        (io[reg::VPORTA_OUT] & HELD_LOW == 0, "PA1 isn't low"),
-        (io[HELD_LOW_CTRL] == 0, "PA1 has a pull-up or a sense"),
-        (io[SWITCH_CTRL] == 0, "PD4 has a sense or a pull-up"),
-        (
-            [
-                pin(reg::PORTA_PIN0CTRL, board::FET),
-                pin(reg::PORTC_PIN0CTRL, board::UNUSED_PC2),
-                pin(reg::PORTC_PIN0CTRL, board::UNUSED_PC3),
-                pin(reg::PORTD_PIN0CTRL, board::UNUSED_PD5),
-                pin(reg::PORTD_PIN0CTRL, board::POWER_BANK),
-            ]
-            .iter()
-            .all(|&ctrl| ctrl & PORT_PULLUPEN != 0),
-            "an unused pin has no pull-up",
-        ),
-    ];
-    match checks.into_iter().find(|&(ok, _)| !ok) {
-        Some((_, why)) => Err(why.into()),
-        None => Ok(()),
-    }
-}
-
-/// Armed, then three clicks, on, off and on again, each held 200 ms and let
-/// go for 300 ms. It's lit from the press, and stays as it is through the
-/// release.
-fn clicks(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, false, 1000 * MS)?;
-    for click in 1..=3 {
-        hold(&mut sim, true, 200 * MS)?;
-        let shown = |sim: &Sim| {
-            if click % 2 == 1 {
-                lit_at_floor(sim)
-            } else {
-                dark(sim)
-            }
-        };
-        shown(&sim).map_err(|e| format!("press {click}: {e}"))?;
-        hold(&mut sim, false, 300 * MS)?;
-        shown(&sim).map_err(|e| format!("after release {click}: {e}"))?;
-    }
-    rises(&sim, 2)
-}
-
-/// A 200 ms press 400 ms after reset, before it's armed, does nothing. Nor
-/// does the next press, until the switch has read released long enough
-/// again, and then one does.
-fn pressed_arming(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, false, 400 * MS)?;
-    hold(&mut sim, true, 200 * MS)?;
-    dark(&sim)?;
-    hold(&mut sim, false, 300 * MS)?;
-    hold(&mut sim, true, 200 * MS)?;
-    dark(&sim)?;
-    rises(&sim, 0)?;
-    hold(&mut sim, false, 1000 * MS)?;
-    hold(&mut sim, true, 200 * MS)?;
-    lit_at_floor(&sim)
-        .map_err(|e| format!("pressed once armed: {e}"))
-        .and_then(|()| rises(&sim, 1))
-}
-
-/// Five seconds with the switch held from before reset never lights. Let go
-/// long enough, a press does.
-fn held_from_reset(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, true, 5000 * MS)?;
-    dark(&sim)?;
-    rises(&sim, 0)?;
-    hold(&mut sim, false, 1000 * MS)?;
-    hold(&mut sim, true, 200 * MS)?;
-    lit_at_floor(&sim).and_then(|()| rises(&sim, 1))
-}
-
-/// A press held for five seconds turns it on once and does nothing more. Let
-/// go, the next press turns it off.
-fn held_on(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, false, 1000 * MS)?;
-    hold(&mut sim, true, 5000 * MS)?;
-    lit_at_floor(&sim)?;
-    rises(&sim, 1)?;
-    hold(&mut sim, false, 300 * MS)?;
-    hold(&mut sim, true, 200 * MS)?;
-    dark(&sim).and_then(|()| rises(&sim, 1))
-}
-
-/// Presses and releases that bounce for 5 ms, and 10 ms presses too short to
-/// count, each toggle once at most, the glitches never.
-fn bounces(mut sim: Sim) -> Result<(), String> {
-    hold(&mut sim, false, 1000 * MS)?;
-    hold(&mut sim, true, 10 * MS)?;
-    hold(&mut sim, false, 300 * MS)?;
-    dark(&sim).map_err(|e| format!("after a 10 ms press: {e}"))?;
-    bounced(&mut sim, true, 200)?;
-    lit_at_floor(&sim)?;
-    bounced(&mut sim, false, 300)?;
-    lit_at_floor(&sim)?;
-    hold(&mut sim, true, 10 * MS)?;
-    hold(&mut sim, false, 300 * MS)?;
-    lit_at_floor(&sim).map_err(|e| format!("after a 10 ms press: {e}"))?;
-    bounced(&mut sim, true, 200)?;
-    dark(&sim)?;
-    bounced(&mut sim, false, 300)?;
-    dark(&sim)?;
-    rises(&sim, 1)
-}
-
 /// Where src/avr/rt.rs's startup copies and zeroes, as data-space addresses.
 struct Layout {
     data: Range<u16>,
@@ -2284,21 +2052,6 @@ impl Sim {
                  interrupt enables alone keeping it down",
                 pc * 2
             ));
-        }
-        if self.chip.bare {
-            if self.cpu.flag(I) {
-                return Err(format!(
-                    "{:#06x}: sets SREG.I, and first light has no interrupts",
-                    pc * 2
-                ));
-            }
-            if self.chip.enabled != 0 {
-                return Err(format!(
-                    "{:#06x}: enables {}, and first light has no interrupts",
-                    pc * 2,
-                    vector_name(self.chip.enabled.trailing_zeros() as u8)
-                ));
-            }
         }
         self.watch_handler(handling)?;
         if self.cpu.handling.is_some() && self.cpu.pc == self.halt {
@@ -2813,10 +2566,6 @@ struct Chip {
     /// Writes to anything but SRAM so far.
     register_writes: u32,
     boot: Boot,
-    /// Holds the program to the first-light image's promises, no interrupt,
-    /// no sleep, no watchdog and no timer (`first_light`), and nothing on
-    /// TWI0, since first light leaves the AW2016 alone.
-    bare: bool,
     /// Times PC1 has risen.
     pc1_rises: u32,
     /// TWI0's host and the AW2016 on its bus (`twi.rs`).
@@ -2883,7 +2632,6 @@ impl Chip {
             power_downs: 0,
             register_writes: 0,
             boot: Boot::default(),
-            bare: false,
             pc1_rises: 0,
             twi: Twi::new(),
             aux_unwired: false,
@@ -3683,8 +3431,7 @@ impl Chip {
             }
             // The watchdog's lit setting, synced and started by a `wdr`, so a
             // hang with the light on bites within its window. A firmware with
-            // no watchdog at all, examples/guards.rs and first light, is
-            // held to the rest.
+            // no watchdog at all, examples/guards.rs, is held to the rest.
             if self.wdt_on()
                 && (self.io[reg::WDT_CTRLA] != WDT_LIT
                     || self.wdt.pending.is_some()
@@ -3937,29 +3684,6 @@ fn plain(addr: usize) -> bool {
         )
 }
 
-/// Whether `addr` is one of PORTA's, PORTC's or PORTD's PINnCTRL.
-/// Refuses a write first light promises never to make, to the watchdog, or
-/// starting TCB0 or the PIT. Enabling an interrupt is refused in `Sim::step`,
-/// whichever register does it.
-fn bare_write(a: usize, value: u8) -> Result<(), String> {
-    match a {
-        reg::WDT_CTRLA => Err("writes WDT.CTRLA, and first light has no watchdog".into()),
-        reg::TCB0_CTRLA if value & TCB_ENABLE != 0 => {
-            Err("starts TCB0, and first light has no timers".into())
-        }
-        reg::RTC_PITCTRLA if value & RTC_PITEN != 0 => {
-            Err("starts the PIT, and first light has no timers".into())
-        }
-        // `hw::halt` turns TWI0's host off, which talks to nobody.
-        reg::TWI0_MCTRLA if value == 0 => Ok(()),
-        _ if twi(a) => Err(format!(
-            "writes {}, and first light leaves the AW2016 alone",
-            name(a)
-        )),
-        _ => Ok(()),
-    }
-}
-
 /// Whether `addr` is one of TWI0's registers.
 fn twi(addr: usize) -> bool {
     (reg::TWI0_CTRLA..reg::TWI0_CTRLA + 0x10).contains(&addr)
@@ -4102,9 +3826,6 @@ impl Bus for Chip {
     }
 
     fn wdr(&mut self) -> Result<(), String> {
-        if self.bare {
-            return Err("runs `wdr`, and first light has no watchdog".into());
-        }
         if self.wdt.pending.is_some() {
             return Err("wdr before the WDT.CTRLA write has synced".into());
         }
@@ -4158,9 +3879,6 @@ impl Bus for Chip {
     /// good, since only a reset wakes it (§13.3.1). That sets `down`, which is
     /// for whoever's running the chip to judge.
     fn sleep(&mut self) -> Result<bool, String> {
-        if self.bare {
-            return Err("runs `sleep`, and first light never sleeps".into());
-        }
         self.dark_without_vddio2()?;
         self.vddio2_goes()?;
         self.ccp_hold = false;
@@ -4366,9 +4084,6 @@ impl Bus for Chip {
         }
         self.register_writes += 1;
         self.boot.write(self.now, a, value);
-        if self.bare {
-            bare_write(a, value)?;
-        }
         match a {
             reg::CPU_CCP => {
                 if value != CCP_IOREG {
@@ -5843,22 +5558,6 @@ mod tests {
         poke(&mut chip, SWITCH_CTRL, ISC_BOTHEDGES).unwrap();
         assert_eq!(chip.sleep(), Ok(true));
         assert!(!chip.down);
-    }
-
-    #[test]
-    fn first_light_never_sleeps_feeds_a_watchdog_or_starts_a_timer() {
-        let mut chip = dark();
-        chip.bare = true;
-        poke(&mut chip, reg::SLPCTRL_CTRLA, SLEEP_IDLE | SLPCTRL_SEN).unwrap();
-        assert!(chip.sleep().unwrap_err().contains("never sleeps"));
-        assert!(chip.wdr().unwrap_err().contains("no watchdog"));
-        let e = unlocked(&mut chip, reg::WDT_CTRLA, WDT_PERIOD_MAX).unwrap_err();
-        assert!(e.contains("no watchdog"), "{e}");
-        assert!(refused(&mut chip, reg::TCB0_CTRLA, TCB_RUNNING).contains("no timers"));
-        let pit = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
-        assert!(refused(&mut chip, reg::RTC_PITCTRLA, pit).contains("no timers"));
-        // Stopping them is fine, as `hw::halt` does.
-        poke(&mut chip, reg::TCB0_CTRLA, 0).unwrap();
     }
 
     #[test]

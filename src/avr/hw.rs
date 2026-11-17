@@ -328,7 +328,7 @@ pub fn set_pit(pit: Pit) {
 }
 
 /// The clock, the pins and DAC0, with no timer and no interrupt. [`init`]
-/// starts with this, and examples/first_light.rs runs it alone.
+/// starts with this.
 ///
 /// PD4, the switch, is left as reset has it, its input buffer on, no
 /// pull-up and no sense, so it reads but raises nothing. [`init`] gives it
@@ -956,45 +956,6 @@ fn spin(loops: u8) {
     };
 }
 
-/// Passes of [`spin_ms`]'s loop in a millisecond. Each pass is eight
-/// instructions, so a millisecond is 4,000 of them, which is the 4,000 main
-/// clocks of a millisecond at 4 MHz if every instruction took one clock, and
-/// that's how the simulator counts it. On the chip a pass is ten clocks (six
-/// `nop`s, `sbiw` and a taken `brne` at two each), so it's about 1.25 ms.
-const PASSES_PER_MS: u16 = 500;
-
-/// Spins for `ms` milliseconds by the simulator's count, about 1.25 × `ms`
-/// on the chip (see [`PASSES_PER_MS`]), with no timer and no interrupt.
-/// Only examples/first_light.rs waits like this; the firmware times
-/// everything off its tick.
-#[allow(
-    dead_code,
-    reason = "examples/first_light.rs's waits, which the firmware doesn't use"
-)]
-pub fn spin_ms(ms: u16) {
-    for _ in 0..ms {
-        // SAFETY: counts a register pair down to zero. Touches no memory.
-        // `sbiw` changes the status flags, so there's no `preserves_flags`,
-        // and with no `nomem` it's a compiler barrier, so the stores either
-        // side of a wait stay either side.
-        unsafe {
-            asm!(
-                "1:",
-                "nop",
-                "nop",
-                "nop",
-                "nop",
-                "nop",
-                "nop",
-                "sbiw {n}, 1",
-                "brne 1b",
-                n = inout(reg_iw) PASSES_PER_MS => _,
-                options(nostack),
-            )
-        };
-    }
-}
-
 /// Loops of [`spin`] for DAC0's output to fall to 0 before a reference or a
 /// path changes, about 20 µs. The datasheet's settling time is 7 µs typical
 /// for a full-scale step into 50 pF (table 38-23), and the DAC can sink only
@@ -1032,8 +993,8 @@ const REFERENCE_SETTLES: u8 = 4;
 /// writes that second, so a code changes in one step.
 ///
 /// The pin and DAC0 sequencing is in [`output_off`], [`output_start`] and
-/// [`output_level`], which examples/first_light.rs calls without TCB0. This
-/// adds TCB0, started just before PC1 rises and stopped once it's low.
+/// [`output_level`]. This adds TCB0, started just before PC1 rises and
+/// stopped once it's low.
 pub fn set_output(output: Output) {
     if !output.enable {
         output_off();
@@ -1070,7 +1031,7 @@ pub fn output_off() {
 /// The driver on and asked for nothing, DAC0 to 0 at 1.024 V and the paths
 /// low, then `just_before`, then PC1 high. Call it with PC1 low, and
 /// [`output_level`] no sooner than 8 ms after. [`set_output`] starts TCB0 in
-/// `just_before`; examples/first_light.rs passes nothing.
+/// `just_before`.
 pub fn output_start(just_before: impl FnOnce()) {
     write16(reg::DAC0_DATA, 0);
     write(reg::VREF_DAC0REF, regs::VREF_REFSEL_1V024);

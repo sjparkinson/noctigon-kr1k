@@ -79,7 +79,6 @@ struct Breakage {
 
 const HW: &str = "src/avr/hw.rs";
 const MAIN: &str = "src/main.rs";
-const FIRST_LIGHT: &str = "examples/first_light.rs";
 const AW2016: &str = "src/aw2016.rs";
 const LIMITS: &str = "src/limits.rs";
 const BATTERY: &str = "src/battery.rs";
@@ -515,74 +514,6 @@ const BREAKAGES: &[Breakage] = &[
         replace: "    Some(u16::from_le_bytes([lo, hi]) / 10)\n",
         stage: Stage::Build,
         expect: "undefined symbol: __mulsi3",
-    },
-    // The first-light image has no interrupts. This sets it up as the
-    // firmware is, which gives PD4 a sense and turns the PIT's interrupt on.
-    Breakage {
-        name: "first-light-interrupt",
-        file: FIRST_LIGHT,
-        find: "        hw::init_pins();\n",
-        replace: "        hw::init();\n",
-        stage: Stage::Simulator,
-        expect: "first light has no interrupts",
-    },
-    // ... and never sets SREG.I, which waiting for a tick does.
-    Breakage {
-        name: "first-light-sei",
-        file: FIRST_LIGHT,
-        find: "        hw::init_pins();\n",
-        replace: "        hw::init_pins();\n        let _ = hw::wait_for_tick(false, false);\n",
-        stage: Stage::Simulator,
-        expect: "sets SREG.I",
-    },
-    // ... never sleeps, which `hw::halt` does, here on a switch held from
-    // reset.
-    Breakage {
-        name: "first-light-sleep",
-        file: FIRST_LIGHT,
-        find: "        hw::init_pins();\n",
-        replace: "        hw::init_pins();\n        if hw::switch_pressed() {\n            \
-                  hw::halt();\n        }\n",
-        stage: Stage::Simulator,
-        expect: "runs `sleep`",
-    },
-    // ... and has no watchdog to feed.
-    Breakage {
-        name: "first-light-wdr",
-        file: FIRST_LIGHT,
-        find: "        hw::init_pins();\n",
-        replace: "        hw::init_pins();\n        hw::feed_watchdog();\n",
-        stage: Stage::Simulator,
-        expect: "runs `wdr`",
-    },
-    // It only arms once the switch has been let go for a while, so a press
-    // as the head's done up can't light it.
-    Breakage {
-        name: "first-light-unarmed",
-        file: FIRST_LIGHT,
-        find: "        steady(false, ARMING_MS);\n",
-        replace: "",
-        stage: Stage::Simulator,
-        expect: "pressed while it arms: should be dark",
-    },
-    // DAC0 leaves 0 no sooner than 8 ms after PC1 rises, which here only the
-    // busy-wait gives it.
-    Breakage {
-        name: "first-light-boost-short",
-        file: FIRST_LIGHT,
-        find: "pub const BOOST_MS: u16 = 8;\n",
-        replace: "pub const BOOST_MS: u16 = 7;\n",
-        stage: Stage::Simulator,
-        expect: "the stock firmware gives the boost converter",
-    },
-    // A bounce or a glitch shorter than the debounce changes nothing.
-    Breakage {
-        name: "first-light-undebounced",
-        file: FIRST_LIGHT,
-        find: "pub const DEBOUNCE_MS: u16 = 30;\n",
-        replace: "pub const DEBOUNCE_MS: u16 = 1;\n",
-        stage: Stage::Simulator,
-        expect: "with a bouncing switch",
     },
     // Every wait on TWI0 counts down the update's budget. This one waits for
     // WIF for ever, which a held-down SCL never raises.
