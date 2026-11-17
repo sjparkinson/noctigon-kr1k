@@ -38,6 +38,7 @@
 //! the same as there being nothing.
 
 use crate::TICKS_PER_SECOND;
+use crate::ramp::Output;
 
 /// Cycles of the WDT's 1.024 kHz clock in one tick.
 pub const CLOCKS_PER_TICK: u16 = 1024 / TICKS_PER_SECOND;
@@ -432,6 +433,18 @@ impl Pacer {
         matches!(self.state, State::Fast)
     }
 
+    /// `output`, or [`Output::OFF`] unless the lit setting is in force.
+    ///
+    /// The torch only lights after a click or a hold, which can't count
+    /// before the lit setting is back ([`EXIT_PASSES`]), so this never
+    /// changes anything the firmware does today. It's there so that a way to
+    /// light the torch added later, one that doesn't wait for the switch,
+    /// can't raise PC1 under the rest setting or with the PIT slow. `main`
+    /// sends every output through it.
+    pub const fn guard(&self, output: Output) -> Output {
+        if self.lit() { output } else { Output::OFF }
+    }
+
     /// Whether the PIT is slow for the sleep the last pass ended in.
     pub const fn slow(&self) -> bool {
         matches!(self.state, State::Slow { .. })
@@ -788,6 +801,40 @@ mod tests {
         }
         let (t, f) = (true, false);
         assert_eq!(&feeds[..7], &[t, f, f, t, f, f, t]);
+    }
+
+    /// Whatever the torch asks for, nothing lights outside the fast state,
+    /// on every pass of a rest and a way back from it.
+    #[test]
+    fn the_guard_only_lets_a_light_through_with_the_lit_setting_in_force() {
+        use crate::ramp;
+        let light = ramp::output(ramp::CEILING);
+        let mut pacer = Pacer::new();
+        let mut states = std::vec::Vec::new();
+        let mut wake = Wake::Tick;
+        for n in 0..400 {
+            let quiet = n < 300;
+            if n == 300 {
+                wake = Wake::Switch;
+            }
+            pass(&mut pacer, wake, quiet, quiet);
+            wake = Wake::Tick;
+            states.push(pacer.state);
+            let want = if pacer.lit() { light } else { Output::OFF };
+            assert_eq!(pacer.guard(light), want, "{:?}", pacer.state);
+            assert_eq!(pacer.guard(Output::STARTING).enable, pacer.lit());
+            assert_eq!(pacer.guard(Output::OFF), Output::OFF);
+        }
+        for state in [
+            State::Fast,
+            State::Entering,
+            State::Slow { since: 1 },
+            State::Bridge,
+            State::Returning,
+            State::Restoring,
+        ] {
+            assert!(states.contains(&state), "never in {state:?}");
+        }
     }
 
     #[test]

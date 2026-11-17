@@ -117,10 +117,10 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "dac-before-the-boost-starts",
         file: MAIN,
-        find: "        if let Some(output) = output_changes.update(torch.output()) {\n            \
+        find: "        if let Some(output) = output_changes.update(pacer.guard(torch.output())) {\n            \
                hw::set_output(output);\n",
         replace: "        if let Some(output) = \
-                  output_changes.update(kr1k::ramp::output(torch.level())) {\n            \
+                  output_changes.update(pacer.guard(kr1k::ramp::output(torch.level()))) {\n            \
                   hw::set_output(output);\n            hw::set_output(output);\n",
         stage: Stage::Simulator,
         expect: "the stock firmware gives the boost converter",
@@ -383,6 +383,21 @@ const BREAKAGES: &[Breakage] = &[
         find: "            hw::set_watchdog(setting);\n",
         replace: "            if setting == kr1k::watchdog::Setting::Rest {\n                \
                   hw::set_watchdog(setting);\n            }\n",
+        stage: Stage::Simulator,
+        expect: "raises PC1 with WDT.CTRLA at 0x0b",
+    },
+    // Every output goes through `Pacer::guard`, so nothing lights outside
+    // the lit window. Taking the guard out alone changes nothing today, since
+    // only a click or a hold lights the torch. This takes it out and adds the
+    // mistake it's there for, a way to light that doesn't wait for the
+    // switch, here the boost converter on at every slow tick.
+    Breakage {
+        name: "unguarded-light-at-rest",
+        file: MAIN,
+        find: "output_changes.update(pacer.guard(torch.output()))",
+        replace: "output_changes.update(if pacer.slow() {\n            \
+                  kr1k::ramp::Output::STARTING\n        } else {\n            \
+                  torch.output()\n        })",
         stage: Stage::Simulator,
         expect: "raises PC1 with WDT.CTRLA at 0x0b",
     },

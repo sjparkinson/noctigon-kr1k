@@ -52,6 +52,7 @@ use crate::TICKS_PER_SECOND;
 use crate::aw2016::Aw2016;
 use crate::battery;
 use crate::button::{Event, HOLD_TICKS, RELEASE_TICKS};
+use crate::ramp::Output;
 use crate::selftest::Faults;
 use crate::sensors::{Channel, Convert};
 use crate::temp::Calibration;
@@ -715,6 +716,12 @@ impl Paced {
             pit: Pit::Fast,
             pressed: false,
         }
+    }
+
+    /// What `main` sends to the driver, the torch's output through
+    /// `Pacer::guard`.
+    pub fn output(&self) -> Output {
+        self.pacer.guard(self.rig.torch.output())
     }
 
     /// The PIT's period as the last pass left it.

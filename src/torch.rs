@@ -452,11 +452,15 @@ mod tests {
                         passes += 1;
                     }
                     slow += u32::from(paced.pacer.slow());
+                    // The torch's own output, before `Pacer::guard`, which
+                    // would make the last check true whatever it asked for.
+                    let asked = paced.rig.torch.output();
+                    assert_eq!(paced.output(), asked, "{phase:?}: the guard never bites");
                     if phase == PitPhase::Aligned {
-                        assert_eq!(paced.output(), plain.output());
+                        assert_eq!(asked, plain.output());
                     }
-                    lit += u32::from(paced.output().enable);
-                    assert!(!paced.output().enable || paced.pacer.lit(), "{phase:?}");
+                    lit += u32::from(asked.enable);
+                    assert!(!asked.enable || paced.pacer.lit(), "{phase:?}");
                 }
             }
             assert!(slow > 10_000, "{phase:?} hardly ever slowed: {slow}");

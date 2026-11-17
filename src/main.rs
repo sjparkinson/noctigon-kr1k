@@ -113,7 +113,9 @@ extern "C" fn main() -> ! {
             aux.failed();
         }
 
-        if let Some(output) = output_changes.update(torch.output()) {
+        // Off unless the watchdog's lit window is in force, whatever the
+        // torch asks for.
+        if let Some(output) = output_changes.update(pacer.guard(torch.output())) {
             hw::set_output(output);
         }
 
