@@ -125,6 +125,7 @@ Write the result in the [table](#results) before going on.
 | 4.5 | | Tail current, off, on the 4 A range | 0.000 to 0.003 once it's asleep. Anything steadily over about 5 mA isn't a sleeping chip, or it's a reset loop | The rough version of the off current |
 | 4.6 | | An hour on at a low level, in sight | Stays on and doesn't move. Going out is the watchdog biting or the tick deadline | "It never trips in normal use", in part |
 | 4.7 | Pass | Leave it off overnight, then 1C | Comes on at once | |
+| 4.8 | | With firmware that has the supply readings flashed, cell out, the probe on the pads for a second or more so the power-on check has run, then `cargo xtask peek <port>` once. It ends with UPDIDIS, which resets the chip, and the next boot reads both again | The `supplies at 7000` lines show VDD and VDDIO2 in volts and raw. On the kit's roughly 4.5 V, VDD reads about 4.46 V (the slope of 1014 reads about 1 % low). VDDIO2 within a few hundredths of a volt of VDD means it's very likely tied to VDD on this board. Clearly lower, or near 0 V, means a separate rail or nothing connected, and the open question in hardware.md stays open with that as one point of evidence. Both read through one ADC and one reference, so the difference is worth more than either value. It's one point on programmer power and says nothing about VDDIO2 with the cell in and the boost converter pulling on it | Part of "What VDDIO2 is connected to" |
 
 ## Stage 5, the ramp
 

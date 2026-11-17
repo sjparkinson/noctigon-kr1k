@@ -140,6 +140,7 @@ mod tests {
             adc_dead: true,
             vddio2: false,
             adc_stuck: Some(6140),
+            vddio2_level: Some(330),
         };
         let world = World::from(scene);
         assert_eq!(world.scene, scene);

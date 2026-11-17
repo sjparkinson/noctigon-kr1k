@@ -163,7 +163,9 @@
 //! 5. An ADC that never finishes a conversion, from a click to ten seconds
 //!    later, when the light has to be off (`adc_never_answers`). One stuck
 //!    on a good cell's reading for every input, ground included, when the
-//!    light has to fade out as a fault (`adc_stuck`). The cell
+//!    light has to fade out as a fault (`adc_stuck`). The cell and VDDIO2
+//!    read with the light off, which have to land in SRAM where `cargo xtask
+//!    peek` reads them, and stay put while it's lit (`supplies_kept`). The cell
 //!    falling under the hard floor with the light at the top of the ramp, on
 //!    each tick of the ADC's round, when PC1 has to be low within 12 ticks
 //!    (`cell_collapses`). Twenty thousand ticks with the switch held down
@@ -206,7 +208,7 @@ use kr1k::TICKS_PER_SECOND;
 use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
-use kr1k::sensors::{CYCLE_TICKS, Channel};
+use kr1k::sensors::{CYCLE_TICKS, Channel, SUPPLIES_AT, Supplies};
 use kr1k::testing::{self, Action, Example, Rig, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{CLOCK_HZ, FEED_TICKS, Feeder, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS};
@@ -228,12 +230,12 @@ use crate::world::{CALIBRATION, FUSE_NAMES, World};
 // since anything hand-written in src/regs.rs is the firmware's choice.
 use kr1k::regs::{
     self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_GND, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10,
-    ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN, ADC_SAMPNUM,
-    ADC_SAMPNUM_ACC4, ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, CRCSCAN_SRC_FLASH,
-    DAC_ENABLE, DAC_OUTEN, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN, RSTCTRL_PORF,
-    RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE, VREF_REFSEL_1V024,
-    VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY, WDT_WINDOW,
-    addr as reg,
+    ADC_MUXPOS_VDDIO2DIV10, ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN,
+    ADC_SAMPNUM, ADC_SAMPNUM_ACC4, ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK,
+    CRCSCAN_SRC_FLASH, DAC_ENABLE, DAC_OUTEN, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN,
+    RSTCTRL_PORF, RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE,
+    VREF_REFSEL_1V024, VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY,
+    WDT_WINDOW, addr as reg,
 };
 
 const CCP_IOREG: u8 = regs::CPU_CCP_IOREG;
@@ -460,6 +462,15 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     // What `cargo xtask hex` and `flash` write.
     let signed = crc::sign(&image, &stamp::TEST)?;
     let reset = symbol(elf, "__reset")?;
+    // `cargo xtask peek` reads the supply readings at a fixed address.
+    let supplies = symbol(elf, "SUPPLIES")?;
+    if supplies != DATA_SPACE + SUPPLIES_AT as u32 {
+        return Err(format!(
+            "SUPPLIES is at {supplies:#08x}, not at {:#08x}, where `cargo xtask peek` reads it \
+             (kr1k::sensors::SUPPLIES_AT)",
+            DATA_SPACE + SUPPLIES_AT as u32
+        ));
+    }
 
     // A chip that's just had its cell put in, run to the end of startup.
     let power_on = || -> Result<Sim, String> {
@@ -499,11 +510,12 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     // in this order, whichever thread finishes first. The last four come last
     // since they ramp and click through the UI with the light on, so they'd
     // catch many a mistake as a wrong output before the run that names it.
-    let faults: [(FaultCheck, &str); 6] = [
+    let faults: [(FaultCheck, &str); 7] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
         (adc_never_answers, "with a dead ADC"),
         (adc_stuck, "with the ADC stuck on one reading"),
+        (supplies_kept, "keeping the supply readings"),
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
@@ -895,6 +907,86 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
             "the light isn't out as a fault and staying so from 2 s after the ADC stuck \
              ({:?} at {out})",
             ticks.get(out)
+        ));
+    }
+    Ok(())
+}
+
+/// What the firmware keeps at `kr1k::sensors::SUPPLIES_AT` for `cargo xtask
+/// peek`, against what the world's VDDIO2 / 10 and VDD / 10 read. A second
+/// with VDDIO2 at 3.30 V and the cell at 4.00 V, which the power-on check
+/// reads. Then five minutes with VDDIO2 tied to a 3.60 V cell, which the
+/// next check at rest reads. Then a click on, with VDDIO2 dropping to 2.00 V
+/// once the light's lit, which nothing reads, since VDDIO2 is only read with
+/// the light off. Firmware and library in step, and the library's
+/// `Torch::supplies` has to say the same as the firmware's SRAM at the end of
+/// each.
+fn supplies_kept(mut sim: Sim, report: &mut Report) -> Result<(), String> {
+    let quiet = |ticks: u32, cell: u16, vddio2_level: Option<u16>| {
+        iter::repeat_n(
+            Sample {
+                pressed: false,
+                scene: Scene {
+                    cell,
+                    vddio2_level,
+                    ..Scene::NORMAL
+                },
+            },
+            ticks as usize,
+        )
+    };
+    let second = u32::from(TICKS_PER_SECOND);
+    let click = testing::samples([Action::Cell(360), Action::Clicks(1)]);
+    let samples = quiet(second, 400, Some(330))
+        .chain(quiet(301 * second, 360, None))
+        .chain(click)
+        .chain(quiet(second, 360, Some(200)));
+    // The firmware's four bytes, and the library's, at the end of each part.
+    let marks = [second as usize, 302 * second as usize];
+    let seen = std::cell::RefCell::new(Vec::new());
+    let mut shadow = Rig::default();
+    let samples = samples.enumerate().map(|(tick, sample)| {
+        shadow.tick_in(sample.pressed, &sample.scene);
+        if marks.contains(&(tick + 1)) {
+            seen.borrow_mut().push(shadow.supplies());
+        }
+        sample
+    });
+    let end = in_step(&mut sim, samples, report)?;
+    if end == Some(0) {
+        return Err("the click didn't light it".into());
+    }
+    let at = SUPPLIES_AT - usize::from(SRAM.start);
+    let kept = sim
+        .chip
+        .sram
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .map(Supplies::from_bytes)
+        .ok_or("SUPPLIES_AT isn't in SRAM")?;
+    let reading = testing::voltage_reading;
+    let want = [
+        Supplies {
+            cell: reading(400),
+            vddio2: reading(330),
+        },
+        Supplies {
+            cell: reading(360),
+            vddio2: reading(360),
+        },
+    ];
+    let seen = seen.into_inner();
+    if seen != want {
+        return Err(format!(
+            "the library kept {seen:?} at the end of the first two parts, not {want:?}"
+        ));
+    }
+    if shadow.supplies() != want[1] || kept != want[1] {
+        return Err(format!(
+            "lit, the library has {:?} and the firmware's SRAM {kept:?}, where both should \
+             still be the last reading with the light off, {:?}",
+            shadow.supplies(),
+            want[1]
         ));
     }
     Ok(())
@@ -2915,6 +3007,12 @@ impl Chip {
             // It reads `testing::GROUND_READING`, the worst offset table
             // 38-24 allows, since a single-ended result can't go under 0.
             (ADC_MUXPOS_GND, VREF_REFSEL_1V024) => Channel::Ground,
+            // VDDIO2 / 10, which section 33.5.7 names and says nothing more
+            // about. It reads the world's VDDIO2, the cell unless a run says
+            // otherwise, and 0 with VDDIO2 missing, which the datasheet
+            // doesn't say either, so it's the reading furthest from a rail
+            // that's there.
+            (ADC_MUXPOS_VDDIO2DIV10, VREF_REFSEL_1V024) => Channel::Vddio2,
             (ADC_MUXPOS_TEMPSENSE, VREF_REFSEL_2V048) => {
                 // Section 33.3.3.8 wants at least 25 µs of INITDLY and 28 µs
                 // of SAMPLEN, in ADC clocks.
@@ -2932,12 +3030,13 @@ impl Chip {
             _ => {
                 return Err(format!(
                     "converts MUXPOS {muxpos:#04x} against VREF.ADC0REF {reference:#04x}; the \
-                     simulator only models VDD / 10 and ground against 1.024 V and the \
-                     temperature sensor against 2.048 V"
+                     simulator only models VDD / 10, VDDIO2 / 10 and ground against 1.024 V \
+                     and the temperature sensor against 2.048 V"
                 ));
             }
         };
         let setup = Some((muxpos, reference));
+        // VDDIO2 / 10 with VDDIO2 missing reads 0 (`Scene::reading` has why).
         self.adc.result = if self.adc.last_setup == setup {
             self.world.reading(channel)
         } else {
@@ -4920,12 +5019,12 @@ mod tests {
             (
                 reg::VREF_ADC0REF,
                 VREF_REFSEL_2V048,
-                "VDD / 10 and ground against 1.024 V",
+                "VDD / 10, VDDIO2 / 10 and ground against 1.024 V",
             ),
             (
                 reg::ADC0_MUXPOS,
                 regs::ADC_MUXPOS_AIN1,
-                "VDD / 10 and ground against 1.024 V",
+                "VDD / 10, VDDIO2 / 10 and ground against 1.024 V",
             ),
         ] {
             let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);
@@ -5919,14 +6018,15 @@ mod tests {
     fn a_failed_run_says_which_it_was_and_whether_interrupts_were_landing() {
         let power_on = || Ok(ticking());
         let failed = "the library says power down, but the firmware idled";
-        // Ticks 0 and 1 read the cell, the check every torch makes on its
-        // first tick, so the library idles too. Tick 2's the first it rests.
+        // Ticks 0 to 3 read the cell and VDDIO2, the check every torch makes
+        // on its first tick, so the library idles too. Tick 4's the first it
+        // rests.
         let err = run(&power_on, None, Landing::Watch).err().unwrap();
-        assert_eq!(err, format!("random switching: tick 2: {failed}"));
+        assert_eq!(err, format!("random switching: tick 4: {failed}"));
         let err = run(&power_on, None, Landing::Until(5)).err().unwrap();
         assert_eq!(
             err,
-            format!("with interrupts mid-pass: random switching: tick 2: {failed}")
+            format!("with interrupts mid-pass: random switching: tick 4: {failed}")
         );
 
         let example = spec::examples(spec::UI_MD)

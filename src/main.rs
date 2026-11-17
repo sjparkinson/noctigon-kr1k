@@ -65,6 +65,7 @@ extern "C" fn main() -> ! {
 
     let mut torch = Torch::new(hw::temperature_calibration(), faults);
     let mut output_changes = Changes::new();
+    let mut supply_changes = Changes::new();
     let mut aux = Aw2016::new();
     let mut feeder = Feeder::new();
 
@@ -85,6 +86,12 @@ extern "C" fn main() -> ! {
 
         if let Some(convert) = torch.convert() {
             hw::adc_start(convert);
+        }
+
+        // The cell and VDDIO2 as last read with the light off, kept for
+        // `cargo xtask peek`. Nothing reads them back.
+        if let Some(supplies) = supply_changes.update(torch.supplies()) {
+            hw::record_supplies(supplies.to_bytes());
         }
 
         // The aux before the output, so they go dark before the light comes

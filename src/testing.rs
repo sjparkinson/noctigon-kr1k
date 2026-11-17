@@ -177,7 +177,8 @@ impl Adc {
     pub fn start(&mut self, convert: Option<Convert>) {
         let (voltage, temperature, ground) = (self.voltage, self.temperature, self.ground);
         self.start_with(convert, |channel| match channel {
-            Channel::Voltage => voltage,
+            // VDDIO2 reads as the cell here, as if the two were one rail.
+            Channel::Voltage | Channel::Vddio2 => voltage,
             Channel::Temperature => temperature,
             Channel::Ground => ground,
         });
@@ -434,6 +435,11 @@ pub struct Scene {
     /// included, whatever the cell does. `adc:stuck` sets it to the cell's
     /// reading as it stands.
     pub adc_stuck: Option<u16>,
+    /// VDDIO2's voltage in centivolts, as `battery::centivolts` would report
+    /// its VDDIO2 / 10 reading, or `None` for the same as the cell, a board
+    /// with the two tied together. It's what the ADC reads, where
+    /// [`Scene::vddio2`] is MVIO's bit. No script word sets it.
+    pub vddio2_level: Option<u16>,
 }
 
 impl Scene {
@@ -446,6 +452,7 @@ impl Scene {
         adc_dead: false,
         vddio2: true,
         adc_stuck: None,
+        vddio2_level: None,
     };
 
     /// What the power-on checks find, with `fault` standing for a fuse that
@@ -466,6 +473,12 @@ impl Scene {
         }
         match channel {
             Channel::Voltage => voltage_reading(self.cell),
+            // With MVIO saying VDDIO2 is missing, it reads 0. DS40002413B
+            // doesn't say what VDDIO2 / 10 reads then (sections 19.3.2.2 and
+            // 33.5.7), so this is the reading furthest from a rail that's
+            // there.
+            Channel::Vddio2 if !self.vddio2 => 0,
+            Channel::Vddio2 => voltage_reading(self.vddio2_level.unwrap_or(self.cell)),
             Channel::Temperature => temperature_reading(self.kelvin),
             Channel::Ground => GROUND_READING,
         }
@@ -1099,6 +1112,7 @@ mod tests {
             adc_dead: false,
             vddio2: true,
             adc_stuck: None,
+            vddio2_level: None,
         };
         let mut samples = samples(script).peekable();
         assert!(samples.peek().is_some());

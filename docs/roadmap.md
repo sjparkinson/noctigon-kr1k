@@ -17,7 +17,7 @@ This repo started as TS26 firmware and is being ported to the KR1K, so the TS26'
 - [ ] Read the PCB code, measure the pads' pitch, and check the pads' order with a multimeter
 - [x] Ping, back up and flash the KR1K with `xtask`, with only the plain 4.5 V UPDI kit, and the first-light image first. All three on 2026-11-16. The backup matched avrdude's, the first-light flash verified, and the chip answered `ping` after it
 - [ ] Disassemble `backup/stock`, and check what docs/hardware.md takes from the stock firmware's source against what the stock build really writes to PC1, the DAC, VREF and the ADC
-- [ ] Find out what VDDIO2 is connected to, since PC1 is on it. It reads present on programmer power (`peek`, 2026-11-16); the rail and its behaviour on the cell are still unknown
+- [ ] Find out what VDDIO2 is connected to, since PC1 is on it. It reads present on programmer power (`peek`, 2026-11-16); the rail and its behaviour on the cell are still unknown. The firmware now reads VDDIO2 / 10 next to VDD / 10 with the light off and `peek` prints both (row 4.8 of docs/breakout.md), but nobody has taken the reading
 - [ ] Check the enable, DAC and path sequencing on the real light. Does it come on cleanly, with no flash at turn-on?
 - [ ] Measure what DAC value, path and reference do to output, so the ramp has something to stand on
 

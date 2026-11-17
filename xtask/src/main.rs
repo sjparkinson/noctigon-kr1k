@@ -310,7 +310,20 @@ fn ping(port: &str) -> Result<(), String> {
 /// The addresses are the firmware's own, from src/regs.rs. src/regs.rs has no
 /// stack pointer, since the firmware never touches it, so that comes from the
 /// simulated CPU's.
+///
+/// It also decodes the last readings of the cell and of VDDIO2 that the
+/// firmware keeps at `kr1k::sensors::SUPPLIES_AT`, both taken with the light
+/// off ([`supply_lines`]). Those are SRAM, which the dump shows too.
 fn peek(port: &str) -> Result<(), String> {
+    for line in peek_from(|| open(port))? {
+        println!("{line}");
+    }
+    Ok(())
+}
+
+/// `peek`, with opening the port left to `open`, so the tests can hand it
+/// the fake chip. Gives back the lines to print.
+fn peek_from<W: Wire>(open: impl FnOnce() -> Result<W, String>) -> Result<Vec<String>, String> {
     use kr1k::regs::addr;
     let registers = [
         ("RSTCTRL.RSTFR", addr::RSTCTRL_RSTFR),
@@ -336,9 +349,10 @@ fn peek(port: &str) -> Result<(), String> {
         ("RTC.PITCTRLA", addr::RTC_PITCTRLA),
     ];
 
-    let mut p = connect(port)?;
+    let mut p = Programmer::connect(open()?)?;
+    let mut lines = Vec::new();
     for (name, at) in registers {
-        println!("{name:20} {:02X}", p.read(at as u16, 1)?[0]);
+        lines.push(format!("{name:20} {:02X}", p.read(at as u16, 1)?[0]));
     }
     let sram = p.read(
         elf::SRAM.start,
@@ -346,11 +360,61 @@ fn peek(port: &str) -> Result<(), String> {
     )?;
     p.disconnect()?;
 
-    println!("SRAM");
+    let at = kr1k::sensors::SUPPLIES_AT - usize::from(elf::SRAM.start);
+    let supplies: [u8; 4] = sram
+        .get(at..at + 4)
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("SUPPLIES_AT isn't in SRAM")?;
+    lines.extend(supply_lines(supplies));
+    lines.push("SRAM".into());
     for line in runs(elf::SRAM.start, &sram) {
-        println!("  {line}");
+        lines.push(format!("  {line}"));
     }
-    Ok(())
+    Ok(lines)
+}
+
+/// The firmware's last readings of the cell (VDD / 10) and VDDIO2 (VDDIO2 /
+/// 10), from the four bytes at `kr1k::sensors::SUPPLIES_AT`, as volts, raw
+/// sums and the difference. Both go through `battery::centivolts`, so both
+/// get the stock firmware's slope of 1014, which is for VDD and is assumed for
+/// VDDIO2. They share the ADC and its 1.024 V reference, whose ±4 % moves both
+/// the same way, so the difference says more than either. Both zero is the
+/// firmware not having read them since it started.
+fn supply_lines(bytes: [u8; 4]) -> Vec<String> {
+    use kr1k::battery::centivolts;
+    let supplies = kr1k::sensors::Supplies::from_bytes(bytes);
+    let mut lines = vec![format!(
+        "supplies at {:04X}, last read with the light off",
+        kr1k::sensors::SUPPLIES_AT
+    )];
+    if supplies == kr1k::sensors::Supplies::default() {
+        lines.push("  none read since the chip started".into());
+        return lines;
+    }
+    let volts = |cv: u16| format!("{}.{:02} V", cv / 100, cv % 100);
+    let (cell, vddio2) = (centivolts(supplies.cell), centivolts(supplies.vddio2));
+    lines.push(format!(
+        "  VDD     {:>8}  raw {:5}",
+        volts(cell),
+        supplies.cell
+    ));
+    lines.push(format!(
+        "  VDDIO2  {:>8}  raw {:5}",
+        volts(vddio2),
+        supplies.vddio2
+    ));
+    let (diff, raw) = (
+        i32::from(vddio2) - i32::from(cell),
+        i32::from(supplies.vddio2) - i32::from(supplies.cell),
+    );
+    let sign = if diff < 0 { "-" } else { "+" };
+    let diff = diff.unsigned_abs();
+    lines.push(format!(
+        "  VDDIO2 - VDD  {sign}{}.{:02} V  raw {raw:+}",
+        diff / 100,
+        diff % 100
+    ));
+    lines
 }
 
 /// `bytes` as one line per run of equal bytes, so a pattern and where it stops
@@ -665,9 +729,68 @@ mod tests {
     use super::updi::tests::fake::Dd20;
     use super::updi::{Programmer, SerialNumber};
     use super::{
-        backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, runs, signed, stamp,
-        this_boards_hex, write,
+        backup_from, commas, crc, ihex, peek_from, program, read_hex, restore_onto, row, runs,
+        signed, stamp, supply_lines, this_boards_hex, write,
     };
+    use kr1k::sensors::{SUPPLIES_AT, Supplies};
+    use kr1k::testing::voltage_reading;
+
+    /// A fake chip whose firmware has kept `supplies` where the real one
+    /// does.
+    fn kept(supplies: Supplies) -> Dd20 {
+        let mut dd = Dd20::new();
+        let at = SUPPLIES_AT - kr1k::regs::mem::INTERNAL_SRAM_START;
+        dd.sram[at..at + 4].copy_from_slice(&supplies.to_bytes());
+        dd
+    }
+
+    #[test]
+    fn peek_shows_the_supplies_the_firmware_kept_in_volts_and_raw() {
+        let mut dd = kept(Supplies {
+            cell: voltage_reading(380),
+            vddio2: voltage_reading(330),
+        });
+        let lines = peek_from(on(&mut dd)).unwrap();
+        let at = lines
+            .iter()
+            .position(|line| line.starts_with("supplies at 7000"))
+            .unwrap();
+        assert_eq!(
+            lines[at + 1..at + 4],
+            [
+                "  VDD       3.80 V  raw  6132",
+                "  VDDIO2    3.30 V  raw  5324",
+                "  VDDIO2 - VDD  -0.50 V  raw -808",
+            ]
+        );
+        // It only read, so the firmware's left running, and UPDI's off.
+        assert_eq!(dd.stores_in, 0);
+        assert!(dd.updi_disabled);
+        // And the SRAM dump still follows, with the four bytes in it.
+        assert!(lines.iter().any(|line| line == "SRAM"));
+        // 6132 is 0x17F4, low byte first.
+        assert!(lines.iter().any(|line| line.starts_with("  7000 F4 x1")));
+    }
+
+    #[test]
+    fn peek_says_when_the_two_agree_and_when_nothing_has_been_read() {
+        let same = voltage_reading(445);
+        let lines = supply_lines(
+            Supplies {
+                cell: same,
+                vddio2: same,
+            }
+            .to_bytes(),
+        );
+        assert_eq!(lines[3], "  VDDIO2 - VDD  +0.00 V  raw +0");
+        let lines = peek_from(on(&mut Dd20::new())).unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "  none read since the chip started"),
+            "{lines:?}"
+        );
+    }
 
     /// A directory of the test's own under the system's temporary one, gone
     /// again when the test's done with it.

@@ -7,7 +7,7 @@ use crate::button::{Clicks, Event};
 use crate::limits::{Health, Limits};
 use crate::ramp::{self, Output};
 use crate::selftest::Faults;
-use crate::sensors::Convert;
+use crate::sensors::{Convert, Supplies};
 use crate::temp::Calibration;
 use crate::ui::{Aux, Mode, Ui};
 
@@ -200,6 +200,13 @@ impl Torch {
         self.limits.health()
     }
 
+    /// The last readings of the cell and VDDIO2 with the light off, for the
+    /// firmware to keep where `cargo xtask peek` can read them. Nothing acts
+    /// on them.
+    pub const fn supplies(&self) -> Supplies {
+        self.limits.supplies()
+    }
+
     /// The conversion to start on the ADC after this tick, if any.
     pub const fn convert(&self) -> Option<Convert> {
         self.limits.convert()
@@ -283,6 +290,10 @@ mod tests {
     use std::vec::Vec;
 
     const UI_MD: &str = include_str!("../docs/ui.md");
+
+    /// Ticks a check of the cell stays awake, the cell's two conversions and
+    /// VDDIO2's two.
+    const CHECK_AWAKE: u16 = 4;
 
     fn dim() -> Output {
         ramp::output(ON_LEVEL)
@@ -486,23 +497,25 @@ mod tests {
     }
 
     /// One check, from the first tick of rest, the way every check after
-    /// power-on goes. Two ticks awake and the third resting again.
+    /// power-on goes. Four ticks awake, the cell then VDDIO2, and the fifth
+    /// resting again.
     fn assert_a_check(torch: &mut Rig, why: &str) {
+        let convert = |channel, setup| Some(Convert { channel, setup });
+        for (tick, started) in [
+            convert(Channel::Voltage, true),
+            convert(Channel::Voltage, false),
+            convert(Channel::Vddio2, true),
+            convert(Channel::Vddio2, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            torch.tick(false);
+            assert!(!torch.resting(), "{why}: the check's tick {tick}");
+            assert_eq!(torch.convert(), started, "{why}: tick {tick}");
+        }
         torch.tick(false);
-        assert!(!torch.resting(), "{why}: the check's first tick");
-        assert_eq!(
-            torch.convert(),
-            Some(Convert {
-                channel: Channel::Voltage,
-                setup: true
-            }),
-            "{why}"
-        );
-        torch.tick(false);
-        assert!(!torch.resting(), "{why}: the check's second tick");
-        assert!(torch.convert().is_some(), "{why}");
-        torch.tick(false);
-        assert!(torch.resting(), "{why}: the reading's in");
+        assert!(torch.resting(), "{why}: the readings are in");
         assert_eq!(torch.convert(), None, "{why}");
     }
 
@@ -530,7 +543,7 @@ mod tests {
     #[test]
     fn a_press_or_the_light_starts_the_five_minutes_again() {
         let mut torch = Rig::default();
-        run(&mut torch, false, 3);
+        run(&mut torch, false, CHECK_AWAKE + 1);
         rest(&mut torch, CHECK_TICKS / 2, "half way");
         // 2C does nothing from off, but the switch reads the cell.
         tap(&mut torch, 2, Event::Click(2));
@@ -560,7 +573,7 @@ mod tests {
             checks += u32::from(resting && !torch.resting());
             resting = torch.resting();
         }
-        // One at power-on and one every five minutes and two ticks after.
+        // One at power-on and one every five minutes and four ticks after.
         assert_eq!(checks, 864);
     }
 
@@ -617,7 +630,7 @@ mod tests {
         assert_eq!(torch.aux(), Aux::Off);
         torch.adc.voltage = voltage_reading(380);
         let ticks = next_check(&mut torch);
-        assert!(ticks <= u32::from(CHECK_TICKS) + 3, "{ticks}");
+        assert!(ticks <= u32::from(CHECK_TICKS + CHECK_AWAKE) + 1, "{ticks}");
         assert_eq!(torch.aux(), Aux::Blue);
     }
 
@@ -791,13 +804,13 @@ mod tests {
     #[test]
     fn a_check_whose_result_never_comes_still_ends() {
         let mut torch = Rig::default();
-        run(&mut torch, false, 3);
+        run(&mut torch, false, CHECK_AWAKE + 1);
         torch.adc.voltage = voltage_reading(320);
         next_check(&mut torch);
         assert_eq!(torch.aux(), Aux::Off);
         rest(&mut torch, CHECK_TICKS - 1, "to the next check");
         // No result at all, which reads as zero.
-        for _ in 0..2 {
+        for _ in 0..CHECK_AWAKE {
             torch.torch.tick(false, None, true);
             assert!(!torch.resting());
         }
@@ -824,7 +837,7 @@ mod tests {
         }
         torch.adc.voltage = voltage_reading(380);
         let ticks = next_check(&mut torch);
-        assert!(ticks <= u32::from(CHECK_TICKS) + 3, "{ticks}");
+        assert!(ticks <= u32::from(CHECK_TICKS + CHECK_AWAKE) + 1, "{ticks}");
         assert_eq!(torch.torch.limits.health(), Health::Good, "with no press");
         assert_eq!(torch.aux(), Aux::Blue);
         assert_eq!(torch.level(), 0, "and still off");
@@ -866,7 +879,7 @@ mod tests {
         let (mut read, mut not) = (0, 0);
         for down in HOLD_TICKS + 1..HOLD_TICKS + 17 {
             let mut torch = Rig::default();
-            run(&mut torch, false, 3);
+            run(&mut torch, false, CHECK_AWAKE + 1);
             torch.adc.voltage = voltage_reading(320);
             run(&mut torch, true, down - 1);
             assert_eq!(torch.aux(), Aux::Off, "{down}");
@@ -877,7 +890,12 @@ mod tests {
                 .convert()
                 .is_some_and(|c| c.channel == Channel::Voltage);
             assert_eq!(torch.tick(false), Some(Event::Release { clicks: 0 }));
-            run(&mut torch, false, 2);
+            // VDDIO2's turn may follow the voltage's, so up to four more.
+            for _ in 0..4 {
+                if !torch.resting() {
+                    torch.tick(false);
+                }
+            }
             assert!(torch.resting(), "{down}");
             let aux = if running { Aux::Blue } else { Aux::Off };
             assert_eq!(torch.aux(), aux, "{down}");
@@ -1065,7 +1083,7 @@ mod tests {
     #[test]
     fn a_stuck_adc_at_rest_is_never_a_fault() {
         let mut torch = Rig::default();
-        run(&mut torch, false, 3);
+        run(&mut torch, false, CHECK_AWAKE + 1);
         torch.adc.stuck(voltage_reading(380));
         for _ in 0..12 {
             next_check(&mut torch);
@@ -1456,16 +1474,16 @@ mod tests {
     #[test]
     fn vddio2_lost_at_rest_is_a_fault_at_the_next_check_of_the_cell() {
         let mut torch = Rig::default();
-        run(&mut torch, false, 3);
+        run(&mut torch, false, CHECK_AWAKE + 1);
         torch.vddio2 = false;
         rest(&mut torch, CHECK_TICKS - 1, "to the next check");
         assert_eq!(torch.torch.limits.health(), Health::Good);
         torch.tick(false);
         assert_eq!(torch.torch.limits.health(), Health::Fault);
         assert_eq!(torch.aux(), Aux::White, "from the check");
-        // The check's own conversions are read out, then it rests, and
-        // there are no more checks.
-        run(&mut torch, false, 2);
+        // The check's own conversions, the cell's and VDDIO2's, are read
+        // out, then it rests, and there are no more checks.
+        run(&mut torch, false, CHECK_AWAKE);
         assert!(torch.resting());
         run(&mut torch, false, SHOW_TICKS);
         assert_eq!(torch.aux(), Aux::Off);
@@ -1882,7 +1900,7 @@ mod tests {
             let event = rig.torch.tick(pressed, result, vddio2);
             rig.adc
                 .start_with(rig.torch.convert(), |channel| match channel {
-                    Channel::Voltage => cell.read(rng),
+                    Channel::Voltage | Channel::Vddio2 => cell.read(rng),
                     Channel::Temperature => head.read(rng),
                     // An ADC that reads garbage for the cell reads it for
                     // ground too. Otherwise ground's near zero.
@@ -2077,7 +2095,8 @@ mod tests {
                 check!(t, rig.convert().is_none(), "resting with the ADC busy");
             }
             // A check of the cell is due after enough rest, never with a
-            // fault, and takes two ticks awake before it rests again.
+            // fault, and takes four ticks awake, the cell and VDDIO2, before
+            // it rests again.
             if resting_before && !pressed {
                 check!(t, event.is_none(), "an event with the switch up");
                 if model.check_in == 0 && health_before != Health::Fault {
@@ -2100,8 +2119,9 @@ mod tests {
                     seen.vddio2_missing_unseen += u32::from(!vddio2 && health == Health::Good);
                 }
             }
+            let awake = u32::from(CHECK_AWAKE);
             let checking =
-                model.checked_at != 0 && t - model.checked_at <= 2 && up > t - model.checked_at;
+                model.checked_at != 0 && t - model.checked_at <= awake && up > t - model.checked_at;
             if checking {
                 check!(t, level == 0, "lit by a check");
                 check!(
@@ -2111,7 +2131,8 @@ mod tests {
                         || (!vddio2 && health == Health::Fault),
                     "a check took it from {health_before:?} to {health:?}"
                 );
-                check!(t, resting == at_a_check, "two ticks awake, then rest");
+                let rests = t == model.checked_at + awake;
+                check!(t, resting == rests, "four ticks awake, then rest");
                 if at_a_check && (health_before, health) == (Health::Flat, Health::Good) {
                     seen.charged_at_a_check += 1;
                 }
@@ -2123,7 +2144,10 @@ mod tests {
             if resting_before && pressed {
                 check!(t, rig.convert().is_some(), "a press that reads nothing");
             }
-            if up > u32::from(RELEASE_TICKS) + 2 && level == 0 && !checking {
+            // A conversion that's running as the torch goes quiet is seen
+            // through, and VDDIO2's turn can follow the voltage's, so up to
+            // four ticks.
+            if up > u32::from(RELEASE_TICKS + CHECK_AWAKE) && level == 0 && !checking {
                 check!(t, resting, "nothing to do and not resting");
             }
             seen.blue_dark_for_the_cell +=

@@ -546,6 +546,7 @@ fn adc_channel(channel: Channel) {
         Channel::Voltage => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),
         Channel::Temperature => (regs::VREF_REFSEL_2V048, regs::ADC_MUXPOS_TEMPSENSE),
         Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_GND),
+        Channel::Vddio2 => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDIO2DIV10),
     };
     write(reg::VREF_ADC0REF, reference);
     write(reg::ADC0_MUXPOS, muxpos);
@@ -579,6 +580,28 @@ pub fn adc_result() -> Option<u16> {
     let lo = read(reg::ADC0_RES);
     let hi = read(reg::ADC0_RES + 1);
     Some(u16::from_le_bytes([lo, hi]))
+}
+
+/// The last raw readings of the cell and VDDIO2, as
+/// `kr1k::sensors::Supplies::to_bytes` lays them out, for `cargo xtask peek`
+/// to read over UPDI while the firmware runs. It's the firmware's only
+/// static, so it's at the start of .bss, which is the start of SRAM, and
+/// xtask's simulator checks the ELF puts it at `kr1k::sensors::SUPPLIES_AT`.
+/// Startup zeroes it, which `peek` reads as nothing read yet. Nothing in the
+/// firmware reads it back.
+#[unsafe(no_mangle)]
+static mut SUPPLIES: [u8; 4] = [0; 4];
+
+/// Keeps `bytes` in [`SUPPLIES`]. Ordinary SRAM, so errata 2.2.3 doesn't
+/// come into it.
+pub fn record_supplies(bytes: [u8; 4]) {
+    let to = (&raw mut SUPPLIES).cast::<u8>();
+    for (i, byte) in bytes.into_iter().enumerate() {
+        // SAFETY: a volatile byte write inside the 4-byte static, through a
+        // raw pointer, with no reference made. Only the main loop calls
+        // this, and no handler touches it.
+        unsafe { write_volatile(to.wrapping_add(i), byte) }
+    }
 }
 
 /// A 16-bit word of the signature row, which is plain memory in data space.

@@ -24,7 +24,7 @@
 //! left holding the enable to fade with, and the light's level is 0 on the
 //! tick that reads it missing ([`Limits::tick`]).
 //!
-//! One thing does snap it out. While the light's on, every voltage reading
+//! A collapsing cell snaps it out too. While the light's on, every voltage reading
 //! the schedule has, the four-a-second ones and the quick ones between them,
 //! also goes to `battery::Protection::quick`, and two in a row under
 //! `battery::COLLAPSE_BELOW` turn the light off that tick, as a flat cell,
@@ -40,7 +40,7 @@
 use crate::battery::{self, Protection, Verdict};
 use crate::ramp::CEILING;
 use crate::selftest::Faults;
-use crate::sensors::{Convert, Ground, Reading, Schedule};
+use crate::sensors::{Convert, Ground, Reading, Schedule, Supplies};
 use crate::temp::Calibration;
 use crate::thermal::Thermal;
 
@@ -91,6 +91,10 @@ pub struct Limits {
     protection: Protection,
     thermal: Thermal,
     ground: Ground,
+    /// The last four-a-second voltage reading, raw.
+    last_voltage: u16,
+    /// The last pair of supply readings, for the programmer.
+    supplies: Supplies,
     /// Whether the UI was on last tick.
     on: bool,
     /// The level the light's at, as of the last tick.
@@ -118,6 +122,8 @@ impl Limits {
             protection: Protection::new(),
             thermal: Thermal::new(),
             ground: Ground::new(),
+            last_voltage: 0,
+            supplies: Supplies { cell: 0, vddio2: 0 },
             on: false,
             level: 0,
             lit_before: false,
@@ -136,6 +142,12 @@ impl Limits {
     /// [`Step::level`].
     pub const fn level(&self) -> u8 {
         self.level
+    }
+
+    /// The last raw readings of the cell and VDDIO2, taken with the light
+    /// off. A measurement for `cargo xtask peek`, which nothing here acts on.
+    pub const fn supplies(&self) -> Supplies {
+        self.supplies
     }
 
     /// The battery and thermal ceilings right now.
@@ -237,6 +249,7 @@ impl Limits {
                 // Only the four-a-second reading is a sample for the filter
                 // and the holds, and for the aux.
                 if matches!(reading, Some(Reading::Voltage(_))) {
+                    self.last_voltage = raw;
                     if level == 0 && self.level == 0 && !self.lit_before {
                         unloaded = Some(centivolts);
                     }
@@ -258,6 +271,14 @@ impl Limits {
                 if self.ground.reading(raw) {
                     self.fault = true;
                 }
+            }
+            // For the programmer to read and nothing else. It pairs with
+            // the voltage reading two ticks before, from the same round.
+            Some(Reading::Vddio2(raw)) => {
+                self.supplies = Supplies {
+                    cell: self.last_voltage,
+                    vddio2: raw,
+                };
             }
             None => {}
         }
@@ -285,8 +306,10 @@ impl Limits {
         // decides when that light goes out instead.
         let fault = self.fault && (cut || self.level <= 1);
         let flat = !self.fault && self.protection.flat();
-        // A collapse doesn't wait for a fault's fade. It's the one thing
-        // that turns the light off from any level, at once.
+        // A collapse doesn't wait for a fault's fade either. With VDDIO2's
+        // cut, it's one of the two things that turn the light off from any
+        // level, at once. If both come together the fault outranks the flat
+        // cell in `health`.
         let off = on && (fault || flat || collapsed);
         self.lit_before = self.level > 0;
         self.level = if on && !off {
@@ -668,14 +691,21 @@ mod tests {
             run.ui = 50;
             run.adc.voltage = voltage_reading(250);
             let on = run.levels.len();
-            run.ticks(u32::from(LANDING_TICKS) + COLLAPSE_TICKS as u32);
+            // Turned on after the round's tick 2, VDDIO2's turn has the
+            // ADC, and the quick readings wait for the next round.
+            run.ticks(u32::from(CYCLE_TICKS) + COLLAPSE_TICKS as u32);
             let lit = run.levels[on..].iter().take_while(|&&l| l > 0).count();
             assert_eq!(*run.levels.last().unwrap(), 0, "on at {at}");
             assert_eq!(run.limits.health(), Health::Flat, "on at {at}");
             took.push(lit);
         }
-        // Never before the third and fourth ticks' conversions are both in.
+        // Never before the third and fourth ticks' conversions are both in,
+        // and never later than the next round's third reading.
         assert_eq!(took.iter().min(), Some(&4));
+        assert!(
+            *took.iter().max().unwrap() <= usize::from(CYCLE_TICKS) + 3,
+            "{took:?}"
+        );
     }
 
     #[test]

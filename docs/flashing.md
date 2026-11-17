@@ -108,7 +108,7 @@ Step 1 is the only check on the chip before the erase, and the signature only sa
 
 A flash doesn't power-cycle the chip, so take the probe off and leave it a few seconds before putting the cell in, so VDD really collapses.
 
-If the light goes dark after a flash that verified, run `cargo xtask peek /dev/cu.usbserial-XXXX` before anything else. It reads the running chip's registers and SRAM, which shows how far the firmware got, and finishes with the same reset as `ping`, so only the first run shows anything. If it talks, flash the first-light image again. A light that comes back points at the firmware, and one that doesn't points at the board.
+If the light goes dark after a flash that verified, run `cargo xtask peek /dev/cu.usbserial-XXXX` before anything else. It reads the running chip's registers and SRAM, which shows how far the firmware got, and finishes with the same reset as `ping`, so only the first run shows anything. It also prints the last readings of VDD and VDDIO2 the firmware took with the light off, which it keeps at the start of SRAM, in volts and raw with the difference (row 4.8 of [breakout.md](breakout.md)). Firmware from before those readings leaves other bytes there, so the lines mean nothing on it. If it talks, flash the first-light image again. A light that comes back points at the firmware, and one that doesn't points at the board.
 
 ## Going back
 

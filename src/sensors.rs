@@ -41,6 +41,25 @@
 //! to the temperature. So with the light on the cell goes unread for ten
 //! ticks in every sixteen, 156 ms.
 //!
+//! While the light's off, the voltage's reading tick starts a turn for VDDIO2
+//! instead, a measurement for the programmer to read and nothing more
+//! ([`Supplies`]).
+//!
+//! ```text
+//! tick 2   that result is the voltage, as above. Set the ADC up for
+//!          VDDIO2 / 10 against 1.024 V, start a conversion
+//! tick 3   throw that result away, start another
+//! tick 4   that result is VDDIO2
+//! ```
+//!
+//! It starts on tick 2 rather than 3 because the torch rests as soon as no
+//! conversion is running, and a check of the cell at rest has to stay awake
+//! for it. So a check is four ticks awake rather than two, and the VDDIO2
+//! conversion starts two ticks, 31 ms, after the cell's. It's decided on tick
+//! 2, and once started it finishes, light or not. A light that comes on
+//! partway through gets no quick readings until the next round, since the
+//! ADC is no longer on the voltage.
+//!
 //! After the temperature's turn, lit or not, comes ground's, a check on the
 //! ADC itself ([`Ground`]).
 //!
@@ -92,6 +111,10 @@ pub enum Channel {
     /// the internal 1.024 V reference, as the voltage is, four 12-bit
     /// conversions accumulated, for [`Ground`].
     Ground,
+    /// VDDIO2 / 10 (MUXPOS 0x45, DS40002413B section 33.5.7), the supply
+    /// PC1 hangs off, against the internal 1.024 V reference, as the voltage
+    /// is, four 12-bit conversions accumulated, for [`Supplies`].
+    Vddio2,
 }
 
 /// A conversion for the firmware to start this tick.
@@ -117,6 +140,48 @@ pub enum Reading {
     Quick(u16),
     /// Ground, for [`Ground`].
     Ground(u16),
+    /// VDDIO2 / 10, for [`Supplies`].
+    Vddio2(u16),
+}
+
+/// Where the firmware keeps the last [`Supplies`], a data-space address.
+///
+/// It's for `cargo xtask peek` to read. It's the start of SRAM, where the
+/// linker puts the firmware's only static, and xtask's simulator checks the
+/// ELF has it there.
+pub const SUPPLIES_AT: usize = crate::regs::mem::INTERNAL_SRAM_START;
+
+/// The last raw reading of the cell (VDD / 10) and of VDDIO2 / 10, both
+/// taken with the light off, two ticks apart, against the same 1.024 V
+/// reference.
+///
+/// It's a measurement aid and nothing else. The firmware keeps it at
+/// [`SUPPLIES_AT`] for `cargo xtask peek`, so one programmer session shows
+/// whether VDDIO2, which PC1 hangs off, follows VDD. Nothing in the
+/// firmware compares the two or acts on either. Both zero means nothing's
+/// been read since the chip started.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Supplies {
+    pub cell: u16,
+    pub vddio2: u16,
+}
+
+impl Supplies {
+    /// How [`SUPPLIES_AT`] holds it, each reading low byte first, the cell's
+    /// first.
+    pub const fn to_bytes(self) -> [u8; 4] {
+        let [cell_lo, cell_hi] = self.cell.to_le_bytes();
+        let [io_lo, io_hi] = self.vddio2.to_le_bytes();
+        [cell_lo, cell_hi, io_lo, io_hi]
+    }
+
+    pub const fn from_bytes(bytes: [u8; 4]) -> Self {
+        let [cell_lo, cell_hi, io_lo, io_hi] = bytes;
+        Self {
+            cell: u16::from_le_bytes([cell_lo, cell_hi]),
+            vddio2: u16::from_le_bytes([io_lo, io_hi]),
+        }
+    }
 }
 
 /// Ticks in a full round of every channel, and so how many apart each
@@ -213,6 +278,8 @@ pub struct Schedule {
     /// Whether last tick started a quick voltage conversion, whose result is
     /// due this tick.
     quick: bool,
+    /// Whether VDDIO2's turn is under way this round.
+    vddio2: bool,
     /// The channel the ADC was last set up for, `None` before the first.
     /// Its registers keep their values until a reset, which starts this
     /// afresh too. [`Schedule::rest`] puts it back to `None`, since the
@@ -226,6 +293,7 @@ impl Schedule {
             phase: 0,
             temperature: false,
             quick: false,
+            vddio2: false,
             set_up: None,
         }
     }
@@ -281,15 +349,44 @@ impl Schedule {
                     Channel::Voltage => Reading::Voltage(raw),
                     Channel::Temperature => Reading::Temperature(raw),
                     Channel::Ground => Reading::Ground(raw),
+                    Channel::Vddio2 => Reading::Vddio2(raw),
                 };
                 (Some(reading), None)
             }
             _ => (None, None),
         };
-        // The voltage's turn carries on while the light's on. The ADC is
+        if channel == Channel::Voltage {
+            // VDDIO2's turn, with the light off, decided on the voltage's
+            // reading tick and seen through from there.
+            let vddio2 = |setup| {
+                Some(Convert {
+                    channel: Channel::Vddio2,
+                    setup,
+                })
+            };
+            if step == READING_STEP && !lit {
+                self.vddio2 = true;
+                self.set_up = Some(Channel::Vddio2);
+                return (reading.or(quick), vddio2(true));
+            }
+            if self.vddio2 {
+                return match step {
+                    3 => (quick, vddio2(false)),
+                    _ => {
+                        self.vddio2 = false;
+                        (Some(Reading::Vddio2(raw)), None)
+                    }
+                };
+            }
+        }
+        // The voltage's turn carries on while the light's on, if the ADC is
         // still set up for the voltage, so there's no setup and nothing to
         // throw away.
-        if channel == Channel::Voltage && step >= READING_STEP && lit {
+        if channel == Channel::Voltage
+            && step >= READING_STEP
+            && lit
+            && self.set_up == Some(Channel::Voltage)
+        {
             self.quick = true;
             return (reading.or(quick), convert(false));
         }
@@ -319,13 +416,15 @@ mod tests {
         Some(Convert { channel, setup })
     }
 
-    /// A round with the light off, the voltage then ground, as a press reads
-    /// it.
+    /// A round with the light off, the voltage, VDDIO2 straight after it,
+    /// then ground, as a press reads it.
     fn dark_round() -> [(Option<Reading>, Option<Convert>); 16] {
         let mut expected = [(None, None); 16];
         expected[0].1 = convert(Channel::Voltage, true);
         expected[1].1 = convert(Channel::Voltage, false);
-        expected[2].0 = Some(Reading::Voltage(7));
+        expected[2] = (Some(Reading::Voltage(7)), convert(Channel::Vddio2, true));
+        expected[3].1 = convert(Channel::Vddio2, false);
+        expected[4].0 = Some(Reading::Vddio2(7));
         expected[11].1 = convert(Channel::Ground, true);
         expected[12].1 = convert(Channel::Ground, false);
         expected[13].0 = Some(Reading::Ground(7));
@@ -333,20 +432,47 @@ mod tests {
     }
 
     #[test]
-    fn dark_it_reads_the_voltage_then_ground() {
+    fn dark_it_reads_the_voltage_then_vddio2_then_ground() {
         let mut schedule = Schedule::new();
         assert_eq!(run(&mut schedule, 16, Some(7), false), dark_round());
     }
 
-    /// A check of the cell at rest is the first three ticks of a round and
-    /// a rest, so it never gets to ground's turn.
+    /// A check of the cell at rest is the first five ticks of a round and a
+    /// rest, the cell and VDDIO2 with no ground.
     #[test]
-    fn a_check_at_rest_reads_no_ground() {
+    fn a_check_at_rest_reads_the_cell_and_vddio2_and_no_ground() {
         let mut schedule = Schedule::new();
         for _ in 0..10 {
-            let ticks = run(&mut schedule, 3, Some(7), false);
-            assert_eq!(ticks[..], dark_round()[..3]);
+            let ticks = run(&mut schedule, 5, Some(7), false);
+            assert_eq!(ticks[..], dark_round()[..5]);
+            assert_eq!(ticks[4].1, None, "nothing running, so it rests");
             schedule.rest();
+        }
+    }
+
+    /// VDDIO2 reads against the voltage's reference, and its conversion
+    /// starts two ticks after the cell's, so the two compare.
+    #[test]
+    fn vddio2_is_read_two_ticks_after_the_cell_and_never_while_lit() {
+        let mut schedule = Schedule::new();
+        let ticks = run(&mut schedule, 64, Some(7), false);
+        let started = |channel| {
+            ticks
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, c))| c.is_some_and(|c| c.channel == channel))
+                .map(|(tick, _)| tick)
+                .collect::<Vec<_>>()
+        };
+        for round in 0..4 {
+            let at = 16 * round;
+            assert!(started(Channel::Voltage).contains(&(at + 1)));
+            assert!(started(Channel::Vddio2).contains(&(at + 3)));
+        }
+        let mut schedule = Schedule::new();
+        for (reading, convert) in run(&mut schedule, 160, Some(7), true) {
+            assert!(!matches!(reading, Some(Reading::Vddio2(_))));
+            assert!(convert.is_none_or(|c| c.channel != Channel::Vddio2));
         }
     }
 
@@ -450,28 +576,36 @@ mod tests {
                 (Some(Reading::Quick(9)), None),
                 "out at {out_at}"
             );
+            // VDDIO2's turn is decided on tick 2, so it isn't in the rest of
+            // this round.
             let rest = run(&mut schedule, 15 - out_at, Some(7), false);
-            assert_eq!(rest[..], dark_round()[out_at + 1..], "{out_at}");
+            let mut expected = dark_round();
+            expected[4] = (None, None);
+            assert_eq!(rest[..], expected[out_at + 1..], "{out_at}");
         }
     }
 
+    /// Off, tick 2 always starts VDDIO2's turn, so a light that comes on
+    /// after that waits for the next round's voltage turn for quick
+    /// readings. VDDIO2's turn finishes first, light or not.
     #[test]
-    fn quick_readings_start_with_the_light_partway_through_the_turn() {
-        for on_at in 3..8 {
+    fn a_light_that_comes_on_partway_through_the_round_starts_quick_readings_next_round() {
+        for on_at in 3..16 {
             let mut schedule = Schedule::new();
             run(&mut schedule, on_at, Some(7), false);
-            assert_eq!(
-                schedule.tick(Some(7), true),
-                (None, convert(Channel::Voltage, false)),
+            let lit = run(&mut schedule, 16 - on_at, Some(7), true);
+            assert!(
+                lit.iter()
+                    .all(|(r, c)| !matches!(r, Some(Reading::Quick(_)))
+                        && c.is_none_or(|c| c.channel != Channel::Voltage)),
                 "on at {on_at}"
             );
-            assert_eq!(schedule.tick(Some(9), true).0, Some(Reading::Quick(9)));
+            if on_at <= 4 {
+                assert_eq!(lit[4 - on_at].0, Some(Reading::Vddio2(7)), "on at {on_at}");
+            }
+            let next = run(&mut schedule, 16, Some(9), true);
+            assert_eq!(next[3].0, Some(Reading::Quick(9)), "on at {on_at}");
         }
-        // Not once the voltage's turn is over, when the ADC may have moved.
-        let mut schedule = Schedule::new();
-        run(&mut schedule, 9, Some(7), false);
-        let late = run(&mut schedule, 7, Some(7), true);
-        assert_eq!(late[..], dark_round()[9..]);
     }
 
     #[test]
@@ -526,9 +660,10 @@ mod tests {
                 .filter_map(|(_, convert)| convert.filter(|c| c.setup).map(|c| c.channel))
                 .collect()
         };
-        // Off, the voltage then ground, each set up every round.
+        // Off, the voltage, VDDIO2 and ground, each set up every round.
         let off = run(&mut schedule, 64, Some(1), false);
-        assert_eq!(setups(&off), [Channel::Voltage, Channel::Ground].repeat(4));
+        let round = [Channel::Voltage, Channel::Vddio2, Channel::Ground];
+        assert_eq!(setups(&off), round.repeat(4));
         // On, the temperature between them.
         let on = run(&mut schedule, 64, Some(1), true);
         let round = [Channel::Voltage, Channel::Temperature, Channel::Ground];
@@ -541,9 +676,7 @@ mod tests {
         run(&mut schedule, 21, Some(1), true);
         schedule.rest();
         let ticks = run(&mut schedule, 3, Some(7), false);
-        assert_eq!(ticks[0], (None, convert(Channel::Voltage, true)));
-        assert_eq!(ticks[1], (None, convert(Channel::Voltage, false)));
-        assert_eq!(ticks[2], (Some(Reading::Voltage(7)), None));
+        assert_eq!(ticks[..], dark_round()[..3]);
     }
 
     /// `Schedule` doesn't track whether a conversion is pending. It knows
@@ -571,21 +704,34 @@ mod tests {
                 _ => assert_eq!(reading, None, "phase {phase}"),
             }
         }
-        // And with the light off, nothing but the voltage and ground is
-        // asked for, so every other tick's result is ignored, the
+        // And with the light off, nothing but the voltage, VDDIO2 and ground
+        // is asked for, so every other tick's result is ignored, the
         // temperature's due tick included.
         let mut schedule = Schedule::new();
         for tick in 0..160 {
             let (reading, convert) = schedule.tick(Some(0x155), false);
             match tick % 16 {
                 2 => assert_eq!(reading, Some(Reading::Voltage(0x155))),
+                4 => assert_eq!(reading, Some(Reading::Vddio2(0x155))),
                 13 => assert_eq!(reading, Some(Reading::Ground(0x155))),
                 phase => assert_eq!(reading, None, "phase {phase}"),
             }
-            if (2..11).contains(&(tick % 16)) || tick % 16 >= 13 {
+            if (4..11).contains(&(tick % 16)) || tick % 16 >= 13 {
                 assert_eq!(convert, None, "tick {tick}");
             }
         }
+    }
+
+    #[test]
+    fn supplies_go_to_bytes_low_byte_first_the_cell_first_and_back() {
+        let supplies = Supplies {
+            cell: 0x1234,
+            vddio2: 0x0ABC,
+        };
+        assert_eq!(supplies.to_bytes(), [0x34, 0x12, 0xBC, 0x0A]);
+        assert_eq!(Supplies::from_bytes(supplies.to_bytes()), supplies);
+        assert_eq!(Supplies::default().to_bytes(), [0; 4]);
+        assert_eq!(SUPPLIES_AT, 0x7000);
     }
 
     #[test]

@@ -561,8 +561,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "no-quick-readings",
         file: SENSORS,
-        find: "        if channel == Channel::Voltage && step >= READING_STEP && lit {\n",
-        replace: "        if channel == Channel::Voltage && step >= READING_STEP && lit && false {\n",
+        find: "            && lit\n            && self.set_up == Some(Channel::Voltage)\n",
+        replace: "            && lit\n            && false\n",
         stage: Stage::Simulator,
         expect: "A cell that collapses: expected Off",
     },
@@ -587,6 +587,16 @@ const BREAKAGES: &[Breakage] = &[
         replace: "        Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),\n",
         stage: Stage::Simulator,
         expect: "but the library says",
+    },
+    // The cell's and VDDIO2's readings are kept where `peek` reads them.
+    // This writes zeros there, so `peek` would say nothing's been read.
+    Breakage {
+        name: "supplies-not-kept",
+        file: MAIN,
+        find: "            hw::record_supplies(supplies.to_bytes());\n",
+        replace: "            let _ = supplies;\n            hw::record_supplies([0; 4]);\n",
+        stage: Stage::Simulator,
+        expect: "keeping the supply readings",
     },
     // ... and within an update, a NACK ends it. This tries each transfer
     // until it goes through.

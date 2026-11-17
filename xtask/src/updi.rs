@@ -1887,6 +1887,10 @@ pub(crate) mod tests {
         const FUSES: Range<u32> = data(map::FUSES, map::FUSES_SIZE);
         const LOCK: Range<u32> = data(map::LOCK, map::LOCK_SIZE);
         const USERROW: Range<u32> = data(map::USERROW, map::USERROW_SIZE);
+        const SRAM_SPACE: Range<u32> = span(
+            kr1k::regs::mem::INTERNAL_SRAM_START as u32,
+            kr1k::regs::mem::INTERNAL_SRAM_SIZE,
+        );
         /// SIGROW, all of it, which UPDI can't write (DS table 8-5).
         const SIGROW: Range<u32> = data(map::SIGNATURE, 0x80);
 
@@ -1912,6 +1916,9 @@ pub(crate) mod tests {
         pub struct Dd20 {
             pub flash: Vec<u8>,
             pub eeprom: Vec<u8>,
+            /// SRAM, all 4 KB, which reads 0 until a test fills it. UPDI
+            /// reads it while the firmware runs.
+            pub sram: Vec<u8>,
             pub signature: [u8; 3],
             /// SIGROW.SERNUM0 to SERNUM15. The bytes are made up.
             pub serial: [u8; map::SERIAL_SIZE],
@@ -2037,6 +2044,7 @@ pub(crate) mod tests {
                 Self {
                     flash: vec![0xFF; map::FLASH_SIZE],
                     eeprom: vec![0xFF; map::EEPROM_SIZE],
+                    sram: vec![0; kr1k::regs::mem::INTERNAL_SRAM_SIZE],
                     signature: map::AVR32DD20,
                     serial: [
                         0x37, 0x51, 0x3A, 0x07, 0xC4, 0x19, 0xE2, 0x6D, 0x80, 0x2B, 0xF5, 0x12,
@@ -2340,6 +2348,7 @@ pub(crate) mod tests {
                     _ if FUSES.contains(&addr) => self.fuses[at(&FUSES, addr)],
                     _ if LOCK.contains(&addr) => self.lock[at(&LOCK, addr)],
                     _ if USERROW.contains(&addr) => self.userrow[at(&USERROW, addr)],
+                    _ if SRAM_SPACE.contains(&addr) => self.sram[at(&SRAM_SPACE, addr)],
                     _ => 0,
                 }
             }
