@@ -93,6 +93,8 @@ pub struct Limits {
     ground: Ground,
     /// The last four-a-second voltage reading, raw.
     last_voltage: u16,
+    /// Whether that reading's conversion ran with no load on the cell.
+    last_unloaded: bool,
     /// The last pair of supply readings, for the programmer.
     supplies: Supplies,
     /// Whether the UI was on last tick.
@@ -123,6 +125,7 @@ impl Limits {
             thermal: Thermal::new(),
             ground: Ground::new(),
             last_voltage: 0,
+            last_unloaded: false,
             supplies: Supplies { cell: 0, vddio2: 0 },
             on: false,
             level: 0,
@@ -257,6 +260,10 @@ impl Limits {
         if !settled {
             self.protection.dark();
         }
+        // Whether a reading due now ran with no load on the cell, the light
+        // off on this tick and the two before, since its conversion started
+        // last tick, before that tick's output was set.
+        let quiet = level == 0 && self.level == 0 && !self.lit_before;
         let mut unloaded = None;
         let mut collapsed = false;
         match reading {
@@ -266,7 +273,8 @@ impl Limits {
                 // and the holds, and for the aux.
                 if matches!(reading, Some(Reading::Voltage(_))) {
                     self.last_voltage = raw;
-                    if level == 0 && self.level == 0 && !self.lit_before {
+                    self.last_unloaded = quiet;
+                    if quiet {
                         unloaded = Some(centivolts);
                     }
                     if self.protection.sample(centivolts, level) == Verdict::Blind {
@@ -289,14 +297,17 @@ impl Limits {
                 }
             }
             // For the programmer to read and nothing else. It pairs with
-            // the voltage reading two ticks before, from the same round.
-            Some(Reading::Vddio2(raw)) => {
+            // the voltage reading two ticks before, from the same round, and
+            // only when both ran unloaded. VDDIO2's turn starts with the
+            // light off, but a light that went out or came on partway
+            // through the round would put load sag in one of the two.
+            Some(Reading::Vddio2(raw)) if self.last_unloaded && quiet => {
                 self.supplies = Supplies {
                     cell: self.last_voltage,
                     vddio2: raw,
                 };
             }
-            None => {}
+            Some(Reading::Vddio2(_)) | None => {}
         }
         // PC1 has let go of the driver's enable, so there's no fade to wait
         // for. That's this tick only. The fault it leaves keeps the light
@@ -1189,6 +1200,60 @@ mod tests {
                 adc.start(limits.convert());
                 let read = (due(tick) && tick >= out_at + 2).then_some(380);
                 assert_eq!(step.unloaded, read, "out at {out_at}: tick {tick}");
+            }
+        }
+    }
+
+    /// The pair kept for `cargo xtask peek` is only ever two unloaded
+    /// readings, with the light going out, or coming on, at every point in
+    /// the round. A conversion reads the loaded cell if the light was on on
+    /// its tick or the one before, here 3.00 V against 3.80 V at rest, and
+    /// VDDIO2 reads as the cell. Out on tick 2, the voltage reading that
+    /// comes due then ran lit while VDDIO2's turn starts dark, which is the
+    /// pair that mustn't be kept.
+    #[test]
+    fn the_supplies_kept_are_never_a_loaded_reading() {
+        let (rested, loaded) = (voltage_reading(380), voltage_reading(300));
+        let pair = Supplies {
+            cell: rested,
+            vddio2: rested,
+        };
+        for (lit_from, lit_to) in (64..80)
+            .map(|out| (0, out))
+            .chain((64..80).map(|on| (on, 200)))
+        {
+            let mut limits = Limits::new(CALIBRATION, Faults::NONE);
+            let mut adc = Adc::new();
+            let mut was_lit = false;
+            let mut kept_after = None;
+            for tick in 0..200 {
+                let ui = if (lit_from..lit_to).contains(&tick) {
+                    50
+                } else {
+                    0
+                };
+                limits.tick(ui, adc.result(), true);
+                let lit = limits.level() > 0;
+                adc.voltage = if lit || was_lit { loaded } else { rested };
+                adc.start(limits.convert());
+                was_lit = lit;
+                let kept = limits.supplies();
+                let case = (lit_from, lit_to, tick);
+                assert!(
+                    kept == pair || kept == Supplies::default(),
+                    "{case:?}: {kept:?}"
+                );
+                if kept == pair && tick >= lit_to {
+                    kept_after.get_or_insert(tick);
+                }
+            }
+            // Out for good, the next round's pair is kept.
+            if lit_to < 200 {
+                let kept = kept_after.expect("never kept once the light was out");
+                assert!(
+                    kept <= lit_to + 2 * usize::from(CYCLE_TICKS),
+                    "{lit_to}: {kept}"
+                );
             }
         }
     }
