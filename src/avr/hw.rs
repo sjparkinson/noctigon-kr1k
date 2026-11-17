@@ -38,9 +38,9 @@ use crate::regs::{self, addr as reg};
 
 /// The PORTA pins the firmware drives, the three paths, the button LED and
 /// PA1, which is only ever held low. PA0 (the FET gate, not fitted) and PA2
-/// and PA3 (TWI to the AW2016) are never outputs.
+/// and PA3 (TWI to the AW2016) are never outputs. It's the 0xF2 the stock
+/// build on this torch writes to VPORTA.DIR at reset.
 const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW;
-// The 0xF2 the stock build on this torch writes to VPORTA.DIR at reset.
 const _: () = assert!(PORTA_OUTPUTS == 0xF2);
 /// The PORTC pins the firmware drives, only PC1.
 const PORTC_OUTPUTS: u8 = 1 << ENABLE;
