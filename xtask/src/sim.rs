@@ -1,215 +1,15 @@
 //! A fake AVR32DD20 around `avr.rs`'s CPU, wired up like the KR1K's Lume
-//! X1-C driver, and the checks that run the real firmware on it. `build()` in
-//! main.rs runs them after `layout.rs`'s, so `hex` and `flash` refuse
-//! firmware that fails.
+//! X1-C driver, and the checks that run the real firmware on it.
 //!
-//! This finds mistakes, it doesn't prove anything. Everything here is one
-//! reading of the datasheet, run against code written from that same reading,
-//! and nothing has been compared with a real chip. An earlier torch had a
-//! simulator too, and it didn't save it. The likely cause is the 12 V
-//! programmer or a slipped probe, not proven, and no model of the chip can
-//! see either. A pass means the firmware does what this file thinks it
-//! should.
+//! This finds mistakes and proves nothing. It is one reading of the datasheet
+//! (DS40002413B, errata DS80001026D), run against code written from that same
+//! reading, and has never been compared with a real chip. The board's rules
+//! have no section number, since they come from what the stock firmware does.
 //!
-//! Section numbers are DS40002413B, the AVR32/16DD14/20 datasheet, and the
-//! errata is DS80001026D. It models only the registers the firmware touches,
-//! and turns the rules the real chip enforces quietly into errors. Touching a
-//! register it doesn't model is an error too, so new peripheral code fails
-//! here until the model learns about it.
-//!
-//! # The chip
-//!
-//! - A protected register only takes a write within four instructions of the
-//!   CCP key. Interrupts wait out those four instructions, or until the first
-//!   store or `sleep` (§7.6.1). The protected registers the firmware writes
-//!   are CLKCTRL.OSCHFCTRLA and MCLKCTRLB (§12) and WDT.CTRLA (table 22-1).
-//! - The main clock is the internal oscillator at 4 MHz with no prescaler,
-//!   which is the reset value of both (§12.5.7, §12.5.2), and anything else is
-//!   refused, since every timing here assumes it.
-//! - 16-bit registers go low byte then high byte through a TEMP byte, one per
-//!   peripheral (§8.10.3). TCB0's CNT and CCMP, DAC0's DATA and ADC0's RES
-//!   are the ones the firmware uses. A handler that lands with the main loop
-//!   halfway through one can't touch that peripheral's 16-bit registers.
-//! - Errata 2.2.3: a store with `st`, `std` or `sts` to 64 or over, followed
-//!   straight away by a store under 64 or to SLPCTRL.CTRLA that isn't an
-//!   `out`, loses the second store, so it's an error (`avr.rs` has the
-//!   reading).
-//! - DAC0 converts DATA's top ten bits against VREF.DAC0REF, which this
-//!   firmware sets to 1.024 V or 2.5 V, and its output follows the high
-//!   byte's write (§34.5.2). Its output buffer wants PD6's input buffer off
-//!   (§34.3.1). Power-down turns it off (§34.3.3).
-//! - TWI0's host and the AW2016 on its bus are `twi.rs`'s, which has the
-//!   rules. The host stops in every sleep mode (§29.3.5), so `sleep` with it
-//!   on is refused, idle or power-down.
-//! - TCB0 runs in periodic interrupt mode off the main clock, raising CAPT
-//!   when CNT reaches CCMP and starting again from 0 (§24.3.3.1.1). That's
-//!   taken as CCMP + 1 clocks a period; the datasheet doesn't give the
-//!   count. It halts in power-down (§24.3.6). CAPT goes up with the
-//!   interrupt off too, and the request is the flag and the enable together
-//!   (§24.3.5), so turning the interrupt on wants the flag not to have sat
-//!   through a period uncleared.
-//! - ADC0 only converts as one of the two measurements the firmware makes,
-//!   VDD / 10 against 1.024 V or the temperature sensor against 2.048 V, with
-//!   four 12-bit samples accumulated and a clock between 125 kHz and 2 MHz
-//!   (table 38-25). The temperature sensor wants 25 µs of INITDLY and 28 µs
-//!   of SAMPLEN (§33.3.3.8). Reading RES early, or its high byte first,
-//!   starting mid-conversion or changing its setup mid-conversion are errors,
-//!   and the first conversion after a change of input reads 0. Reading RES
-//!   clears RESRDY (§33.5.12). Power-down wants no conversion running and
-//!   the ADC off (§33.3.8).
-//! - RTC.PITCTRLA isn't written while PITSTATUS.CTRLBUSY is set (§26.13.12),
-//!   and only takes 512 cycles, 64 Hz, or 32,768, 1 Hz. The PIT's flag goes
-//!   up once a period of simulated time, in every sleep mode (§26.9), on the
-//!   prescaler's 64 Hz grid, a slow one on every 64th edge. Where the first
-//!   tick after a change of period lands isn't stated (§26.5.2.2), so a run
-//!   picks aligned, early or late (`testing::PitPhase`). A run can stretch
-//!   the period to the slowest the two oscillators' limits allow, or stop
-//!   the 32 kHz oscillator, which stops the PIT and the watchdog together.
-//! - Every port pin senses asynchronously, so any sense configured in ISC
-//!   wakes the chip from power-down (§18.3.3.1, table 13-4), and so does the
-//!   PIT. TCB0 doesn't, since it's halted. A switch edge raises PD4's flag
-//!   when its ISC asks for that edge (§18.3.3).
-//! - Enabling an interrupt with SREG.I set and its vector going to
-//!   `__unhandled_interrupt` is an error, because the real chip would return
-//!   with the flag still up, forever. So is taking one, except in the run
-//!   that forces one on purpose (`Chip::force_interrupt`). A handler that
-//!   reaches `hw::halt` never returns, so from there it's held to the main
-//!   loop's rules, not a handler's (`Sim::abandon`).
-//! - A handler gives back every register, SREG and SP as it found them, and
-//!   has to fit in a TCB0 period even if every instruction took four clocks.
-//! - `sleep` needs SLPCTRL.SEN, idle or power-down, and an enabled interrupt
-//!   that could wake it. With none at all it's the chip stopping for good
-//!   (§13.3.1), which is `hw::halt`, and it wants SREG.I clear as well
-//!   (`avr.rs`).
-//! - The watchdog's WDT.CTRLA takes the CCP key and isn't written while
-//!   SYNCBUSY is set (§22.3.6), nor ever written 0, and power-down waits for
-//!   it to sync. It's timed in WDT clocks, with the worst case taken where
-//!   the datasheet is silent (`Wdt` has the list). A `wdr` in the closed
-//!   window, or within a clock of it, fails, and so does running out the
-//!   open window, as the real chip would reset either way (§22.3.3). Nothing
-//!   here resets the chip, so a bite is the firmware failing.
-//! - CRCSCAN runs CRC-16-CCITT over all of flash and sets STATUS.OK if it
-//!   comes to 0, which is what a correct checksum in the last two bytes does
-//!   (§30.3.2, `crc.rs`). The firmware runs on the image `cargo xtask hex`
-//!   writes. STATUS.OK reads 1 from reset (§30.5.3), and the scan starts
-//!   three cycles after ENABLE (§30.3.1).
-//! - The fuses read as the world's, and writing any of them is an error.
-//!   SIGROW.TEMPSENSE0 and 1 hold `world::CALIBRATION`. MVIO.STATUS.VDDIO2S
-//!   reads 1 with single supply (§19.3.1), and otherwise says whether the run
-//!   has VDDIO2. When VDDIO2 comes back the MVIO pins reload PORT
-//!   (§19.3.2.1), so PC1 rises then if PORTC has it set, and that's held to
-//!   every rule a rise is. The datasheet gives no VDDIO2S threshold and no
-//!   delay either way, so both are taken as at once.
-//!
-//! # The board
-//!
-//! None of these have a section number. They're the board's, from what the
-//! stock firmware does with it and docs/safety.md, and they hold the firmware
-//! to them.
-//!
-//! - PC1, the boost converter and amplifier enable, only rises with DAC0 on
-//!   and at 0, its reference at 1.024 V, and every power path low. It only
-//!   falls with DAC0 at 0 and its reference back at 1.024 V, which is the
-//!   stock firmware's off order. It's low at the first register write after
-//!   a start that finds it high, and low in power-down. It only rises with
-//!   the PIT at 64 Hz and, once the watchdog's on, the lit window in force
-//!   and a `wdr` since it was written, and the PIT is never slowed with it
-//!   high.
-//! - DAC0 only goes above 0 with PC1 high, at least 8 ms after it rose, which
-//!   is the stock firmware's wait for the boost converter (the only figure
-//!   with any history on this board), and at least 2 µs after its reference
-//!   last changed (table 38-18's tINTREF, typical).
-//! - With PC1 high, the reference and the power paths only change with
-//!   DAC0 at 0. How the paths combine on this board is unknown
-//!   (docs/safety.md, H3), so no change of either is taken as safe with
-//!   DAC0 live. A reference raised to 2.5 V or a path added also wants
-//!   DAC0's output to have had time to fall to 0. That time isn't known for
-//!   this board. Table 38-23 has 7 µs to 10 µs for a full-scale rise into
-//!   50 pF, and the DAC can sink only 0.001 mA, so how fast PD6 falls depends
-//!   on what the board pulls it down with. This takes the 10 µs, which is a
-//!   floor, not a promise. A reference lowered or a path removed, as the off
-//!   order does straight after DAC0 goes to 0, isn't held to the wait.
-//! - PC1, PD4 (the switch, with its own pull-up), PD6 (DAC0's pin), PA1
-//!   and the three paths never get a pull-up. No pin gets INVEN. PA1's
-//!   `OUT` is never set, since the stock build on this torch holds it as an
-//!   output at 0 and what it connects to is unknown (src/board.rs). PA2 and PA3, the
-//!   AW2016's TWI lines, are never driven through PORT and their settings
-//!   never written, since TWI0 takes them over, and nothing in PORTF (reset
-//!   and UPDI) is ever written.
-//! - The aux are never lit while PC1 is high. An AW2016 write that lights
-//!   one with PC1 high is refused, and so is PC1 rising with one lit.
-//! - Without VDDIO2, PC1 is tri-stated, and what the driver's enable does
-//!   then isn't modelled. A pass that took its tick with VDDIO2S already
-//!   clear leaves PC1 clear in PORTC, DAC0 at 0 against 1.024 V and the
-//!   paths low before it sleeps (`Chip::dark_without_vddio2`).
-//! - TCB0, the tick deadline's timer, runs exactly while PC1 is high,
-//!   checked at every `sleep`. Power-down wants PC1 low and TCB0 stopped.
-//! - With the light on and no tick, `hw::wait_for_tick` gives up after
-//!   `watchdog::TICK_DEADLINE_PERIODS` TCB0 periods and `main` halts.
-//!
-//! Time counts instructions, not cycles. A real instruction takes at least
-//! one clock, so a wait the model measures is never longer than the real
-//! one, and a minimum time here is a conservative check. The budgets go the
-//! other way and take every instruction as the slowest, four clocks.
-//!
-//! # The runs
-//!
-//! 1. Reset to `main` with SRAM full of junk, checking .data and .bss come out
-//!    right, then the same startup code with them moved and given contents.
-//! 2. The reset vector again with PC1 already an output and high, as far as
-//!    the first register write, which has to clear it (`found_lit`). Then
-//!    again as far as the first wait for a tick, checking `main` starts up in
-//!    the order it has to (`boot_order`). Then lit, with an interrupt that
-//!    has no handler forced, which has to end in `hw::halt` with the light
-//!    off (`unhandled_interrupt`).
-//! 3. Two seconds lit with every tick at its slowest, which mustn't trip
-//!    `hw::wait_for_tick`'s deadline (`slow_ticks`).
-//! 4. The 32 kHz oscillator stopping with the light on. PC1 has to drop within
-//!    the deadline, and the chip then stop for good in power-down
-//!    (`oscillator_stops`). A tick lost with the oscillator still running ends
-//!    in a watchdog reset instead, which can't run here.
-//! 5. An ADC that never finishes a conversion, from a click to ten seconds
-//!    later, when the light has to be off (`adc_never_answers`). One stuck
-//!    on a good cell's reading for every input, ground included, when the
-//!    light has to fade out as a fault (`adc_stuck`). The cell and VDDIO2
-//!    read with the light off, which have to land in SRAM where `cargo xtask
-//!    peek` reads them, and stay put while it's lit (`supplies_kept`). The cell
-//!    falling under the hard floor with the light at the top of the ramp, on
-//!    each tick of the ADC's round, when PC1 has to be low within 12 ticks
-//!    (`cell_collapses`). Twenty thousand ticks with the switch held down
-//!    from the first (`switch_stuck`). VDDIO2 missing, so the light never
-//!    comes on (`vddio2_missing`), and VDDIO2 going at the top of the ramp,
-//!    straight after the firmware's look, so the light has to be off a tick
-//!    and a pass later and stay off (`vddio2_drops`). The AW2016 never
-//!    answering, SDA held low and SCL
-//!    held low (`bad_bus`).
-//! 6. Every example in docs/ui.md (see `spec.rs`), each on a fresh chip.
-//!    Then long rests between presses, so the tick slows to 1 Hz, once in
-//!    each of the PIT's phases (`resting`), and once more with a switch edge
-//!    put up with every slow tick, which mustn't end the slow sleep after
-//!    that tick's pass (`stale_edges`).
-//! 7. Twenty thousand ticks of random clicks and holds.
-//! 8. Both of those again with a switch bounce, and a TCB0 period ending
-//!    while the light's on, landing on every instruction the main loop
-//!    reaches (`Sim::land`), each as far as the first run kept reaching new
-//!    code, and a little past (`both_ways`).
-//!
-//! All but the first two drive the library's loop alongside the firmware
-//! (`testing::Paced`, the torch, the AW2016's steps and the pacer), and check
-//! the firmware runs a pass exactly where it does, with the same feeds, PIT
-//! period and sleep, and that PC1, DAC0, its reference and the paths show its
-//! output on every tick, the fourth until the oscillator stops. So does the last part of the
-//! second, until the forced interrupt. Those runs hold the AW2016 to the
-//! library's `torch.aux()` too, at the end of every pass (`AuxWatch`): the
-//! colour through the board's channel map, dim or bright, never a wrong one,
-//! dark for at most two ticks while it wakes, and in standby whenever the aux
-//! are off. Three more runs put a fault on the bus, the AW2016 never
-//! answering, SDA held low and SCL held low (`bad_bus`), and the firmware has
-//! to give each update up without hanging or retrying while the light still
-//! follows the library.
-//! `probe` separately runs examples/link.rs, which has real statics,
-//! and `guards` runs examples/guards.rs, which asks src/avr/hw.rs for
-//! power-down with the light on.
+//! Only the registers the firmware touches are modelled, and touching any
+//! other is an error. Chip resets aren't modelled, so a watchdog bite is a
+//! failed run, and nothing analogue is either. Time counts instructions, each
+//! taken as one clock, except the budgets, which take each as four.
 
 use std::iter;
 use std::ops::Range;
@@ -237,10 +37,8 @@ use crate::twi::{Fault, Twi};
 use crate::updi::map;
 use crate::world::{CALIBRATION, FUSE_NAMES, World};
 
-// The registers the chip models, as data-space addresses, and their bits.
-// They're generated from the ATDF (src/regs.rs), so they only move when the
-// ATDF does, never with the firmware. Only the ones the ATDF names go here,
-// since anything hand-written in src/regs.rs is the firmware's choice.
+// Only what the ATDF names goes here, since anything hand-written in
+// src/regs.rs is the firmware's choice.
 use kr1k::regs::{
     self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_GND, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10,
     ADC_MUXPOS_VDDIO2DIV10, ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN,
@@ -252,8 +50,7 @@ use kr1k::regs::{
 };
 
 const CCP_IOREG: u8 = regs::CPU_CCP_IOREG;
-/// CLKCTRL.OSCHFCTRLA at 4 MHz, with AUTOTUNE and RUNSTDBY off, which is
-/// its reset value (§12.5.7).
+/// The reset value (§12.5.7).
 const OSCHF_4MHZ: u8 = regs::CLKCTRL_FRQSEL_4M;
 const ISC_INTDISABLE: u8 = regs::PORT_ISC_INTDISABLE;
 const ISC_BOTHEDGES: u8 = regs::PORT_ISC_BOTHEDGES;
@@ -263,12 +60,8 @@ const ISC_INPUT_DISABLE: u8 = regs::PORT_ISC_INPUT_DISABLE;
 const ISC_LEVEL: u8 = regs::PORT_ISC_LEVEL;
 const SLEEP_IDLE: u8 = regs::SLPCTRL_SMODE_IDLE;
 const SLEEP_POWER_DOWN: u8 = regs::SLPCTRL_SMODE_PDOWN;
-/// TCB0.CTRLA running off the main clock, undivided.
 const TCB_RUNNING: u8 = regs::TCB_CLKSEL_DIV1 | TCB_ENABLE;
-/// ADC0.CTRLA as the firmware converts: enabled, single-ended, 12-bit, right
-/// adjusted, one conversion per trigger.
 const ADC_ON: u8 = ADC_ENABLE | ADC_RESSEL_12BIT | regs::ADC_CONVMODE_SINGLEENDED;
-/// DAC0.CTRLA on with its output buffer driving PD6.
 const DAC_DRIVING: u8 = DAC_ENABLE | DAC_OUTEN;
 /// How far DAC0's 10-bit code sits up DATA (§34.5.2).
 const DAC_SHIFT: u32 = regs::DAC_DATA.trailing_zeros();
@@ -278,131 +71,83 @@ const VECTOR_TCB0: u8 = regs::VECTOR_TCB0_INT as u8;
 const VECTOR_PORTA: u8 = regs::VECTOR_PORTA_PORT as u8;
 const VECTOR_PORTC: u8 = regs::VECTOR_PORTC_PORT as u8;
 const VECTOR_PORTD: u8 = regs::VECTOR_PORTD_PORT as u8;
-/// Reset plus every interrupt.
 const VECTORS: usize = regs::VECTORS;
 const _: () = assert!(VECTORS <= 64);
 
-/// WDT.CTRLA.PERIOD = 8KCLK, the longest. Anything over is reserved.
+/// Anything over is reserved.
 const WDT_PERIOD_MAX: u8 = regs::WDT_PERIOD_8KCLK;
 
-/// CPU cycles a second, from `hw::init`'s clock setup.
 const CLK_PER: u32 = 4_000_000;
-// The library sizes the tick deadline for the same clock, and
-// `clocked_as_modelled` holds the firmware to it.
 const _: () = assert!(CLOCK_HZ == CLK_PER);
-/// Main clocks in TCB0's period, as the library counts on.
+/// Main clocks in TCB0's period.
 const TIMER_PERIOD: u64 = TIMER_PERIOD_CLOCKS as u64;
-/// WDT clocks in a tick. The PIT divides the same 32 kHz oscillator by 512,
-/// and the WDT runs at 1.024 kHz (§22.3.2).
+/// WDT clocks in a 64 Hz tick (§22.3.2).
 const WDT_CLOCKS_PER_TICK: u32 = 16;
-/// The scan starts three cycles after ENABLE, and the CPU keeps running until
-/// then (§30.3.1). No instruction is quicker than a cycle, so at most this many
-/// instructions see STATUS from before the scan.
+/// The scan starts three cycles after ENABLE (§30.3.1).
 const CRC_START_INSTRUCTIONS: u64 = 3;
-/// Reads of STATUS that show BUSY once the scan's started. The scan stalls
-/// the CPU until it's done (§30.3.2), so a real chip may never show it; this
-/// makes sure the firmware waits if it does.
+/// Reads of STATUS that show BUSY. A real chip may never show it, since the
+/// scan stalls the CPU (§30.3.2).
 const CRC_BUSY_READS: u8 = 2;
 /// What the first conversion after a change of input reads. The datasheet
-/// doesn't promise it's wrong, but table 38-25 gives the temperature sensor
-/// 40 µs to settle after MUXPOS changes, and the stock firmware finds it
-/// unstable, so the model makes it as wrong as it gets.
+/// doesn't promise it's wrong (table 38-25), so this is the worst case.
 const UNSETTLED: u16 = 0;
 
-/// Where flash appears in data space, and how much of it there is. On this
-/// part all of flash fits the window, which runs to the top of data space.
+/// Where flash appears in data space.
 const MAPPED: u16 = map::FLASH;
 const FLASH_SIZE: usize = map::FLASH_SIZE;
 const _: () = assert!(MAPPED as usize + FLASH_SIZE == 0x1_0000);
 
-/// SRAM's contents before startup. Real SRAM powers up holding anything; a
-/// fixed pattern makes a byte that should have been written stand out.
+/// SRAM's contents before startup.
 const JUNK: u8 = 0xA5;
 
-// The pins, from `kr1k::board`, which src/avr/hw.rs uses too.
-/// PC1, the boost converter and amplifier enable.
 const ENABLE: u8 = 1 << board::ENABLE;
-/// PA5 to PA7, the three power paths.
 const PATHS: u8 = board::PATHS;
-/// PA2 and PA3, the AW2016's TWI lines.
 const TWI: u8 = 1 << board::TWI_SDA | 1 << board::TWI_SCL;
 /// PA1, which goes to something unknown and is only ever held low.
 const HELD_LOW: u8 = 1 << board::HELD_LOW;
 const HELD_LOW_CTRL: usize = reg::PORTA_PIN0CTRL + board::HELD_LOW as usize;
-/// PD4, the switch, active low.
+/// PD4, active low.
 const SWITCH: u8 = 1 << board::SWITCH;
 const SWITCH_PIN: usize = board::SWITCH as usize;
-/// PD6, DAC0's output.
 const DAC_PIN: u8 = 1 << board::DAC;
 const DAC_PIN_CTRL: usize = reg::PORTD_PIN0CTRL + board::DAC as usize;
 const SWITCH_CTRL: usize = reg::PORTD_PIN0CTRL + SWITCH_PIN;
 
-/// Instructions startup may take before reaching `main`.
 const BOOT_BUDGET: u64 = 100_000;
-/// CPU cycles in a 64 Hz tick at 4 MHz.
 const TICK_CYCLES: u64 = CLK_PER as u64 / TICKS_PER_SECOND as u64;
 const _: () = assert!(TICK_CYCLES * TICKS_PER_SECOND as u64 == CLK_PER as u64);
-/// Instructions one pass of the main loop may take, handlers included, taking
-/// each as four clocks. The AVRxt column of the instruction set manual's
-/// table 5-4 has `call`, `ret` and `reti` at four with a 16-bit PC, and
-/// nothing slower, with one exception it doesn't bound. A load from NVM,
-/// which the mapped-flash window is, takes "a minimum of one extra cycle"
-/// that "varies dependent on the NVM module implementation" (note 2), and
-/// DS40002413B doesn't say how many. So an `lds` of the ramp's table could
-/// take more than four, and this budget is likely, not certain, for those.
+/// A load from mapped flash can take more than four clocks (instruction set
+/// manual, table 5-4 note 2) and how many isn't stated, so this is likely.
 const TICK_BUDGET: u64 = TICK_CYCLES / 4;
-/// Clocks the CPU spends getting into a handler and back out of it, on a
-/// part with more than 8 KB of flash and a 16-bit PC (§15.3.2.3, table 15-1,
-/// which has six in, and four for `reti`).
+/// §15.3.2.3, table 15-1.
 const INTERRUPT_CYCLES: u64 = 10;
-/// Instructions a handler may take, so it fits in a TCB0 period by the same
-/// sum.
 const HANDLER_BUDGET: u64 = (TIMER_PERIOD - INTERRUPT_CYCLES) / 4;
-/// Clocks DAC0's output gets to fall to 0 before a reference is raised or a
-/// path added with PC1 high: 10 µs, table 38-23's settling time at 5.5 V.
+/// 10 µs (table 38-23). A floor, since how fast PD6 falls on this board is
+/// unknown.
 const DAC_SETTLE_CYCLES: u64 = CLK_PER as u64 / 100_000;
-/// Clocks after a change of VREF.DAC0REF before DAC0 may go above 0: 2 µs,
-/// table 38-18's tINTREF.
+/// 2 µs, table 38-18's tINTREF.
 const VREF_SETTLE_CYCLES: u64 = CLK_PER as u64 / 500_000;
-/// Clocks after PC1 rises before DAC0 may go above 0: 8 ms, the stock
-/// firmware's wait for the boost converter.
+/// 8 ms, the stock firmware's wait for the boost converter.
 const BOOST_START_CYCLES: u64 = CLK_PER as u64 / 125;
 
-/// How many reads of RTC.PITSTATUS report busy after reset or a write to
-/// PITCTRLA. The real chip is busy for two 32 kHz clocks while it syncs
-/// (§26.13.12); any non-zero number makes the firmware wait.
+/// The real chip is busy for two 32 kHz clocks (§26.13.12).
 const PIT_SYNC_READS: u8 = 2;
 
 #[derive(Clone, Copy, Default)]
 pub struct Report {
-    /// The most stack the firmware used, in bytes.
+    /// Bytes.
     pub stack: u16,
-    /// The most instructions one pass of the main loop took, from the runs
-    /// without interrupts landed on purpose. Every pass still has to fit the
-    /// budget with them (`Sim::tick`).
     pub loop_instructions: u64,
-    /// What that's measured against.
     pub loop_budget: u64,
-    /// The most instructions one pass took that started off resting and ended
-    /// in power-down, which is what the chip stays awake for, 64 times a
-    /// second, when it's off.
     pub off_instructions: u64,
-    /// The most instructions one run of any handler took.
     pub handler_instructions: u64,
-    /// What that's measured against.
     pub handler_budget: u64,
-    /// Interrupts `Sim::land` put on an instruction of the main loop.
     pub landed: u32,
-    /// Handlers that landed with a 16-bit access half done. None of the
-    /// firmware's handlers touch a 16-bit register, so this only counts.
     pub mid_access: u32,
-    /// The last tick the main loop reached an instruction for the first time
-    /// where `Sim::land` could put an interrupt.
     last_new: u32,
 }
 
 impl Report {
-    /// Adds in another run's figures.
     fn merge(&mut self, run: &Self) {
         self.stack = self.stack.max(run.stack);
         self.loop_instructions = self.loop_instructions.max(run.loop_instructions);
@@ -421,21 +166,17 @@ impl Report {
     }
 }
 
-/// The symbols every program here has, as data-space addresses or word
-/// addresses as each one's used.
+/// `main` is a word address.
 struct Linked {
     main: u32,
     ends: Ends,
     layout: Layout,
 }
 
-/// Where interrupts that can't go back to the code they interrupted end up,
-/// as byte addresses.
+/// Where interrupts that never return end up, as byte addresses.
 #[derive(Clone, Copy, Default)]
 struct Ends {
-    /// `__unhandled_interrupt`.
     unhandled: u32,
-    /// `hw::halt`, which `__unhandled_interrupt` jumps to.
     halt: u32,
 }
 
@@ -463,16 +204,11 @@ fn symbol(elf: &Elf, name: &str) -> Result<u32, String> {
         .ok_or_else(|| format!("no `{name}` symbol"))
 }
 
-/// Runs every check on the firmware. With `examples` false, docs/ui.md's
-/// examples are left out, for a test build that's meant to disagree with
-/// them, and the rest still runs.
 pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     let linked = Linked::of(elf)?;
     let image = elf.flash_image();
-    // What `cargo xtask hex` and `flash` write.
     let signed = crc::sign(&image, &stamp::TEST)?;
     let reset = symbol(elf, "__reset")?;
-    // `cargo xtask peek` reads the supply readings at a fixed address.
     let supplies = symbol(elf, "SUPPLIES")?;
     if supplies != DATA_SPACE + SUPPLIES_AT as u32 {
         return Err(format!(
@@ -482,7 +218,6 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         ));
     }
 
-    // A chip that's just had its cell put in, run to the end of startup.
     let power_on = || -> Result<Sim, String> {
         let mut sim = Sim::new(signed.clone(), linked.layout.bss.end, linked.ends)?;
         sim.run_to(linked.main, BOOT_BUDGET)
@@ -508,15 +243,8 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     unhandled_interrupt(power_on()?)
         .map_err(|e| format!("with an interrupt that has no handler: {e}"))?;
     let examples = if examples { EXAMPLES } else { &[] };
-    // The clock, stuck-input and supply faults, every example, then the
-    // random switching, each example and the switching with and without
-    // interrupts landing mid-pass, then the collapsing cell, the faults on
-    // the AW2016's bus and the long rests in each of the PIT's phases. Each
-    // is its own chip, so they run side by side, because the long ones take
-    // minutes of simulated time. Errors come back in this order, whichever
-    // thread finishes first. The late ones come last since they ramp and
-    // click through the UI, so they'd catch many a mistake as a wrong output
-    // before the run that names it.
+    // Errors come back in this order. The late ones would report many a
+    // mistake as a wrong output before the run that names it.
     let faults: [(FaultCheck, &str); 7] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
@@ -526,8 +254,6 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
-    // VDDIO2 going while lit, and the collapsing cell, come last too, since
-    // they hold the light on and ramp it, and the rests after them.
     let late_faults: [(FaultCheck, &str); 9] = [
         (cell_collapses, "with a collapsing cell"),
         (aw2016_absent, "with the AW2016 never answering"),
@@ -582,20 +308,10 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     Ok(report)
 }
 
-/// One of the fault checks `check` runs on a freshly started chip, which adds
-/// what it measured to the report.
 type FaultCheck = fn(Sim, &mut Report) -> Result<(), String>;
 
-/// Ticks a run with interrupts landing goes on for after the last tick the
-/// run without them reached new code, so whatever a late landing broke has
-/// time to show.
 const LANDING_MARGIN: u32 = 2 * TICKS_PER_SECOND as u32;
 
-/// An example, or the random switching with `None`, run as it is and then
-/// with interrupts landing mid-pass. The second only lands on the first
-/// time each instruction's reached, so once the first run's reached all it
-/// will, the second has nothing left to land on, and the rest of it would
-/// repeat the first, so it stops `LANDING_MARGIN` after.
 fn both_ways(
     power_on: &impl Fn() -> Result<Sim, String>,
     example: Option<&Example>,
@@ -606,10 +322,6 @@ fn both_ways(
     Ok(report)
 }
 
-/// One run on a fresh chip, of an example from docs/ui.md or the random
-/// switching with `None`. `Landing::Until` puts a switch bounce, and a TCB0
-/// period's end with the light on, on every instruction it reaches
-/// (`Sim::land`), which is the race between the handlers and the main loop.
 fn run(
     power_on: &impl Fn() -> Result<Sim, String>,
     example: Option<&Example>,
@@ -632,15 +344,10 @@ fn run(
     }
 }
 
-/// Ticks of random switching to compare against the library, about five
-/// minutes of a torch being clicked and held.
 const RANDOM_TICKS: usize = 20_000;
 
-/// Runs one of docs/ui.md's examples on the firmware and the library in step,
-/// then checks where the library ended up against the example.
 fn ui_example(mut sim: Sim, example: &Example, report: &mut Report) -> Result<(), String> {
-    // Cut short, it never gets to the end. The level is the library's alone,
-    // so the run that did get there has checked it.
+    // The run without landing has checked the level.
     let Some(level) = in_step(&mut sim, testing::samples(example.actions()), report)? else {
         return Ok(());
     };
@@ -654,9 +361,6 @@ fn ui_example(mut sim: Sim, example: &Example, report: &mut Report) -> Result<()
     }
 }
 
-/// Switches the firmware and the library the same random way. The host tests
-/// trust the library; this checks the AVR build of it, and `hw.rs`'s pins, do
-/// what it says.
 fn against_the_library(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     let samples = RandomSwitching::new(0x5EED)
         .flat_map(|(pressed, ticks)| iter::repeat_n(pressed, ticks.into()))
@@ -668,8 +372,6 @@ fn against_the_library(mut sim: Sim, report: &mut Report) -> Result<(), String> 
     in_step(&mut sim, samples, report).map(drop)
 }
 
-/// A click from off, then `ticks` more with the switch left alone, in step
-/// with the library, which has to leave the light on.
 fn lit(sim: &mut Sim, ticks: u16, report: &mut Report) -> Result<(), String> {
     let script = [Action::Clicks(1), Action::Wait(ticks)];
     in_step(sim, testing::samples(script), report)?;
@@ -679,43 +381,21 @@ fn lit(sim: &mut Sim, ticks: u16, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// The slowest tick the oscillators allow, in main clocks. That's the 32 kHz
-/// one 30% slow, and the main one 5% fast, so more of its clocks fit in the
-/// time. Figure 38-2 has the 4 MHz oscillator within 5% over the whole
-/// supply and temperature range. Table 38-10 gives OSC32K no tolerance at
-/// all, so the 30% is the ATtiny1616's figure, kept as a guess, and the same
-/// one `kr1k::watchdog` sizes the deadline by.
+/// The slowest tick the oscillators allow, in main clocks, with the 32 kHz
+/// one 30% slow and the main one 5% fast (figure 38-2). Table 38-10 gives
+/// OSC32K no tolerance at all, so the 30% is a guess.
 const SLOWEST_TICK_CYCLES: u64 = TICK_CYCLES * 105 / 70;
-/// Main clocks `hw::wait_for_tick` waits for a tick, with the light on, before
-/// it gives up on the 32 kHz oscillator.
 const DEADLINE_CYCLES: u64 = TICK_DEADLINE_PERIODS as u64 * TIMER_PERIOD;
-// The slowest tick this chip can be given is well inside the deadline, so only
-// a run that stops the oscillator can trip it.
 const _: () = assert!(4 * SLOWEST_TICK_CYCLES < DEADLINE_CYCLES);
 
-/// Two seconds lit with every tick as slow as the oscillators' limits allow.
-/// `hw::wait_for_tick`'s deadline mustn't trip, because that stops the chip for
-/// good, which `Sim::tick` fails. Only the PIT's period changes. The model's
-/// watchdog counts WDT clocks off the same oscillator, so it's none the
-/// wiser.
+/// The model's watchdog never sees the slow oscillator.
 fn slow_ticks(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.tick_cycles = SLOWEST_TICK_CYCLES;
     lit(&mut sim, 2 * TICKS_PER_SECOND, report)
 }
 
-/// A click from off, then ten seconds with the switch alone, then another
-/// click, and the ADC never finishing a conversion (`Scene::adc_dead`), so
-/// `hw::adc_result` only ever sees RESRDY clear. docs/ui.md's `cell:0V` rows
-/// are the same path seen as a garbage reading, where this is silence. The
-/// light has to come on, then fade out within a few seconds as a fault and
-/// stay out, the second click included, the firmware and the library in step
-/// the whole way.
-///
-/// `in_step` only hands back the last level, so a second rig, fed the same
-/// samples, keeps the one at each tick.
 fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
     let seconds = |s: usize| s * usize::from(TICKS_PER_SECOND);
-    // The second click, after the fault, has to light nothing.
     let script = [
         Action::Clicks(1),
         Action::Wait(10 * TICKS_PER_SECOND),
@@ -746,8 +426,6 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
         .iter()
         .position(|&level| level > 0)
         .ok_or("the light never came on")?;
-    // A second of readings goes before the fault, then a fade from the level
-    // it came on at, a level a tick.
     let out = lit + seconds(4);
     if !levels.get(out..).is_some_and(|l| l.iter().all(|&l| l == 0)) {
         return Err(format!(
@@ -758,37 +436,16 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// The most ticks from the one the cell falls under the hard floor on to the
-/// one PC1 is low on, counting both, for a light that's been on a while:
-/// 12 ticks, 188 ms, which is docs/ui.md's promise and H6's. It's typed as a
-/// number rather than worked out from the library's constants, so a change
-/// to those that breaks the promise fails here. The sum it comes from is the
-/// cell unread for `sensors::UNREAD_TICKS` at worst, then
-/// `battery::COLLAPSE_READINGS` in a row, the last due a tick after its
-/// conversion starts.
+/// From the cell falling under the floor to PC1 low, both counted. Typed as a
+/// number on purpose, not worked out from the library's constants.
 const COLLAPSE_TICKS: usize = 12;
 
-/// The cell falling under `battery::COLLAPSE_BELOW` with the light at the top
-/// of the ramp, once on each of the 16 ticks of the ADC's round, firmware and
-/// library in step. Each time the light has to be out within
-/// `COLLAPSE_TICKS`, straight from the top with no fade, as a flat cell and
-/// not a fault, and a click with the cell still down has to light nothing.
-/// The cell then reads 3.80 V again, so the next click lights it for the
-/// next round.
-///
-/// `in_step` holds PC1, DAC0 and the paths to the library on every tick, so
-/// the library's level going to 0 is PC1 going low. The cell's reading is
-/// scripted, and it changes between two ticks, so this is the timetable and
-/// the firmware's sums and nothing about a real cell, whose voltage falls
-/// as it pleases.
 fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     let rounds = u16::from(CYCLE_TICKS);
     let script = (0..rounds).flat_map(|round| {
         [
             Action::Cell(380),
             Action::Clicks(1),
-            // To the top of the ramp, and a tick longer each round, so the
-            // cell falls on each tick of the ADC's round in turn.
             Action::Hold {
                 clicks: 0,
                 ticks: 2 * TICKS_PER_SECOND + round,
@@ -799,7 +456,6 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
             Action::Wait(TICKS_PER_SECOND),
         ]
     });
-    // Each tick's cell, and the library's level and aux after it.
     let ticks = std::cell::RefCell::new(Vec::new());
     let mut shadow = Rig::default();
     let samples = testing::samples(script).inspect(|sample| {
@@ -825,7 +481,6 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         if ticks[fell - 1].1 != CEILING {
             return Err(at("the light isn't at the top of the ramp".into()));
         }
-        // Until the cell's good again, or the script ends.
         let down = ticks[fell..].iter().take_while(|tick| !good(tick)).count();
         let lit = ticks[fell..fell + down]
             .iter()
@@ -861,7 +516,6 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     if falls != usize::from(rounds) {
         return Err(format!("the cell fell {falls} times, not {rounds}"));
     }
-    // One of the 16 ticks is the worst, so it's been run.
     if slowest != COLLAPSE_TICKS {
         return Err(format!(
             "the slowest took {slowest} ticks, not the {COLLAPSE_TICKS} the worst tick of the \
@@ -871,12 +525,6 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// The ADC stuck on the cell's 3.80 V reading for every input, ground
-/// included, a second after a click lights the torch, then a second click
-/// once the light's out, firmware and library in step. Every voltage reading
-/// from then on looks like a good cell, so only ground can tell. The light
-/// has to fade out as a fault, and stay out through the second click, which
-/// the library has to agree is a fault too.
 fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     let seconds = |s: usize| s * usize::from(TICKS_PER_SECOND);
     let script = [
@@ -909,7 +557,6 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     if ticks[stuck - 1].1 == 0 || ticks[..stuck].iter().any(|tick| tick.2) {
         return Err("the light wasn't on and well before the ADC stuck".into());
     }
-    // Two ground readings, then a fade from level 52, a level a tick.
     let out = stuck + seconds(2);
     if !ticks
         .get(out..)
@@ -924,15 +571,6 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// What the firmware keeps at `kr1k::sensors::SUPPLIES_AT` for `cargo xtask
-/// peek`, against what the world's VDDIO2 / 10 and VDD / 10 read. A second
-/// with VDDIO2 at 3.30 V and the cell at 4.00 V, which the power-on check
-/// reads. Then five minutes with VDDIO2 tied to a 3.60 V cell, which the
-/// next check at rest reads. Then a click on, with VDDIO2 dropping to 2.00 V
-/// once the light's lit, which nothing reads, since VDDIO2 is only read with
-/// the light off. Firmware and library in step, and the library's
-/// `Torch::supplies` has to say the same as the firmware's SRAM at the end of
-/// each.
 fn supplies_kept(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     let quiet = |ticks: u32, cell: u16, vddio2_level: Option<u16>| {
         iter::repeat_n(
@@ -953,7 +591,6 @@ fn supplies_kept(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         .chain(quiet(301 * second, 360, None))
         .chain(click)
         .chain(quiet(second, 360, Some(200)));
-    // The firmware's four bytes, and the library's, at the end of each part.
     let marks = [second as usize, 302 * second as usize];
     let seen = std::cell::RefCell::new(Vec::new());
     let mut shadow = Rig::default();
@@ -1004,9 +641,6 @@ fn supplies_kept(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// The switch pressed from the first tick and never let go, for about five
-/// minutes of ticks, firmware and library in step. A jammed button is a hold
-/// from off, which does nothing, so the light has to stay off.
 fn switch_stuck(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     let samples = iter::repeat_n(
         Sample {
@@ -1022,18 +656,6 @@ fn switch_stuck(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// MVIO says VDDIO2 isn't there, from power-on, so PORTC's pins, PC1 among
-/// them, are tri-stated whatever PORT says (§19.3.2.1), and come back with
-/// whatever PORT holds if VDDIO2 does. The firmware has to treat it as a
-/// fault and keep PC1 low, through a click and a hold, in step with a
-/// library that's told the same.
-///
-/// It starts with a second at rest. A firmware that let the power-on check
-/// go would still find VDDIO2 missing on its first pass, now that every
-/// waking pass looks, and never light. But it would be a torch with nothing
-/// wrong for that one pass, awake to read its cell, where one that failed
-/// the check powers down from the first tick, and the rest is where that
-/// shows.
 fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     let script = [
         Action::Vddio2(false),
@@ -1059,23 +681,8 @@ fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// VDDIO2 goes with the light on, at the top of the ramp, so all three paths
-/// are up and DAC0 is near the top of its range. It goes at the worst moment
-/// for a firmware that looks once a pass, straight after this pass's look
-/// (`Chip::vddio2_goes`), so it's a whole tick before anything can see it.
-/// The pass that takes the next tick has to leave PC1 clear in PORTC, DAC0
-/// at 0 against 1.024 V and the paths low before it sleeps
-/// (`Chip::dark_without_vddio2`), which is a tick and a pass after it went.
-///
-/// Then it has to stay off, in step with the library, through a click and a
-/// hold with VDDIO2 still gone, and through another click once it's back,
-/// when PC1 would rise again if PORTC still had it set (§19.3.2.1). The
-/// library has the aux white after each press, and the AW2016 is held to it.
-///
-/// Dips shorter than a tick aren't run. A firmware that looks once a pass
-/// can miss one whole, and the chip would then put PC1 back up with DAC0
-/// live, which `Chip::vddio2_moved` refuses, so such a run could only fail.
-/// docs/safety.md has that under H1's what's left.
+/// Dips shorter than a tick aren't run, since a firmware that looks once a
+/// pass can miss one whole and `Chip::vddio2_moved` would refuse what follows.
 fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.late_vddio2 = true;
     let second = TICKS_PER_SECOND;
@@ -1113,12 +720,6 @@ fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
-/// Long rests between presses, each long enough for the tick to slow to
-/// 1 Hz and feed the watchdog at rest a few times, with presses landing
-/// mid-second, a light on and off, lockout's five seconds of red and a hold,
-/// in step with the library throughout. The PIT's first tick after each
-/// change of period lands as `phase` says. It has to have ticked slow for
-/// most of the rests, and lit the light.
 fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), String> {
     sim.chip.pit_phase = phase;
     let second = TICKS_PER_SECOND;
@@ -1158,14 +759,6 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
     Ok(())
 }
 
-/// Rests with an edge on the switch, the switch not moving, put up with
-/// every slow tick, so its handler runs with the tick already due and before
-/// that tick's pass reads the switch, the way a real edge could land just
-/// after the PIT's. That pass sees whatever the edge did, so the slow sleep
-/// after it has to run its full second, in step with a library that's told
-/// of no edge, where a firmware that left the edge up would wake straight
-/// away for nothing. A click between the rests, so the edges also meet the
-/// pacer's way back to the lit window and down again.
 fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.edge_with_slow_tick = true;
     let second = TICKS_PER_SECOND;
@@ -1201,27 +794,18 @@ fn resting_late(sim: Sim, report: &mut Report) -> Result<(), String> {
     resting(sim, PitPhase::Late, report)
 }
 
-/// The AW2016 never acknowledges its address.
 fn aw2016_absent(sim: Sim, report: &mut Report) -> Result<(), String> {
     bad_bus(sim, Fault::Absent, report)
 }
 
-/// SDA held low, so every address loses arbitration with a bus error.
 fn sda_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
     bad_bus(sim, Fault::SdaLow, report)
 }
 
-/// SCL held low, so no byte ever finishes and no flag ever comes up, which
-/// only the update's budget of polls gets the firmware out of.
 fn scl_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
     bad_bus(sim, Fault::SclLow, report)
 }
 
-/// The light on and off, lockout and a press in it, then on, ramped and off
-/// again, all with `fault` on the bus. Every update fails, and the firmware
-/// has to give each up without hanging or retrying (`AuxWatch`), every pass
-/// inside the budget (`Sim::tick`), and the light has to follow the library
-/// all the way, ending off.
 fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String> {
     sim.chip.twi.fault = fault;
     let second = TICKS_PER_SECOND;
@@ -1262,26 +846,11 @@ fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String
     Ok(())
 }
 
-/// Steps `hw::halt` may take from dropping PC1 to its `sleep`, counting
-/// instructions, or waits if it's gone to sleep some other way.
+/// Instructions from dropping PC1 to the `sleep`.
 const HALT_BUDGET: u64 = 100;
-/// PIT periods' worth of time to watch a chip that's stopped for good.
+/// PIT periods.
 const DOWN_PERIODS: u64 = 4 * TICKS_PER_SECOND as u64;
 
-/// The 32 kHz oscillator stops with the light on, and takes the tick and the
-/// watchdog with it. `hw::wait_for_tick`'s deadline is all that's left, and
-/// `main` answers it with `hw::halt`. This checks PC1 drops within the
-/// deadline of the stop, and not before it, which a count that ran fast would
-/// do. Then that the firmware gets to a `sleep` in power-down with no
-/// interrupt enabled, by `ready_for_power_down`'s rules, and that nothing
-/// runs and PC1 stays low for four seconds after.
-///
-/// The oscillator stops just as a tick lands, so the firmware has one more
-/// pass, and the deadline counts from the wait that ends it.
-///
-/// A tick that goes missing with the oscillator still running ends another
-/// way, in the watchdog resetting the chip. That can't run here, because this
-/// chip has no resets, so a bite is a failed run.
 fn oscillator_stops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     lit(&mut sim, 0, report)?;
     sim.chip.osc32k_stopped = true;
@@ -1329,28 +898,15 @@ fn oscillator_stops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
             return Err("woke up or raised PC1 after stopping for good".into());
         }
     }
-    // `lit` took the rest. `hw::halt` is a call deeper than the loop.
+    // `hw::halt` is a call deeper than the loop.
     report.stack = report.stack.max(sim.stack());
     Ok(())
 }
 
-/// The vector `unhandled_interrupt` forces. Nothing in the firmware touches
-/// TCB1 and the model doesn't have it, so its slot goes to
-/// `__unhandled_interrupt`.
+/// Nothing in the firmware touches TCB1 and the model doesn't have it.
 const VECTOR_UNHANDLED: u8 = regs::VECTOR_TCB1_INT as u8;
 
-/// An interrupt with no handler fires with the light on, which nothing in the
-/// firmware can make happen, so `Chip::force_interrupt` stands in for a
-/// peripheral gone wrong. src/avr/rt.rs's `__unhandled_interrupt` jumps into
-/// `hw::halt`, so within `HALT_BUDGET` instructions of taking it, PC1 has to
-/// be low, DAC0 at 0, the paths low, and the chip asleep for good in
-/// power-down. Then it has to stay that way, with no tick taken, since
-/// LVL0EX is still set and halt turned the PIT's interrupt off anyway.
-///
-/// On a real chip the watchdog then resets it, since nothing feeds it. This
-/// chip has no resets, so the run stops one PIT period short of the bite.
-/// The interrupt is forced on the pass after a `wdr`, so that's the most
-/// periods there are to watch, whatever the click timings.
+/// Resets aren't modelled, so the run stops one PIT period short of the bite.
 fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
     if sim.handled & 1 << VECTOR_UNHANDLED != 0 {
         return Err(format!(
@@ -1359,7 +915,6 @@ fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
         ));
     }
     lit(&mut sim, TICKS_PER_SECOND / 4, &mut Report::default())?;
-    // A pass that feeds leaves the count lower than the pass before it did.
     let mut fed = false;
     for _ in 0..=FEED_TICKS {
         let before = sim.chip.wdt.feeds;
@@ -1423,23 +978,18 @@ fn unhandled_interrupt(mut sim: Sim) -> Result<(), String> {
     Ok(())
 }
 
-/// Feeds the same switch samples to the firmware, from just after `main`, and
-/// to `kr1k::torch`, and checks the pins show the library's output on every
-/// tick. Returns the level it ends at, or `None` if `Landing::Until` cut it
-/// short.
+/// Returns the level it ends at, or `None` if `Landing::Until` cut it short.
 fn in_step(
     sim: &mut Sim,
     samples: impl IntoIterator<Item = Sample>,
     report: &mut Report,
 ) -> Result<Option<u8>, String> {
-    // The firmware reads the fuses before its first tick, so the world it
-    // powers up in is the first sample's.
+    // The fuses are read before the first tick.
     let mut samples = samples.into_iter().peekable();
     let power_on = World::from(samples.peek().map_or(Scene::NORMAL, |s| s.scene));
     sim.chip.set_world(power_on)?;
     if power_on.scene.corrupt_flash {
-        // The checksum's high byte, which is never code, so the firmware
-        // still runs however big it gets.
+        // The checksum's high byte, which is never code.
         let byte = sim
             .chip
             .flash
@@ -1454,7 +1004,6 @@ fn in_step(
     if sim.chip.wdt_open() == 0 {
         return Err("hw::start_watchdog never turned the watchdog on".into());
     }
-    // The first pass runs on the grid edge that ended `hw::init`'s wait.
     let mut rig = Paced::new(power_on.faults(), sim.chip.grid);
     rig.phase = sim.chip.pit_phase;
     rig.bus_fails = sim.chip.twi.fault != Fault::None;
@@ -1473,10 +1022,7 @@ fn in_step(
             Landing::Off | Landing::Watch => false,
         };
         sim.chip.enter(World::from(sample.scene)).map_err(at)?;
-        // What MVIO says as the pass begins, which is what the library's
-        // told this tick. It's the scene's, but for a chip whose fuses have
-        // single supply, and for a run that takes VDDIO2 away mid-pass,
-        // after the firmware's looked (`Chip::vddio2_goes`).
+        // Not the scene's with single-supply fuses or VDDIO2 going mid-pass.
         let scene = Scene {
             vddio2: sim.chip.vddio2_ok(),
             ..sample.scene
@@ -1488,14 +1034,9 @@ fn in_step(
             sim.late_edges,
         );
         let took = sim.tick(sample.pressed).map_err(at)?;
-        // The library's passes on this grid point, which is none at all with
-        // the PIT slow and the switch alone, and the firmware's, one per read
-        // of the switch.
         let mut ends: Vec<End> = rig.sample(sample.pressed, &scene).into_iter().collect();
         let passes = (sim.chip.switch_reads - reads) as usize;
-        // A bounce landed after the pass read the switch wakes a slow sleep
-        // with nothing to see, which the library has to be told about. One
-        // the pass read the switch after mustn't wake it.
+        // A late bounce wakes a slow sleep with nothing to see.
         while passes > ends.len() && sim.late_edges > late_edges {
             match rig.bounce(&scene) {
                 Some(end) => ends.push(end),
@@ -1509,22 +1050,16 @@ fn in_step(
             )));
         }
         let Some(&end) = ends.last() else {
-            // Asleep the whole tick, as it should be, or woken by the switch
-            // with the PIT fast and straight back to sleep.
             if sim.chip.wdt.feeds != feeds {
                 return Err(at("fed the watchdog with no pass to run".into()));
             }
             sim.chip.shows(rig.output()).map_err(at)?;
             continue;
         };
-        // Interrupts landed on purpose run their handlers on top of the
-        // pass, which a real tick never sees that many of.
         if !landing {
             report.loop_instructions = report.loop_instructions.max(took);
         }
         let powered_down = sim.chip.power_downs > power_downs;
-        // Only a pass that started off resting, which is what a torch that's
-        // off spends every tick it's awake.
         if powered_down && was_resting {
             report.off_instructions = report.off_instructions.max(took);
         }
@@ -1533,9 +1068,7 @@ fn in_step(
             aux.tick(&sim.chip.twi, rig.aux()).map_err(at)?;
         }
         was_resting = rig.resting();
-        // The sleep that ended the pass was the firmware's answer to the
-        // state the pass left behind, and so were its feeds and the PIT. A
-        // firmware that never feeds at all is the bite's to catch.
+        // A firmware that never feeds at all is the bite's to catch.
         let fed = ends.iter().filter(|end| end.feed).count();
         if sim.chip.wdt.feeds > 0 && (sim.chip.wdt.feeds - feeds) as usize != fed {
             return Err(at(format!(
@@ -1566,24 +1099,9 @@ fn in_step(
     Ok(finished.then(|| rig.level()))
 }
 
-/// Ticks the aux may stay dark after the torch wants a colour. From a state
-/// nobody knows, that's a reset, then a wake, and the colour on the third.
+/// Ticks the aux may stay dark after the torch wants a colour.
 const AUX_CATCH_UP_TICKS: u8 = 2;
 
-/// Holds the AW2016 to the colour the library wants, at the end of every
-/// pass, and the firmware to giving up on a bus that fails.
-///
-/// With a sound bus, whatever the aux show is the colour the torch wants, at
-/// the brightness `ui::Aux::bright` says, through the board's channel map,
-/// never a wrong one. It can lag dark for `AUX_CATCH_UP_TICKS` while the chip
-/// wakes. When the torch wants them off the AW2016 is in standby by the end
-/// of that pass, since that's what H13 in docs/safety.md counts on. Dark
-/// while the light's on comes from that, and `twi.rs` and `Chip::pc1_moves`
-/// refuse the aux lit with PC1 high on the way.
-///
-/// With a fault on the bus, every update fails, and the firmware may only try
-/// again once the colour it gave up on has changed, never every tick. Each
-/// pass turns the host on once at most.
 #[derive(Default)]
 struct AuxWatch {
     behind: u8,
@@ -1652,14 +1170,10 @@ impl AuxWatch {
     }
 }
 
-/// What examples/link.rs's `main` leaves in `LINK_PROBE_COPY`. That's its
-/// .rodata table, then its .data static's starting values, then a byte it
-/// doesn't touch.
+/// The probe's .rodata table, then its .data static's starting values, then
+/// a byte it doesn't touch.
 const PROBE_EXPECTED: [u8; 7] = [0x12, 0x34, 0x56, 0x9A, 0xBC, 0xDE, 0];
 
-/// Runs the link probe from reset with SRAM full of junk, and checks it read
-/// its const table through the mapped-flash window and its .data static from
-/// where the startup code copied it.
 pub fn probe(elf: &Elf) -> Result<(), String> {
     let linked = Linked::of(elf)?;
     let layout = &linked.layout;
@@ -1683,11 +1197,6 @@ pub fn probe(elf: &Elf) -> Result<(), String> {
     Ok(())
 }
 
-/// Runs the guards probe, examples/guards.rs, from reset to `guards_done`.
-/// It asks `hw::wait_for_tick` for power-down on every wait, four times with
-/// the light on and once with it off, so it has to power down exactly once.
-/// Powering down with PC1 high is refused on the way, by
-/// `ready_for_power_down`, so a missing guard fails before the count does.
 pub fn guards(elf: &Elf) -> Result<(), String> {
     let linked = Linked::of(elf)?;
     let mut sim = Sim::new(elf.flash_image(), linked.layout.bss.end, linked.ends)?;
@@ -1703,11 +1212,10 @@ pub fn guards(elf: &Elf) -> Result<(), String> {
     }
 }
 
-/// Where src/avr/rt.rs's startup copies and zeroes, as data-space addresses.
+/// Data-space addresses.
 struct Layout {
     data: Range<u16>,
     bss: Range<u16>,
-    /// .data's initial values, in the mapped-flash window.
     load: u16,
 }
 
@@ -1735,10 +1243,7 @@ fn check_startup(chip: &Chip, layout: &Layout) -> Result<(), String> {
     Ok(())
 }
 
-/// Moves .data and .bss somewhere awkward, gives .data five bytes of initial
-/// values, patches the addresses into the real startup code and runs it. Then
-/// checks it wrote exactly those bytes and nothing either side. `reset` is the
-/// byte address of `__reset`.
+/// `reset` is the byte address of `__reset`.
 fn startup_with_statics(image: &[u8], reset: u32, linked: &Linked) -> Result<(), String> {
     let values = [0x11, 0x22, 0x33, 0x44, 0x55];
     let mut image = image.to_vec();
@@ -1766,17 +1271,13 @@ fn startup_with_statics(image: &[u8], reset: u32, linked: &Linked) -> Result<(),
     Ok(())
 }
 
-/// Rewrites the `ldi`s in src/avr/rt.rs's startup that load the .data and
-/// .bss addresses, after checking they're the ones expected, in order.
 fn patch_startup(
     image: &mut [u8],
     reset: usize,
     linked: &Layout,
     moved: &Layout,
 ) -> Result<(), String> {
-    // (register, byte) for each `ldi`, as rt.rs loads them, which is X =
-    // __data_start, Z = __data_load, r25:r24 = __data_end, X = __bss_start,
-    // r25:r24 = __bss_end.
+    // (register, byte) for each `ldi`, in the order rt.rs loads them.
     let loads = |l: &Layout| -> Vec<(u8, u8)> {
         [
             (26, l.data.start),
@@ -1820,16 +1321,7 @@ fn patch_startup(
     Ok(())
 }
 
-/// Runs `sim` from the reset vector with PORTC as a lit torch has it, PC1 an
-/// output and high, and checks the first register the firmware writes clears
-/// PC1 in VPORTC.OUT. That's `hw::hold_enable_low`'s job, ahead of the CRC
-/// scan and everything else.
-///
-/// A stray jump to the vector would find the port like that, since nothing
-/// short of a reset clears OUT. This isn't a model of one, though. Only PORTC
-/// starts dirty, and the rest of the chip, SP and SREG included, is as a reset
-/// leaves it. It shows what the firmware's first write does to a pin it finds
-/// high, and that's all.
+/// Not a model of a stray jump to reset. Only PORTC starts dirty.
 fn found_lit(mut sim: Sim) -> Result<(), String> {
     sim.chip.io[reg::VPORTC_DIR] = ENABLE;
     sim.chip.io[reg::VPORTC_OUT] = ENABLE;
@@ -1851,11 +1343,6 @@ fn found_lit(mut sim: Sim) -> Result<(), String> {
     ))
 }
 
-/// Runs `sim` from reset to the first wait for a tick, and checks `main` got
-/// there in the order it has to. The reset flags are cleared before the
-/// watchdog's on. The CRC scan, the fuse read and the VDDIO2 check come
-/// before the chip's set up at all. The PIT's on before the watchdog.
-/// `found_lit` checks what comes before all of these.
 fn boot_order(mut sim: Sim) -> Result<(), String> {
     for _ in 0..BOOT_BUDGET {
         if sim.chip.tick_polled {
@@ -1868,9 +1355,7 @@ fn boot_order(mut sim: Sim) -> Result<(), String> {
     ))
 }
 
-/// A bit for each vector whose slot in `image`'s table is a `jmp` to
-/// somewhere other than `unhandled` (a word address). layout.rs checks every
-/// slot is a `jmp`.
+/// `unhandled` is a word address.
 fn handled(image: &[u8], unhandled: u32) -> u64 {
     (1..VECTORS).fold(0, |mask, v| {
         let at = v * VECTOR_WORDS as usize * 2;
@@ -1882,7 +1367,6 @@ fn handled(image: &[u8], unhandled: u32) -> u64 {
     })
 }
 
-/// What a handler found when it landed, with its return address pushed.
 struct Landed {
     r: [u8; 32],
     sreg: u8,
@@ -1895,61 +1379,36 @@ struct Sim {
     /// SP below this means a push landed in .bss.
     stack_floor: u16,
     lowest_sp: u16,
-    /// Instructions run, which unlike `Chip::now` stops while asleep.
+    /// Unlike `Chip::now`, stops while asleep.
     executed: u64,
-    /// Instructions that count towards a pass of the main loop. That's all
-    /// of them, except handlers' while `land` is landing interrupts, since a
-    /// real pass never sees one on every new instruction.
+    /// Leaves out handlers' instructions while `land` is landing interrupts.
     counted: u64,
-    /// `__unhandled_interrupt`, as a word address.
+    /// Word address.
     unhandled: u32,
-    /// `hw::halt`, as a word address.
+    /// Word address.
     halt: u32,
-    /// A bit per vector whose slot doesn't jump there.
     handled: u64,
-    /// The vector `Chip::force_interrupt` asked for, once the CPU's taken
-    /// it. It's allowed to go to `__unhandled_interrupt`, since that's what
-    /// it's for.
     forced: Option<u8>,
-    /// The running handler has reached `hw::halt`, so it'll never return to
-    /// the code it interrupted.
     abandoned: bool,
-    /// What the running handler has to give back.
     landed_on: Option<Landed>,
-    /// Instructions the running handler has taken.
     handler_steps: u64,
-    /// The most any handler has taken.
     longest_handler: u64,
-    /// What `land` does.
     landing: Landing,
-    /// A bit per word of flash, for the instructions `land` has seen.
+    /// Indexed by word address.
     reached: Vec<bool>,
-    /// The tick `in_step` is on.
     tick_no: u32,
-    /// The last tick `land` saw an instruction for the first time.
     last_new: u32,
-    /// Interrupts landed so far.
     landed: u32,
-    /// Handlers so far that landed with a 16-bit access half done.
     mid_access: u32,
-    /// Edges on the switch whose handler ran after the main loop last read
-    /// it, with no tick taken since, so the pass that reads it next hasn't
-    /// seen them. Only those can end a slow sleep with no pass of the
-    /// library's to match. One whose handler ran once a tick was taken and
-    /// before that tick's pass read the switch is one that pass sees, so it
-    /// mustn't end the sleep after it.
+    /// Switch edges handled since the main loop last read it, with no tick
+    /// since. Only those can end a slow sleep with no library pass to match.
     late_edges: u32,
 }
 
-/// What `Sim::land` does the first time the main loop reaches an instruction
-/// where an interrupt could land.
 #[derive(Clone, Copy)]
 enum Landing {
-    /// Nothing.
     Off,
-    /// Notes the tick, in `Sim::last_new`.
     Watch,
-    /// Lands interrupts there, until `in_step` stops after this tick.
     Until(u32),
 }
 
@@ -1987,20 +1446,8 @@ impl Sim {
         })
     }
 
-    /// Before the first time the main loop reaches each instruction, PD4's
-    /// flag goes up as a bounce would raise it, if its sense is on, and so
-    /// does TCB0's CAPT if its interrupt's on, as the end of a period would.
-    /// The handler lands there or, with interrupts held off, at the first
-    /// place it can. Left alone a 1 ms period only lands on the instructions
-    /// it happens to meet, and a bounce on none.
-    ///
-    /// Neither is a real edge or a real period, so the switch doesn't move
-    /// and TCB0's count doesn't restart. A landed CAPT is one more towards
-    /// `hw::wait_for_tick`'s deadline, so the run that checks the deadline
-    /// isn't early leaves landing off.
-    ///
-    /// `Landing::Watch` only notes when each instruction's first reached, so
-    /// `both_ways` knows how far a landing run has new code to land on.
+    /// A landed CAPT counts towards `hw::wait_for_tick`'s deadline, so the
+    /// run that checks the deadline leaves landing off.
     fn land(&mut self) {
         if matches!(self.landing, Landing::Off) || self.cpu.handling.is_some() || self.cpu.asleep {
             return;
@@ -2028,7 +1475,7 @@ impl Sim {
         }
     }
 
-    /// The most stack used so far, in bytes.
+    /// Bytes.
     const fn stack(&self) -> u16 {
         SRAM.end - 1 - self.lowest_sp
     }
@@ -2037,15 +1484,11 @@ impl Sim {
         let pc = self.cpu.pc;
         let awake = !self.cpu.asleep;
         let handling = self.cpu.handling;
-        // `hw::halt` is main-loop code, wherever it was reached from, and
-        // gets the main loop's rules.
+        // `hw::halt` gets the main loop's rules, wherever it was reached from.
         self.chip.in_handler = handling.is_some() && !self.abandoned;
         self.chip.interrupts_on = self.cpu.flag(I);
         self.cpu.step(&mut self.chip)?;
-        // Only a reset wakes a chip with no interrupt enabled (§13.3.1), and
-        // figure 15-1 has the global enable gate the wake-up as well. Neither
-        // says the other's enough, so stopping for good wants both, as
-        // `hw::halt` does.
+        // §13.3.1 and figure 15-1. Neither says the other's enough, so both.
         if self.chip.down && self.cpu.flag(I) {
             return Err(format!(
                 "{:#06x}: stops for good with SREG.I still set, which leaves the \
@@ -2072,9 +1515,8 @@ impl Sim {
         if self.cpu.sp < self.stack_floor {
             return Err(format!("{:#06x}: the stack ran into .bss", pc * 2));
         }
-        // The real chip would `reti` straight back into the main loop with
-        // the flag still up, and take the interrupt again, forever. Better to
-        // catch it as soon as one's enabled, before it ever fires.
+        // The real chip would `reti` with the flag still up, and take the
+        // interrupt again, forever.
         if self.cpu.flag(I) {
             let orphans = self.chip.enabled & !self.handled;
             if orphans != 0 {
@@ -2099,8 +1541,7 @@ impl Sim {
         Ok(())
     }
 
-    /// Takes note of a handler starting or finishing. `before` is what the
-    /// CPU was handling before the step just run.
+    /// `before` is what the CPU was handling before the step just run.
     fn watch_handler(&mut self, before: Option<u8>) -> Result<(), String> {
         match (before, self.cpu.handling) {
             (None, Some(vector)) => {
@@ -2128,8 +1569,6 @@ impl Sim {
                         .map_err(|e| format!("the handler for {}: {e}", vector_name(vector)))?;
                 }
             }
-            // A handler in `hw::halt` has stopped being one in all but
-            // LVL0EX, and sleeps from there until a reset.
             (Some(_), Some(_)) if self.abandoned => {}
             (Some(vector), Some(_)) => {
                 self.handler_steps += 1;
@@ -2146,24 +1585,6 @@ impl Sim {
         Ok(())
     }
 
-    /// The running handler has reached `hw::halt`, which never returns, so
-    /// the rules about giving back what it found stop applying. That's
-    /// `__unhandled_interrupt`'s way out, and it'd be any handler's that
-    /// panicked.
-    ///
-    /// That includes TEMP (`Chip::temp_undisturbed`). If the handler landed
-    /// with the main loop halfway through a 16-bit register, `hw::set_output`'s
-    /// writes in `halt` overwrite the low byte the main loop left in DAC0's
-    /// TEMP. The rule's there because the main loop would carry on and write
-    /// its high byte with the wrong low one. Here it never carries on, so
-    /// there's nothing left to corrupt, and `halt`'s own writes go low byte
-    /// then high byte like any other. The half-done access goes too, since
-    /// nothing will ever finish it, and the real TEMP takes `halt`'s low byte
-    /// over the top of it.
-    ///
-    /// The handler's budget goes too, since `halt` sleeps from here until a
-    /// reset, and so does the check that it gives back the registers, SREG
-    /// and SP, since it never returns them to anything.
     const fn abandon(&mut self) {
         self.abandoned = true;
         self.chip.interrupted = 0;
@@ -2173,8 +1594,6 @@ impl Sim {
         self.landed_on = None;
     }
 
-    /// A handler lands between any two instructions of the main loop, so
-    /// anything it changes, the compiled code around it sees change at random.
     fn gave_back(&self, landed: &Landed) -> Result<(), String> {
         let changed = (0..32).find(|&n| self.cpu.r[n] != landed.r[n]);
         if let Some(n) = changed {
@@ -2199,7 +1618,7 @@ impl Sim {
         Ok(())
     }
 
-    /// Runs until PC reaches `target`, a word address.
+    /// `target` is a word address.
     fn run_to(&mut self, target: u32, budget: u64) -> Result<(), String> {
         for _ in 0..budget {
             if self.cpu.pc == target {
@@ -2213,16 +1632,8 @@ impl Sim {
         ))
     }
 
-    /// One point of the 64 Hz grid with the switch as given, run until the
-    /// next. That's a pass of the main loop if the PIT ticked, or with the
-    /// PIT slow if the switch moved, and otherwise the chip sleeping on.
-    /// Returns how many instructions the pass took, which stops when the
-    /// firmware first goes to sleep, counting handlers' unless they're
-    /// landing on purpose (`Sim::counted`). A wait for WDT.STATUS.SYNCBUSY to
-    /// clear lasts as long as the sync, in time, however long each of its
-    /// instructions takes, so those count a quarter each against the budget,
-    /// which takes every other instruction at four clocks. A firmware that
-    /// stops for good (`hw::halt`) with ticks still coming has failed.
+    /// Instructions waiting on WDT.STATUS.SYNCBUSY count a quarter each,
+    /// since the wait lasts as long as the sync whatever they take.
     fn tick(&mut self, pressed: bool) -> Result<u64, String> {
         self.chip.set_switch(pressed)?;
         let (start, grid) = ((self.counted, self.chip.wdt_waits), self.chip.grid);
@@ -2255,59 +1666,38 @@ impl Sim {
     }
 }
 
-/// Whether an ISC value senses anything, so raises a flag and asks for an
-/// interrupt (§18.5.16's ISC table).
+/// §18.5.16
 const fn senses(isc: u8) -> bool {
     matches!(isc, ISC_BOTHEDGES | ISC_RISING | ISC_FALLING | ISC_LEVEL)
 }
 
-/// The watchdog, as the firmware can see it. The setting in force is in
-/// `io[WDT_CTRLA]`. It's timed in WDT clocks, a sixteenth of a 64 Hz PIT
-/// period, since the two share an oscillator (§22.3.2, §26.4.1.1), so a slow
-/// oscillator stretches both alike.
-///
-/// Where the datasheet is silent, this takes the worst case. A write to
-/// CTRLA takes `SYNC_CLOCKS` WDT clocks to sync, and SYNCBUSY reads set until
-/// then, the old setting in force meanwhile with the stricter of the two
-/// timeouts counted. It doesn't restart the count, so the new setting applies
-/// to the time since the last `wdr`. A new window only starts with the next
-/// `wdr` (§22.3.3.2). A `wdr` takes two to three WDT clocks to sync (§22.3.6),
-/// so two of them can land a clock nearer or further apart than they ran,
-/// and the windows are judged a clock tighter each side. Whether SYNCBUSY
-/// covers a `wdr`'s sync isn't stated, so CTRLA isn't written within three
-/// WDT clocks of one.
+/// Timed in WDT clocks (§22.3.2), taking the worst case where the datasheet
+/// is silent. A write to CTRLA doesn't restart the count, and the stricter
+/// of the old and new timeouts holds while it syncs. A new window only
+/// starts with the next `wdr` (§22.3.3.2). Whether SYNCBUSY covers a `wdr`'s
+/// sync isn't stated, so CTRLA isn't written within three WDT clocks of one.
 #[derive(Default)]
 struct Wdt {
     /// When the last `wdr` ran, or the watchdog was turned on.
     since: u64,
-    /// Whether a `wdr` has started window mode's closed windows.
     windowed: bool,
-    /// A write to CTRLA still syncing, and when it lands.
     pending: Option<(u8, u64)>,
-    /// When the last `wdr` ran.
     fed_at: Option<u64>,
-    /// The firmware has read SYNCBUSY set and is waiting for the write to
-    /// land.
     polling: bool,
-    /// `wdr`s so far, while it's on.
     feeds: u32,
 }
 
-/// WDT clocks a write to WDT.CTRLA takes to sync here, the library's
-/// worst case.
+/// In WDT clocks, as are the next two.
 const WDT_SYNC_CLOCKS: u64 = SYNC_CLOCKS as u64;
-/// WDT clocks two `wdr`s' syncs can differ by, three less two (§22.3.6).
+/// Three less two (§22.3.6).
 const WDR_SPREAD: u32 = 1;
-/// WDT clocks after a `wdr` before CTRLA may be written.
 const WDR_SYNC_CLOCKS: u64 = 3;
-/// WDT.CTRLA with the window the library counts on while the light can be on.
 const WDT_LIT: u8 = regs::WDT_WINDOW_32CLK | regs::WDT_PERIOD_32CLK;
 const _: () = {
     assert!(wdt_clocks(WDT_LIT & WDT_PERIOD) == OPEN_CLOCKS as u32);
     assert!(wdt_clocks((WDT_LIT & WDT_WINDOW) >> 4) == CLOSED_CLOCKS as u32);
 };
 
-/// WDT clocks in a WDT.CTRLA PERIOD or WINDOW setting, 0 for off.
 const fn wdt_clocks(setting: u8) -> u32 {
     match setting {
         0 => 0,
@@ -2315,29 +1705,19 @@ const fn wdt_clocks(setting: u8) -> u32 {
     }
 }
 
-/// When each step of `main`'s start-up first happened, in `Chip::now`, for
-/// `boot_order`.
+/// Each in `Chip::now`.
 #[derive(Default)]
 struct Boot {
-    /// The first RSTCTRL.RSTFR write, `hw::take_reset_flags`.
     flags_cleared: Option<u64>,
-    /// The first CRCSCAN.CTRLA write, `hw::flash_ok`.
     flash_checked: Option<u64>,
-    /// The first fuse read, `hw::fuses`.
     fuses_read: Option<u64>,
-    /// The first MVIO.STATUS read, `hw::vddio2_ok`.
     supply_read: Option<u64>,
-    /// The first write that isn't one of those or PORTC's, so the start of
-    /// `hw::init`.
     set_up: Option<u64>,
-    /// The first RTC.PITCTRLA write with PITEN.
     pit_on: Option<u64>,
-    /// The first WDT.CTRLA write, `hw::start_watchdog`.
     watchdog_on: Option<u64>,
 }
 
 impl Boot {
-    /// Notes a register write at `now`.
     fn write(&mut self, now: u64, a: usize, value: u8) {
         let first = |slot: &mut Option<u64>| _ = slot.get_or_insert(now);
         match a {
@@ -2396,68 +1776,47 @@ impl Boot {
     }
 }
 
-/// CRCSCAN's state beyond its plain registers.
 struct CrcScan {
-    /// The instruction that last wrote ENABLE, and what STATUS read just
-    /// before it.
     started: Option<(u64, u8)>,
-    /// Reads of STATUS still to show BUSY.
     busy_reads: u8,
-    /// STATUS once the scan's done. OK from reset (§30.5.3), before any scan,
-    /// which is why the firmware has to wait for its own.
+    /// OK from reset, before any scan (§30.5.3).
     status: u8,
 }
 
-/// ADC0's state beyond its plain registers.
 #[derive(Default)]
 struct Adc {
-    /// The input and reference the last conversion used, to spot a switch.
     last_setup: Option<(u8, u8)>,
-    /// The result of the last conversion started.
     result: u16,
-    /// When that conversion finishes, while its result's unread.
     ready_at: Option<u64>,
-    /// The high byte of RES, latched into ADC0.TEMP by reading the low byte.
     temp: Option<u8>,
 }
 
-/// DAC0, beyond DAC0.CTRLA in `Chip::io`.
 #[derive(Default)]
 struct Dac {
-    /// The 10-bit code the output follows.
     code: u16,
-    /// DAC0's TEMP, holding DATAL until DATAH is written.
     temp: Option<u8>,
-    /// When the code last went to 0, which is when the output started
-    /// falling there. Meaningless while it isn't 0.
+    /// Meaningless while `code` isn't 0.
     zero_since: u64,
 }
 
-/// TCB0, beyond the 8-bit registers in `Chip::io`.
 #[derive(Default)]
 struct Tcb {
     ccmp: u16,
-    /// CNT as last written, or where it stopped.
     cnt: u16,
-    /// TCB0's TEMP, and which register's write it's holding.
     temp: Option<(usize, u8)>,
-    /// INTFLAGS.CAPT.
     capt: bool,
-    /// When CAPT last went up from clear.
     capt_up_at: u64,
-    /// When CNT next reaches CCMP, while it's running.
     next_capt: u64,
 }
 
 impl Tcb {
-    /// Clocks in a period, counting 0 to CCMP.
+    /// Taken as CCMP + 1, which the datasheet doesn't state (§24.3.3.1.1).
     fn period(&self) -> u64 {
         u64::from(self.ccmp) + 1
     }
 }
 
-/// Bits of `Chip::interrupted`, one per peripheral with a TEMP the firmware
-/// uses.
+/// Bits of `Chip::interrupted`.
 const TEMP_TCB0: u8 = 1 << 0;
 const TEMP_DAC0: u8 = 1 << 1;
 const TEMP_ADC0: u8 = 1 << 2;
@@ -2465,113 +1824,64 @@ const TEMP_ADC0: u8 = 1 << 2;
 struct Chip {
     flash: Vec<u8>,
     sram: Vec<u8>,
-    /// Plain storage for the registers that are only storage.
     io: Vec<u8>,
-    /// The time, counted an instruction at a time while the CPU's awake, and
-    /// jumping on to the next event while it sleeps.
+    /// Counts instructions while awake and jumps to the next event asleep.
     now: u64,
-    /// When something next happens, so most instructions needn't look.
     next_event: u64,
-    /// The last instruction a protected register still takes a write on.
     unlocked_until: Option<u64>,
-    /// Whether the CCP period's still holding interrupts off. The key's first
-    /// store to the bus or `sleep` ends it.
+    /// The key's first store to the bus or `sleep` ends it.
     ccp_hold: bool,
     pressed: bool,
     pit_busy: u8,
-    /// RTC.PITINTFLAGS.PI.
     pit_flag: bool,
-    /// PORTD.INTFLAGS.
     portd_flags: u8,
-    /// When the PIT's current period ends.
     next_pit: u64,
-    /// Main clocks in a PIT period, which is the 32 kHz oscillator's speed
-    /// against the main one's. `TICK_CYCLES` unless a run slows it.
+    /// Main clocks.
     tick_cycles: u64,
-    /// The 32 kHz oscillator has stopped. The PIT and the WDT both count it
-    /// (§26.4.1.1, §22.3.2), so neither does anything more, and a period is
-    /// only that much time going by. The firmware writes neither after
-    /// start-up, so a sync left waiting on the oscillator isn't modelled.
+    /// Stops the PIT and the WDT (§26.4.1.1, §22.3.2). A sync left waiting
+    /// on it isn't modelled.
     osc32k_stopped: bool,
-    /// The last `sleep` ran with no interrupt enabled, so only a reset wakes
-    /// the chip (§13.3.1), and this one has no resets.
+    /// Only a reset wakes the chip (§13.3.1), and resets aren't modelled.
     down: bool,
-    /// PIT periods so far with the PIT on.
     ticks: u32,
-    /// Of those, the ones with the PIT slow.
     slow_ticks: u32,
-    /// Edges of the 64 Hz grid so far, the prescaler's bit for 512 cycles,
-    /// whatever the PIT's period. A slow PIT ticks on every 64th
-    /// (`testing::next_slow`), the prescaler's bit for 32,768.
+    /// Edges of the 64 Hz grid, whatever the PIT's period.
     grid: u32,
-    /// The grid edge the PIT next ticks on.
     pit_next: u32,
-    /// Where the first tick after a change of period lands.
+    /// The datasheet doesn't state where the first tick after a change of
+    /// period lands (§26.5.2.2).
     pit_phase: PitPhase,
-    /// Reads of VPORTD.IN by the main loop, which reads it once a pass.
     switch_reads: u32,
-    /// When the main loop last read VPORTD.IN.
     switch_read_at: u64,
-    /// Puts PD4's flag up with every slow PIT tick, as an edge with the
-    /// switch not moving, so its handler runs with the tick already due and
-    /// before that tick's pass reads the switch (`stale_edges`).
     edge_with_slow_tick: bool,
-    /// Edges `edge_with_slow_tick` has put up.
     edges_with_ticks: u32,
-    /// Instructions the main loop has spent waiting on WDT.STATUS.SYNCBUSY.
     wdt_waits: u64,
-    /// Whether the firmware's gone to sleep since this was cleared.
     tick_polled: bool,
     tcb: Tcb,
     dac: Dac,
     wdt: Wdt,
     crc: CrcScan,
     adc: Adc,
-    /// RSTCTRL.RSTFR.
     rstfr: u8,
-    /// What the ADC measures, whether VDDIO2 is there, and the fuses.
     world: World,
-    /// When MVIO.STATUS.VDDIO2S last dropped, while it's still clear.
     vddio2_lost_at: Option<u64>,
-    /// Whether the light was lit when it dropped, PC1 set in PORTC and DAC0
-    /// above 0, so a run can tell it took VDDIO2 from a lit torch.
     lost_lit: bool,
-    /// When RTC.PITINTFLAGS.PI was last cleared, which is the firmware
-    /// taking a tick, and the start of the pass of the main loop that it
-    /// wakes.
     tick_taken_at: u64,
-    /// Takes VDDIO2 away at the worst moment for a firmware that looks once
-    /// a pass, rather than as the tick begins (`Chip::enter`).
     late_vddio2: bool,
-    /// VDDIO2 goes straight after the next read of MVIO.STATUS, or as the
-    /// firmware next sleeps if it gets there without looking.
     vddio2_going: bool,
-    /// A bit per vector whose interrupt is enabled.
     enabled: u64,
-    /// A request `force_interrupt` put up, until the CPU takes it.
     forced: Option<u8>,
-    /// Whether the instruction running is in a handler.
     in_handler: bool,
-    /// Whether SREG.I was set as the instruction running started.
+    /// As the running instruction started.
     interrupts_on: bool,
-    /// The TEMPs the running handler caught halfway through an access, which
-    /// it mustn't disturb (`TEMP_TCB0` and the rest).
     interrupted: u8,
-    /// When PC1 last rose.
     pc1_rose_at: u64,
-    /// When VREF.DAC0REF last changed.
     vref_changed_at: u64,
-    /// Times `sleep` has run in power-down.
     power_downs: u32,
-    /// Writes to anything but SRAM so far.
     register_writes: u32,
     boot: Boot,
-    /// Times PC1 has risen.
     pc1_rises: u32,
-    /// TWI0's host and the AW2016 on its bus (`twi.rs`).
     twi: Twi,
-    /// A test program that never drives the aux, so `in_step` doesn't hold
-    /// it to them.
     aux_unwired: bool,
 }
 
@@ -2638,25 +1948,9 @@ impl Chip {
         }
     }
 
-    /// Puts up a request for `vector`, from a peripheral the model doesn't
-    /// have, for a run to see what the firmware does with an interrupt it
-    /// never enabled. The CPU takes it like any other, at the next
-    /// instruction boundary where SREG.I is set and nothing holds interrupts
-    /// off (LVL0EX, `sei`, SPL or the CCP key), lowest vector first, pushing
-    /// PC, leaving SREG alone and jumping to the vector's slot (`avr.rs`).
-    ///
-    /// This is a stand-in, and a one-shot one. It isn't in `enabled`, so it
-    /// wakes nothing and the rule about enabling an interrupt with no handler
-    /// doesn't see it, and it goes once it's taken (`Sim::watch_handler`). A
-    /// real stray interrupt stays enabled and flagged, since `hw::halt`
-    /// doesn't know which peripheral to clear. With LVL0EX set it can't be
-    /// taken again, but whether a pending interrupt that's blocked like that
-    /// (LVL0EX set, SREG.I clear) still wakes `halt`'s `sleep` isn't in the
-    /// datasheet. Modelled as enabled, this chip would refuse that `sleep`
-    /// for a question the datasheet doesn't answer, so it isn't. Either way
-    /// PC1 is low before the first `sleep`, and `halt` sleeps in a loop, so
-    /// the worst case is spinning dark rather than sleeping dark, until the
-    /// watchdog resets the chip about 63 ms later.
+    /// One-shot, and wakes nothing, where a real stray interrupt stays
+    /// enabled and flagged. Whether one blocked by LVL0EX still wakes
+    /// `hw::halt`'s `sleep` isn't in the datasheet.
     const fn force_interrupt(&mut self, vector: u8) {
         self.forced = Some(vector);
     }
@@ -2665,12 +1959,10 @@ impl Chip {
         &self.sram[usize::from(range.start - SRAM.start)..usize::from(range.end - SRAM.start)]
     }
 
-    /// PC1, as the boost converter sees it, with VDDIO2 there.
     fn enabled_high(&self) -> bool {
         self.io[reg::VPORTC_OUT] & self.io[reg::VPORTC_DIR] & ENABLE != 0
     }
 
-    /// The power paths that are on, as a PORTA mask.
     fn paths(&self) -> u8 {
         self.io[reg::VPORTA_OUT] & self.io[reg::VPORTA_DIR] & PATHS
     }
@@ -2679,29 +1971,23 @@ impl Chip {
         self.io[reg::VREF_DAC0REF]
     }
 
-    /// MVIO.STATUS.VDDIO2S. It reads 1 with single supply, since PORTC is on
-    /// VDD then (§19.3.1).
+    /// Reads 1 with single supply (§19.3.1).
     fn vddio2_ok(&self) -> bool {
         self.world.vddio2s()
     }
 
-    /// Puts the chip in `world`, which a run does between passes. A change
-    /// of VDDIO2 is the only part of it the chip has to act on.
     fn set_world(&mut self, world: World) -> Result<(), String> {
         let was = self.vddio2_ok();
         self.world = world;
         self.vddio2_moved(was)
     }
 
-    /// Takes VDDIO2 away, or brings it back, now.
     fn set_vddio2(&mut self, there: bool) -> Result<(), String> {
         let was = self.vddio2_ok();
         self.world.scene.vddio2 = there;
         self.vddio2_moved(was)
     }
 
-    /// `set_world` as a tick begins. With `late_vddio2`, a world that takes
-    /// VDDIO2 away keeps it for now and arms `vddio2_goes` instead.
     fn enter(&mut self, mut world: World) -> Result<(), String> {
         if self.late_vddio2 && self.world.scene.vddio2 && !world.scene.vddio2 {
             world.scene.vddio2 = true;
@@ -2710,14 +1996,8 @@ impl Chip {
         self.set_world(world)
     }
 
-    /// Takes VDDIO2 away if `enter` armed it. The chip calls this straight
-    /// after a read of MVIO.STATUS, which has already had its answer, and as
-    /// the firmware sleeps. For a firmware that looks once a pass that's the
-    /// longest it can go unseen, a whole tick and the pass that then finds
-    /// it. For one that never looks it's the end of the pass, and nothing
-    /// finds it. A firmware that looked more than once a pass would see this
-    /// sooner than `in_step` tells the library, and this would need another
-    /// way of choosing its moment.
+    /// A firmware that looked more than once a pass would see this sooner
+    /// than `in_step` tells the library.
     fn vddio2_goes(&mut self) -> Result<(), String> {
         if !self.vddio2_going {
             return Ok(());
@@ -2726,18 +2006,9 @@ impl Chip {
         self.set_vddio2(false)
     }
 
-    /// MVIO.STATUS.VDDIO2S has just changed, if `was` isn't what it reads
-    /// now. Without VDDIO2 the MVIO pins are tri-stated, and when it comes
-    /// back they "reload the current configuration of the PORT registers"
-    /// (§19.3.2.1). So if PORTC still has PC1 high then, PC1 rises there and
-    /// then, and it's held to everything a rise is. The datasheet gives no
-    /// delay for either, so both are taken as at once.
-    ///
-    /// Nothing here says what the driver's enable does while PC1 is
-    /// tri-stated. That's the board's, and nobody knows it. The worst case
-    /// is that it stays wherever it was, so the firmware is held to what it
-    /// still controls (`dark_without_vddio2`), and `enabled_high` goes on
-    /// meaning what PORTC asks for.
+    /// §19.3.2.1. The datasheet gives no delay either way, so both are taken
+    /// as at once. What the driver's enable does while PC1 is tri-stated is
+    /// unknown.
     fn vddio2_moved(&mut self, was: bool) -> Result<(), String> {
         let ok = self.vddio2_ok();
         if was && !ok {
@@ -2758,18 +2029,7 @@ impl Chip {
         Ok(())
     }
 
-    /// With MVIO.STATUS.VDDIO2S clear, PC1 is tri-stated whatever PORTC says
-    /// (§19.3.2.1), so nothing the firmware writes holds the driver's enable,
-    /// and DAC0 and the paths, which are on VDD, are all it has left. A pass
-    /// of the main loop that took its tick with VDDIO2S already clear has
-    /// them at 0 and low before it sleeps, with PC1 clear in PORTC as well,
-    /// so the pin has nothing to take up if VDDIO2 comes back. That's a tick
-    /// and a pass after it went, at most. A pass that was already under way
-    /// when it went is let off, since it may have looked before then.
-    ///
-    /// It's the firmware's rule, not the datasheet's. One that waited for a
-    /// second reading before acting would fail it, and that would be a
-    /// choice to make here on purpose.
+    /// The firmware's rule, not the datasheet's.
     fn dark_without_vddio2(&self) -> Result<(), String> {
         let Some(lost) = self.vddio2_lost_at else {
             return Ok(());
@@ -2789,9 +2049,8 @@ impl Chip {
         ))
     }
 
-    /// Refuses a chip `hw::init` left on a clock or a timer the model doesn't
-    /// have. Writes of anything else are refused already, so this is what
-    /// catches a write that never happened.
+    /// Writes of anything else are refused already, so this is what catches
+    /// a write that never happened.
     fn clocked_as_modelled(&self) -> Result<(), String> {
         if self.io[reg::CLKCTRL_OSCHFCTRLA] != OSCHF_4MHZ || self.io[reg::CLKCTRL_MCLKCTRLB] != 0 {
             return Err("isn't on the internal oscillator at 4 MHz, undivided".into());
@@ -2820,8 +2079,6 @@ impl Chip {
         self.io[reg::SLPCTRL_CTRLA] == SLEEP_POWER_DOWN | SLPCTRL_SEN
     }
 
-    /// Spends the CCP key on a write to protected register `a`, or refuses
-    /// the write if there's no key to spend.
     fn take_protected_write(&mut self, a: usize) -> Result<(), String> {
         if self.unlocked_until.is_none_or(|until| self.now > until) {
             return Err(format!(
@@ -2834,8 +2091,7 @@ impl Chip {
         Ok(())
     }
 
-    /// Moves time on to `to`, and runs whatever falls due on the way. This is
-    /// the one place simulated time moves.
+    /// The one place simulated time moves.
     fn advance_to(&mut self, to: u64) -> Result<(), String> {
         self.now = to;
         if self.now < self.next_event {
@@ -2878,8 +2134,6 @@ impl Chip {
         if let Some((value, at)) = self.wdt.pending
             && self.now >= at
         {
-            // The count carries on from the last `wdr`, and a window only
-            // starts with the next one.
             self.wdt_check()?;
             self.io[reg::WDT_CTRLA] = value;
             self.wdt.pending = None;
@@ -2891,7 +2145,6 @@ impl Chip {
         Ok(())
     }
 
-    /// The PIT's period, from RTC.PITCTRLA.
     fn pit(&self) -> Pit {
         if self.io[reg::RTC_PITCTRLA] & regs::RTC_PERIOD == regs::RTC_PERIOD_CYC32768 {
             Pit::Slow
@@ -2900,19 +2153,15 @@ impl Chip {
         }
     }
 
-    /// Main clocks in `clocks` WDT clocks.
     const fn wdt_time(&self, clocks: u64) -> u64 {
         clocks * self.tick_cycles / WDT_CLOCKS_PER_TICK as u64
     }
 
-    /// The open window in WDT clocks, which is the whole timeout in normal
-    /// mode, or 0 with the WDT off.
     fn wdt_open(&self) -> u32 {
         wdt_clocks(self.io[reg::WDT_CTRLA] & WDT_PERIOD)
     }
 
-    /// The closed window in WDT clocks, 0 in normal mode or before the first
-    /// `wdr` starts window mode (§22.3.3.2).
+    /// §22.3.3.2
     fn wdt_closed(&self) -> u32 {
         if self.wdt.windowed {
             wdt_clocks((self.io[reg::WDT_CTRLA] & WDT_WINDOW) >> 4)
@@ -2921,14 +2170,11 @@ impl Chip {
         }
     }
 
-    /// Whether the watchdog's on, or turning on.
     fn wdt_on(&self) -> bool {
         self.wdt_open() > 0 || self.wdt.pending.is_some()
     }
 
-    /// The timeout in WDT clocks from the last `wdr`, 0 with the WDT off.
-    /// While a write syncs, the shorter of the setting in force and the open
-    /// window of the one coming, since which counts meanwhile isn't stated.
+    /// While a write syncs, which setting counts isn't stated, so the shorter.
     fn wdt_timeout(&self) -> u32 {
         let now = self.wdt_closed() + self.wdt_open();
         match self.wdt.pending {
@@ -2940,21 +2186,17 @@ impl Chip {
         }
     }
 
-    /// WDT clocks since the last `wdr`, rounded down.
     const fn wdt_elapsed(&self) -> u64 {
         (self.now - self.wdt.since) * WDT_CLOCKS_PER_TICK as u64 / self.tick_cycles
     }
 
-    /// When the watchdog bites if nothing feeds it, a clock early for a
-    /// `wdr` that synced fast, or `None` with it off.
+    /// A clock early, for a `wdr` that synced fast.
     fn wdt_bite_at(&self) -> Option<u64> {
         let timeout = self.wdt_timeout();
         (timeout > 0)
             .then(|| self.wdt.since + self.wdt_time(u64::from(timeout.saturating_sub(WDR_SPREAD))))
     }
 
-    /// PIT periods that can still go by without a `wdr` before the watchdog
-    /// bites, up to `DOWN_PERIODS`, which is all of them with it off.
     fn wdt_periods_left(&self) -> u64 {
         match self.wdt_bite_at() {
             None => DOWN_PERIODS,
@@ -2963,9 +2205,7 @@ impl Chip {
         }
     }
 
-    /// The watchdog, checked on every grid edge and as a write lands. It runs
-    /// in every sleep mode (§22.3.4). A stopped 32 kHz oscillator stops it.
-    /// Nothing here resets the chip, so running out is the firmware failing.
+    /// The watchdog runs in every sleep mode (§22.3.4).
     fn wdt_check(&self) -> Result<(), String> {
         if self.osc32k_stopped {
             return Ok(());
@@ -2981,7 +2221,6 @@ impl Chip {
         }
     }
 
-    /// CRCSCAN.STATUS as a read sees it now.
     const fn crc_status(&mut self) -> u8 {
         match self.crc.started {
             Some((at, before)) if self.now <= at + CRC_START_INSTRUCTIONS => before,
@@ -2993,8 +2232,7 @@ impl Chip {
         }
     }
 
-    /// Starts a whole-flash scan. That's CRC-16-CCITT over every byte of
-    /// flash, erased bytes reading 0xFF, passing if it comes to 0.
+    /// §30.3.2
     fn start_crc(&mut self) -> Result<(), String> {
         let ctrlb = self.io[reg::CRCSCAN_CTRLB];
         if ctrlb != CRCSCAN_SRC_FLASH {
@@ -3018,9 +2256,6 @@ impl Chip {
         self.adc.ready_at.is_some_and(|at| self.now < at)
     }
 
-    /// Starts a conversion, if the ADC's set up for one of the two
-    /// measurements the firmware makes, and works out what it'll read and
-    /// when.
     fn start_conversion(&mut self) -> Result<(), String> {
         if self.converting() {
             return Err("starts a conversion while one's still running".into());
@@ -3056,19 +2291,11 @@ impl Chip {
         let muxpos = io(reg::ADC0_MUXPOS);
         let channel = match (muxpos, reference) {
             (ADC_MUXPOS_VDDDIV10, VREF_REFSEL_1V024) => Channel::Voltage,
-            // Section 33.5.7 names the input and says nothing more about it.
-            // It reads `testing::GROUND_READING`, the worst offset table
-            // 38-24 allows, since a single-ended result can't go under 0.
+            // §33.5.7 says no more, so the worst offset table 38-24 allows.
             (ADC_MUXPOS_GND, VREF_REFSEL_1V024) => Channel::Ground,
-            // VDDIO2 / 10, which section 33.5.7 names and says nothing more
-            // about. It reads the world's VDDIO2, the cell unless a run says
-            // otherwise, and 0 with VDDIO2 missing, which the datasheet
-            // doesn't say either, so it's the reading furthest from a rail
-            // that's there.
+            // What it reads with VDDIO2 missing isn't stated, so 0.
             (ADC_MUXPOS_VDDIO2DIV10, VREF_REFSEL_1V024) => Channel::Vddio2,
             (ADC_MUXPOS_TEMPSENSE, VREF_REFSEL_2V048) => {
-                // Section 33.3.3.8 wants at least 25 µs of INITDLY and 28 µs
-                // of SAMPLEN, in ADC clocks.
                 let need = |us: u32| (clk_adc * us).div_ceil(1_000_000);
                 if initdly < need(25) || samplen < need(28) {
                     return Err(format!(
@@ -3089,17 +2316,14 @@ impl Chip {
             }
         };
         let setup = Some((muxpos, reference));
-        // VDDIO2 / 10 with VDDIO2 missing reads 0 (`Scene::reading` has why).
         self.adc.result = if self.adc.last_setup == setup {
             self.world.reading(channel)
         } else {
             UNSETTLED
         };
         self.adc.last_setup = setup;
-        // Section 33.3.3.4.4's sum for four samples, plus INITDLY, which
-        // only applies after an enable or a reference change but is counted
-        // every time, so a result is never early. In main clocks, which the
-        // model's time can only fall short of.
+        // §33.3.3.4.4. INITDLY is counted every time, so a result is never
+        // early.
         let adc_clocks = initdly + 4 * (2 + sampdly + samplen) + 4 * 27 / 2;
         let clocks = 4 + u64::from(adc_clocks) * u64::from(divide);
         self.adc.ready_at = Some(self.now + clocks);
@@ -3117,13 +2341,10 @@ impl Chip {
         }
     }
 
-    /// One instruction's worth of time.
     fn elapse(&mut self) -> Result<(), String> {
         self.advance_to(self.now + 1)
     }
 
-    /// Whether the pins are doing what `output` asks: PC1, DAC0's code, its
-    /// reference and the paths.
     fn shows(&self, output: Output) -> Result<(), String> {
         let reference = match output.vref {
             Vref::V1024 => VREF_REFSEL_1V024,
@@ -3149,8 +2370,6 @@ impl Chip {
         Ok(())
     }
 
-    /// DAC0 is at 0, which any change of reference or path wants with PC1
-    /// high. `what` says which.
     fn dac_zero(&self, what: &str) -> Result<(), String> {
         if self.dac.code != 0 {
             return Err(format!(
@@ -3162,8 +2381,6 @@ impl Chip {
         Ok(())
     }
 
-    /// DAC0's output is at 0 and has had time to get there, which a raised
-    /// reference or an added path wants with PC1 high. `what` says which.
     fn dac_quiet(&self, what: &str) -> Result<(), String> {
         self.dac_zero(what)?;
         let since = self.now - self.dac.zero_since;
@@ -3176,11 +2393,7 @@ impl Chip {
         Ok(())
     }
 
-    /// Presses or releases the switch on PD4. A change sets PD4's flag in
-    /// PORTD.INTFLAGS if its ISC asks for that edge (§18.3.3).
-    ///
-    /// `Sim::tick` only moves the switch between ticks, so an edge that's
-    /// asked for always raises its flag.
+    /// §18.3.3
     fn set_switch(&mut self, pressed: bool) -> Result<(), String> {
         if pressed == self.pressed {
             return Ok(());
@@ -3203,9 +2416,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A bit per vector, a port's being set when any of its pins senses, the
-    /// PIT's when its interrupt's on, and TCB0's when its interrupt's on and
-    /// `tcb` says it counts.
     fn interrupts(&self, tcb: bool) -> u64 {
         let port = |base: usize, vector: u8| {
             let on = (0..8).any(|pin| senses(self.io[base + pin] & PORT_ISC));
@@ -3224,8 +2434,6 @@ impl Chip {
         self.enabled = self.interrupts(true);
     }
 
-    /// The TEMPs a handler landing now would catch halfway, as
-    /// `Chip::interrupted` bits.
     const fn temps_in_use(&self) -> u8 {
         (if self.tcb.temp.is_some() {
             TEMP_TCB0
@@ -3242,8 +2450,6 @@ impl Chip {
         })
     }
 
-    /// What has to be true before `sleep` in power-down. The light has to be
-    /// off, and nothing left running that power-down would leave stuck.
     fn ready_for_power_down(&self) -> Result<(), String> {
         if self.enabled_high() {
             return Err(
@@ -3284,7 +2490,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A write to PORTx.PINnCTRL, refusing what the board can't take.
     fn write_pin_ctrl(&mut self, a: usize, value: u8) -> Result<(), String> {
         let pull_up = value & PORT_PULLUPEN != 0;
         let pin = |base: usize, n: u8| base + usize::from(n);
@@ -3349,7 +2554,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A write to VPORTA.OUT or DIR, watching the paths.
     fn write_porta(&mut self, a: usize, value: u8) -> Result<(), String> {
         if value & TWI != 0 {
             return Err(format!(
@@ -3381,7 +2585,6 @@ impl Chip {
         checked
     }
 
-    /// A write to VPORTC.OUT or DIR, watching what PC1 does.
     fn write_portc(&mut self, a: usize, value: u8) -> Result<(), String> {
         if value & !ENABLE != 0 {
             return Err(format!(
@@ -3393,14 +2596,12 @@ impl Chip {
         self.io[a] = value;
         let moved = self.pc1_moves(was);
         if moved.is_err() {
-            // A refused write changes nothing, so a test can carry on.
             self.io[a] = old;
         }
         moved
     }
 
-    /// Checks PC1's rise or fall against the rules, once VPORTC's been
-    /// written. `was` is whether it was high before.
+    /// `was` is whether PC1 was high before the write.
     fn pc1_moves(&mut self, was: bool) -> Result<(), String> {
         let high = self.enabled_high();
         if high && !was {
@@ -3429,9 +2630,6 @@ impl Chip {
                     self.paths()
                 ));
             }
-            // The watchdog's lit setting, synced and started by a `wdr`, so a
-            // hang with the light on bites within its window. A firmware with
-            // no watchdog at all, examples/guards.rs, is held to the rest.
             if self.wdt_on()
                 && (self.io[reg::WDT_CTRLA] != WDT_LIT
                     || self.wdt.pending.is_some()
@@ -3483,8 +2681,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A write to VPORTD.OUT or DIR. Only PD6 is ever an output, and PORT
-    /// only ever holds it low under DAC0.
     fn write_portd(&mut self, a: usize, value: u8) -> Result<(), String> {
         let refused = match a {
             reg::VPORTD_DIR => value & !DAC_PIN != 0,
@@ -3501,8 +2697,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A write to VREF.DAC0REF, which only goes up with DAC0 quiet if PC1's
-    /// high.
     fn write_dac_reference(&mut self, value: u8) -> Result<(), String> {
         if value != VREF_REFSEL_1V024 && value != VREF_REFSEL_2V500 {
             return Err(format!(
@@ -3522,7 +2716,6 @@ impl Chip {
         Ok(())
     }
 
-    /// DAC0's output changes to `code`, as DATAH's write lands.
     fn set_dac(&mut self, code: u16) -> Result<(), String> {
         if code != 0 {
             if !self.enabled_high() {
@@ -3553,7 +2746,6 @@ impl Chip {
         Ok(())
     }
 
-    /// A write to TCB0.CTRLA, starting or stopping it.
     fn write_tcb_ctrla(&mut self, value: u8) -> Result<(), String> {
         let running = self.tcb_running();
         match value {
@@ -3583,7 +2775,6 @@ impl Chip {
         Ok(())
     }
 
-    /// The firmware has finished writing a 16-bit TCB0 register.
     fn tcb_written(&mut self, low: usize, value: u16) -> Result<(), String> {
         match low {
             reg::TCB0_CCMP if self.tcb_running() => Err(
@@ -3611,9 +2802,6 @@ impl Chip {
         }
     }
 
-    /// Refuses an access to `a` by a handler that caught the main loop
-    /// halfway through a 16-bit register of the same peripheral, since they
-    /// share its TEMP (§8.10.3).
     fn temp_undisturbed(&self, a: usize) -> Result<(), String> {
         let wide = [
             (TEMP_TCB0, reg::TCB0_CNT..reg::TCB0_CCMP + 2, "TCB0"),
@@ -3634,8 +2822,7 @@ impl Chip {
     }
 }
 
-/// CLK_PER's divisor for ADC0.CTRLC.PRESC, which is a table of named values
-/// rather than a shift (§33.5.3).
+/// CLK_PER's divisor for ADC0.CTRLC.PRESC (§33.5.3).
 const fn adc_prescaler(presc: u8) -> Option<u32> {
     Some(match presc {
         regs::ADC_PRESC_DIV2 => 2,
@@ -3669,7 +2856,6 @@ const fn adc_initdly(initdly: u8) -> Option<u32> {
     })
 }
 
-/// Registers that are plain storage as far as the firmware's concerned.
 fn plain(addr: usize) -> bool {
     (reg::GPR_GPR0..=reg::GPR_GPR3).contains(&addr)
         || matches!(
@@ -3684,7 +2870,6 @@ fn plain(addr: usize) -> bool {
         )
 }
 
-/// Whether `addr` is one of TWI0's registers.
 fn twi(addr: usize) -> bool {
     (reg::TWI0_CTRLA..reg::TWI0_CTRLA + 0x10).contains(&addr)
 }
@@ -3699,7 +2884,6 @@ fn pin_ctrl(addr: usize) -> bool {
     .any(|&base| (base..base + 8).contains(&addr))
 }
 
-/// Whether `addr` is one of PORTF's registers, or VPORTF's.
 fn portf(addr: usize) -> bool {
     (reg::PORTF_DIR..=reg::PORTF_PIN7CTRL).contains(&addr)
         || (reg::VPORTF_DIR..=reg::VPORTF_INTFLAGS).contains(&addr)
@@ -3717,8 +2901,7 @@ fn vector_name(vector: u8) -> String {
     }
 }
 
-/// The registers that decide what a conversion measures. Changing one
-/// mid-conversion gives unpredictable results (§33.3.2) or isn't modelled.
+/// Changing one mid-conversion gives unpredictable results (§33.3.2).
 const ADC_SETUP: [usize; 7] = [
     reg::VREF_ADC0REF,
     reg::ADC0_CTRLA,
@@ -3729,7 +2912,6 @@ const ADC_SETUP: [usize; 7] = [
     reg::ADC0_MUXPOS,
 ];
 
-/// The fuses and the lock bytes after them.
 fn fuse_or_lock(addr: usize) -> bool {
     let fuses = usize::from(map::FUSES);
     let lock = usize::from(map::LOCK);
@@ -3834,8 +3016,6 @@ impl Bus for Chip {
         }
         self.wdt_check()?;
         let closed = self.wdt_closed();
-        // A clock tighter, for a `wdr` that synced slow after one that synced
-        // fast.
         let edge = self.wdt.since + self.wdt_time(u64::from(closed + WDR_SPREAD));
         if closed > 0 && self.now <= edge {
             return Err(format!(
@@ -3851,9 +3031,7 @@ impl Bus for Chip {
         Ok(())
     }
 
-    /// Lowest vector first, the default static priority (§15.3.2.4.3). A
-    /// port's request is a flag on a pin whose ISC senses, and the PIT's and
-    /// TCB0's are the flag and the enable together. So is `force_interrupt`'s.
+    /// Lowest vector first, the default static priority (§15.3.2.4.3).
     fn interrupt(&self) -> Option<u8> {
         let sensing = (0..8).fold(0u8, |bits, pin| {
             let on = senses(self.io[reg::PORTD_PIN0CTRL + pin] & PORT_ISC);
@@ -3867,17 +3045,13 @@ impl Bus for Chip {
         (requests != 0).then(|| requests.trailing_zeros() as u8)
     }
 
-    /// Interrupts are ignored for the four instructions after the key, and
-    /// left pending (§7.6.1). That the store or `sleep` which ends the
-    /// protected change ends this too is likely, not stated.
+    /// §7.6.1. That the store or `sleep` ending the protected change ends
+    /// this too is likely, not stated.
     fn holds_interrupts(&self) -> bool {
         self.ccp_hold && self.unlocked_until.is_some_and(|until| self.now <= until)
     }
 
-    /// With an interrupt enabled that can't wake it from the mode it's in,
-    /// that's a mistake. With none enabled at all, it's the chip stopping for
-    /// good, since only a reset wakes it (§13.3.1). That sets `down`, which is
-    /// for whoever's running the chip to judge.
+    /// With no interrupt enabled, only a reset wakes it (§13.3.1).
     fn sleep(&mut self) -> Result<bool, String> {
         self.dark_without_vddio2()?;
         self.vddio2_goes()?;
@@ -3917,8 +3091,7 @@ impl Bus for Chip {
         }
         let mut wakes = if self.powering_down() {
             self.power_downs += 1;
-            // Every pin senses asynchronously (section 18.3.3.1), and TCB0
-            // is halted (table 13-4).
+            // §18.3.3.1, table 13-4.
             self.interrupts(false)
         } else if ctrla == SLEEP_IDLE | SLPCTRL_SEN {
             self.enabled
@@ -3938,8 +3111,7 @@ impl Bus for Chip {
         Ok(wakes != 0)
     }
 
-    /// Jumps to the next thing that happens. TCB0 halts in power-down
-    /// (§24.3.6), so its count waits for it there.
+    /// TCB0 halts in power-down (§24.3.6).
     fn idle(&mut self) -> Result<(), String> {
         if self.powering_down() {
             self.tcb.next_capt += self.next_pit - self.now;
@@ -3968,16 +3140,11 @@ impl Bus for Chip {
             return Ok(self.sram[usize::from(addr - SRAM.start)]);
         }
         if addr >= MAPPED {
-            // Erased flash past the end of the image reads as 0xFF.
             return Ok(*self.flash.get(usize::from(addr - MAPPED)).unwrap_or(&0xFF));
         }
         match a {
-            // PD4 reads through its input buffer, against the board's own
-            // pull-up, so a released switch reads 1 and a pressed one 0. IN
-            // follows the pin at once here. The real one stops following it
-            // in power-down, since input synchronisation runs off CLK_PER
-            // (section 18.3.5), and the datasheet doesn't say how soon after
-            // a wake it's caught up.
+            // The real IN stops following the pin in power-down (§18.3.5), and
+            // how soon after a wake it catches up isn't stated.
             reg::VPORTD_IN => {
                 if self.io[SWITCH_CTRL] & PORT_ISC == ISC_INPUT_DISABLE {
                     return Err(
@@ -4018,7 +3185,6 @@ impl Bus for Chip {
             reg::RSTCTRL_RSTFR => Ok(self.rstfr),
             reg::ADC0_INTFLAGS => {
                 let ready = self.adc.ready_at.is_some_and(|at| self.now >= at);
-                // A dead ADC never sets RESRDY.
                 Ok(if ready && !self.world.scene.adc_dead {
                     ADC_RESRDY
                 } else {
@@ -4026,8 +3192,7 @@ impl Bus for Chip {
                 })
             }
             reg::ADC0_RES => {
-                // Reading the low byte latches the high byte into ADC0.TEMP
-                // (section 8.10.3) and clears RESRDY (section 33.5.12).
+                // §8.10.3, §33.5.12
                 if self.adc.ready_at.is_none_or(|at| self.now < at) {
                     return Err("reads ADC0.RES with no result ready".into());
                 }
@@ -4041,8 +3206,7 @@ impl Bus for Chip {
                  whatever ADC0.TEMP held"
                     .into()
             }),
-            // The calibration is two 16-bit words, low byte first (section
-            // 8.6.2.2).
+            // §8.6.2.2
             _ if (reg::SIGROW_TEMPSENSE0..reg::SIGROW_TEMPSENSE0 + 2).contains(&a) => {
                 Ok(CALIBRATION.slope.to_le_bytes()[a - reg::SIGROW_TEMPSENSE0])
             }
@@ -4189,10 +3353,7 @@ impl Bus for Chip {
                         "writes {value:#04x} to TCB0.INTCTRL; the simulator only models CAPT"
                     ));
                 }
-                // The request is the flag and the enable together (section
-                // 24.3.5), and the flag goes up whether the interrupt's on or
-                // not, so one left up from before fires at once. One that went
-                // up since a clear, within a period, is a real one, and fine.
+                // A flag left up from before fires at once (§24.3.5).
                 if value != 0
                     && self.io[a] == 0
                     && self.tcb.capt
@@ -4342,8 +3503,7 @@ impl Bus for Chip {
                 }
             },
             reg::ADC0_INTFLAGS => {
-                // Writing a 1 clears RESRDY. It only clears the flag, so a
-                // conversion that's still running finishes and sets it again.
+                // A conversion still running sets the flag again.
                 if value & ADC_RESRDY != 0 && !self.converting() {
                     self.adc.ready_at = None;
                 }
@@ -4396,17 +3556,14 @@ mod tests {
     use super::*;
     use kr1k::ramp::{self, Paths};
 
-    /// A write of `value` to register `a`.
     fn poke(chip: &mut Chip, a: usize, value: u8) -> Result<(), String> {
         chip.write(a as u16, value)
     }
 
-    /// The error from a write of `value` to register `a`.
     fn refused(chip: &mut Chip, a: usize, value: u8) -> String {
         poke(chip, a, value).expect_err("the write went through")
     }
 
-    /// A write of `value` to protected register `a`, with the key just before.
     fn unlocked(chip: &mut Chip, a: usize, value: u8) -> Result<(), String> {
         poke(chip, reg::CPU_CCP, CCP_IOREG)?;
         poke(chip, a, value)
@@ -4426,8 +3583,7 @@ mod tests {
         chip.advance_to(chip.now + clocks).unwrap();
     }
 
-    /// A chip with the pins, DAC0 and TCB0 set up as `hw::init` leaves them,
-    /// the light off.
+    /// As `hw::init` leaves it.
     fn dark() -> Chip {
         let mut chip = Chip::new(Vec::new());
         for (a, value) in [
@@ -4449,8 +3605,6 @@ mod tests {
         chip
     }
 
-    /// `dark`, with TCB0 started as `set_output` starts it and PC1 raised,
-    /// then the boost converter's 8 ms gone by.
     fn lit() -> Chip {
         let mut chip = dark();
         tcb_on(&mut chip);
@@ -4484,7 +3638,6 @@ mod tests {
         let moon = Paths::Moon.mask();
         let err = rise(&|chip| poke(chip, reg::VPORTA_OUT, moon).unwrap()).unwrap_err();
         assert!(err.contains("power paths 0x80 on"), "{err}");
-        // OUT before DIR finds it the same.
         let mut chip = dark();
         poke(&mut chip, reg::VPORTC_DIR, 0).unwrap();
         poke(&mut chip, reg::VPORTC_OUT, ENABLE).unwrap();
@@ -4556,11 +3709,9 @@ mod tests {
         );
         let err = refused(&mut chip, reg::VREF_DAC0REF, VREF_REFSEL_1V024);
         assert!(err.contains("lowers VREF.DAC0REF"), "{err}");
-        // Straight after DAC0 goes to 0 is fine, as the off order has it.
         dac(&mut chip, 0).unwrap();
         poke(&mut chip, reg::VREF_DAC0REF, VREF_REFSEL_1V024).unwrap();
         poke(&mut chip, reg::VPORTA_OUT, Paths::Low.mask()).unwrap();
-        // With PC1 low nothing's asked for at all.
         let mut chip = dark();
         poke(&mut chip, reg::VPORTA_OUT, Paths::High.mask()).unwrap();
         poke(&mut chip, reg::VREF_DAC0REF, VREF_REFSEL_2V500).unwrap();
@@ -4603,7 +3754,6 @@ mod tests {
         assert!(err.contains("without its low byte"), "{err}");
         let err = refused(&mut chip, reg::DAC0_DATA, 0x01);
         assert!(err.contains("bits 5:0"), "{err}");
-        // 0x3FF << 6 is 0xFFC0, the top ten bits.
         wide(&mut chip, reg::DAC0_DATA, 0xFFC0).unwrap();
         assert_eq!(chip.dac.code, 1023);
     }
@@ -4709,7 +3859,6 @@ mod tests {
         start(&mut chip).unwrap();
         let err = chip.ready_for_power_down().unwrap_err();
         assert!(err.contains("mid-conversion"), "{err}");
-        // Fresh from reset, the PIT still reads busy.
         let chip = Chip::new(Vec::new());
         let err = chip.ready_for_power_down().unwrap_err();
         assert!(err.contains("CTRLBUSY"), "{err}");
@@ -4812,7 +3961,6 @@ mod tests {
         assert!(chip.set_switch(true).unwrap_err().contains("doesn't model"));
     }
 
-    /// The world's fuses with MVSYSCFG at single supply.
     fn single_supply(mut world: World) -> World {
         world.fuses[reg::FUSE_SYSCFG1 - reg::FUSE_WDTCFG] = regs::FUSE_MVSYSCFG_SINGLE;
         world
@@ -4829,22 +3977,17 @@ mod tests {
         chip.set_vddio2(true).unwrap();
         assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
         assert_eq!(chip.vddio2_lost_at, None);
-        // With single supply it reads 1 whatever VDDIO2 does, so the chip
-        // never counts it as lost.
         chip.set_world(single_supply(World::NORMAL)).unwrap();
         chip.set_vddio2(false).unwrap();
         assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
         assert_eq!(chip.vddio2_lost_at, None);
     }
 
-    /// The firmware taking a tick, as `hw::rtc_pit` does.
     fn take_tick(chip: &mut Chip) {
         chip.pit_flag = true;
         poke(chip, reg::RTC_PITINTFLAGS, RTC_PI).unwrap();
     }
 
-    /// `lit`, at a level on the high path, set up to sleep in idle as the
-    /// firmware does with the light on.
     fn lit_and_idling() -> Chip {
         let mut chip = lit();
         poke(&mut chip, reg::VPORTA_OUT, PATHS).unwrap();
@@ -4854,7 +3997,6 @@ mod tests {
         chip
     }
 
-    /// The driver off in the firmware's order, with TCB0 stopped.
     fn turn_off(chip: &mut Chip) {
         dac(chip, 0).unwrap();
         poke(chip, reg::VREF_DAC0REF, VREF_REFSEL_1V024).unwrap();
@@ -4866,7 +4008,6 @@ mod tests {
 
     #[test]
     fn a_pass_that_begins_without_vddio2_cant_sleep_with_the_light_on() {
-        // Gone before the tick's taken, so this pass could have seen it.
         let mut chip = lit_and_idling();
         chip.set_vddio2(false).unwrap();
         assert!(chip.lost_lit);
@@ -4877,12 +4018,9 @@ mod tests {
             err.contains("began with MVIO.STATUS.VDDIO2S clear") && err.contains("DAC0 at 300"),
             "{err}"
         );
-        // Off in PORTC, DAC0 and the paths, and it may.
         turn_off(&mut chip);
         assert_eq!(chip.sleep(), Ok(true));
 
-        // PC1 clear in PORTC isn't enough, since it's the one pin that isn't
-        // listening. The paths are still up here.
         let mut chip = lit_and_idling();
         chip.set_vddio2(false).unwrap();
         take_tick(&mut chip);
@@ -4915,8 +4053,6 @@ mod tests {
         );
     }
 
-    /// With single supply the firmware can't see VDDIO2 go, so nothing's
-    /// asked of it.
     #[test]
     fn single_supply_asks_nothing_when_vddio2_goes() {
         let mut chip = lit_and_idling();
@@ -4928,7 +4064,6 @@ mod tests {
 
     #[test]
     fn vddio2_coming_back_raises_pc1_if_portc_still_has_it_set() {
-        // Still lit in the registers, so PC1 comes up with DAC0 live.
         let mut chip = lit_and_idling();
         chip.set_vddio2(false).unwrap();
         let err = chip.set_vddio2(true).unwrap_err();
@@ -4937,15 +4072,12 @@ mod tests {
                 && err.contains("raises PC1 with DAC0 at 300"),
             "{err}"
         );
-        // Off in the registers, and it comes back to nothing.
         let mut chip = lit_and_idling();
         chip.set_vddio2(false).unwrap();
         turn_off(&mut chip);
         let rises = chip.pc1_rises;
         chip.set_vddio2(true).unwrap();
         assert_eq!(chip.pc1_rises, rises);
-        // PC1 set with DAC0 at 0 and the paths low is a rise like any other,
-        // and DAC0 waits for the boost converter again.
         let mut chip = lit();
         chip.set_vddio2(false).unwrap();
         wait(&mut chip, 100);
@@ -4961,11 +4093,9 @@ mod tests {
             ..Scene::NORMAL
         });
         let read = |chip: &mut Chip| chip.read(reg::MVIO_STATUS as u16);
-        // Not late, it's gone as the tick begins.
         let mut chip = lit_and_idling();
         chip.enter(lost).unwrap();
         assert!(!chip.vddio2_ok());
-        // Late, the look still sees it, and it's gone straight after.
         let mut chip = lit_and_idling();
         chip.late_vddio2 = true;
         chip.enter(lost).unwrap();
@@ -4976,24 +4106,20 @@ mod tests {
         assert_eq!(chip.vddio2_lost_at, Some(chip.now));
         assert_eq!(read(&mut chip), Ok(0));
         assert_eq!(chip.sleep(), Ok(true), "the pass that had already looked");
-        // The next tick's world still has it gone, and nothing's armed.
         chip.enter(lost).unwrap();
         assert!(!chip.vddio2_going && !chip.vddio2_ok());
-        // With no look at all, it goes as the pass sleeps.
         let mut chip = lit_and_idling();
         chip.late_vddio2 = true;
         chip.enter(lost).unwrap();
         take_tick(&mut chip);
         assert_eq!(chip.sleep(), Ok(true));
         assert!(!chip.vddio2_ok());
-        // Coming back is never late.
         chip.late_vddio2 = true;
         turn_off(&mut chip);
         chip.enter(World::NORMAL).unwrap();
         assert!(chip.vddio2_ok());
     }
 
-    /// A chip with the ADC set up as `hw::init` and `adc_channel` do.
     fn adc_ready(muxpos: u8) -> Chip {
         let mut chip = Chip::new(Vec::new());
         let reference = if muxpos == ADC_MUXPOS_TEMPSENSE {
@@ -5019,9 +4145,6 @@ mod tests {
         poke(chip, reg::ADC0_COMMAND, ADC_STCONV)
     }
 
-    /// Instructions a conversion as `adc_ready` sets it up takes: 32 ADC
-    /// clocks of INITDLY and four samples of 2 + 32 + 13.5, at four main
-    /// clocks each, and four main clocks more.
     const CONVERSION: u64 = 4 + (32 + 4 * 34 + 54) * 4;
 
     fn convert(chip: &mut Chip) -> u16 {
@@ -5044,15 +4167,12 @@ mod tests {
             assert_eq!(convert(&mut chip), UNSETTLED);
             assert_eq!(convert(&mut chip), World::NORMAL.reading(channel));
         }
-        // 3.8 V and 25 °C, as the library's tests have them, and ground at
-        // the worst offset table 38-24 allows.
         let voltage = World::NORMAL.reading(Channel::Voltage);
         assert_eq!(kr1k::battery::centivolts(voltage), 380);
         assert_eq!(World::NORMAL.reading(Channel::Temperature), 8603);
         assert_eq!(World::NORMAL.reading(Channel::Ground), 20);
     }
 
-    /// Ground reads against 1.024 V, as the voltage does, and nothing else.
     #[test]
     fn ground_only_converts_against_1_024_v() {
         let mut chip = adc_ready(ADC_MUXPOS_GND);
@@ -5061,7 +4181,6 @@ mod tests {
         assert!(err.contains("MUXPOS 0x40"), "{err}");
     }
 
-    /// A stuck ADC reads the same for every input.
     #[test]
     fn a_stuck_adc_reads_one_value_for_every_input() {
         for muxpos in [ADC_MUXPOS_VDDDIV10, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_GND] {
@@ -5109,7 +4228,6 @@ mod tests {
         let ten_bit = ADC_ENABLE | regs::ADC_RESSEL_10BIT;
         for (a, value, why) in [
             (reg::ADC0_CTRLB, 0, "four samples"),
-            // 4 MHz / 2 is 2 MHz, which is fine, and / 64 is 62.5 kHz.
             (reg::ADC0_CTRLC, regs::ADC_PRESC_DIV64, "at 62500 Hz"),
             (
                 reg::VREF_ADC0REF,
@@ -5141,7 +4259,6 @@ mod tests {
         start(&mut chip).unwrap();
     }
 
-    /// Section 33.3.3.8, at a 1 MHz ADC clock.
     #[test]
     fn the_temperature_sensor_wants_25_us_of_initdly_and_28_of_samplen() {
         for (a, value) in [
@@ -5152,7 +4269,6 @@ mod tests {
             poke(&mut chip, a, value).unwrap();
             let err = start(&mut chip).unwrap_err();
             assert!(err.contains("at least 25 and 28"), "{}: {err}", name(a));
-            // VDD / 10 needs neither.
             let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);
             poke(&mut chip, a, value).unwrap();
             start(&mut chip).unwrap();
@@ -5162,15 +4278,12 @@ mod tests {
         start(&mut chip).unwrap();
     }
 
-    /// Lets a write to WDT.CTRLA land.
     fn synced(chip: &mut Chip) {
         let at = chip.wdt.pending.unwrap().1;
         chip.advance_to(at).unwrap();
         assert!(chip.wdt.pending.is_none());
     }
 
-    /// A chip whose watchdog runs 32 WDT clocks closed and 32 open, two ticks
-    /// each, and has synced.
     fn watched() -> Chip {
         let mut chip = Chip::new(Vec::new());
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
@@ -5182,7 +4295,6 @@ mod tests {
         chip.advance_to(chip.now + n * TICK_CYCLES)
     }
 
-    /// Main clocks in `n` WDT clocks at the usual speed.
     fn clocks(n: u64) -> u64 {
         n * TICK_CYCLES / 16
     }
@@ -5197,8 +4309,6 @@ mod tests {
         assert!(chip.wdr().unwrap_err().contains("closed window"));
     }
 
-    /// Each `wdr` syncs in two to three clocks, so the windows are a clock
-    /// tighter either side.
     #[test]
     fn a_feed_within_a_clock_of_either_edge_bites() {
         let mut chip = watched();
@@ -5246,11 +4356,8 @@ mod tests {
         assert_eq!(chip.read(reg::WDT_STATUS as u16).unwrap(), 0);
     }
 
-    /// A new setting goes on counting from the last `wdr`, and its window
-    /// only starts with the next.
     #[test]
     fn a_new_setting_counts_from_the_last_feed() {
-        // From rest to lit a tick after a feed, fed a tick after that.
         let mut chip = Chip::new(Vec::new());
         unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
         synced(&mut chip);
@@ -5261,8 +4368,6 @@ mod tests {
         assert!(!chip.wdt.windowed);
         chip.wdr().unwrap();
         assert!(chip.wdt.windowed, "the first wdr starts the window");
-        // The same write two ticks after the feed finds 32 clocks gone of the
-        // 32 the open window alone allows.
         let mut chip = Chip::new(Vec::new());
         unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap();
         synced(&mut chip);
@@ -5298,8 +4403,6 @@ mod tests {
         chip.ready_for_power_down().unwrap();
     }
 
-    /// The PIT at 64 Hz or 1 Hz, slow ticks on every 64th grid edge, and the
-    /// light never on with it slow.
     #[test]
     fn the_pit_ticks_slow_on_every_64th_edge_and_never_with_pc1_high() {
         let mut chip = Chip::new(Vec::new());
@@ -5328,7 +4431,6 @@ mod tests {
         assert!(err.contains("slows the PIT with PC1 high"), "{err}");
     }
 
-    /// PC1 only rises with the lit window in force, synced and started.
     #[test]
     fn pc1_rises_only_under_the_lit_watchdog() {
         let mut chip = dark();
@@ -5365,7 +4467,6 @@ mod tests {
     fn the_watchdogs_periods_left_stop_one_short_of_the_bite() {
         let mut chip = Chip::new(Vec::new());
         assert_eq!(chip.wdt_periods_left(), DOWN_PERIODS, "off");
-        // 64 clocks, four ticks, the fourth being the bite.
         unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_64CLK).unwrap();
         assert_eq!(chip.wdt_periods_left(), 3);
         ticks(&mut chip, 3).unwrap();
@@ -5378,7 +4479,6 @@ mod tests {
         let mut chip = watched();
         chip.io[reg::RTC_PITCTRLA] = RTC_PITEN;
         chip.osc32k_stopped = true;
-        // Long past the watchdog's 64 clocks.
         ticks(&mut chip, 100).unwrap();
         assert!(!chip.pit_flag);
         assert_eq!(chip.ticks, 0);
@@ -5393,14 +4493,12 @@ mod tests {
         let mut chip = Chip::new(Vec::new());
         chip.io[reg::RTC_PITCTRLA] = RTC_PITEN;
         chip.tick_cycles = SLOWEST_TICK_CYCLES;
-        // The period under way at the change runs out as it was.
         ticks(&mut chip, 1).unwrap();
         assert_eq!(chip.ticks, 1);
         wait(&mut chip, SLOWEST_TICK_CYCLES - 1);
         assert_eq!(chip.ticks, 1);
         chip.elapse().unwrap();
         assert_eq!(chip.ticks, 2);
-        // 30% slow against 5% fast, in TCB0 periods.
         assert_eq!(SLOWEST_TICK_CYCLES.div_ceil(TIMER_PERIOD), 24);
     }
 
@@ -5412,7 +4510,6 @@ mod tests {
         assert!(err.contains("CTRLBUSY is set"), "{err}");
         while chip.read(reg::RTC_PITSTATUS as u16).unwrap() != 0 {}
         poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
-        // Busy again after the write.
         assert!(poke(&mut chip, reg::RTC_PITCTRLA, fast).is_err());
     }
 
@@ -5424,7 +4521,6 @@ mod tests {
         for (image, want) in [(signed, CRCSCAN_OK), (bad, 0)] {
             let mut chip = Chip::new(image);
             poke(&mut chip, reg::CRCSCAN_CTRLA, CRCSCAN_ENABLE).unwrap();
-            // OK from reset, until the scan starts three cycles later.
             assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(CRCSCAN_OK));
             wait(&mut chip, CRC_START_INSTRUCTIONS + 1);
             assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(CRCSCAN_BUSY));
@@ -5563,12 +4659,9 @@ mod tests {
     #[test]
     fn a_register_it_doesnt_model_is_an_error() {
         let mut chip = Chip::new(Vec::new());
-        // SPI0.CTRLA, which nothing on this board needs.
         let spi = reg::SPI0_CTRLA as u16;
         assert!(chip.write(spi, 0).unwrap_err().contains("doesn't model"));
         assert!(chip.read(spi).unwrap_err().contains("doesn't model"));
-        // TWI0's client side isn't modelled either, nor its host's MCTRLA
-        // read back.
         let client = reg::TWI0_CTRLA as u16 + 0x09;
         assert!(chip.write(client, 0).unwrap_err().contains("doesn't model"));
         let mctrla = reg::TWI0_MCTRLA as u16;
@@ -5576,8 +4669,6 @@ mod tests {
         assert!(chip.write(MAPPED, 0).unwrap_err().contains("flash"));
     }
 
-    /// A handler that catches the main loop halfway through DAC0.DATA can't
-    /// touch DAC0's 16-bit registers, and can touch anything else.
     #[test]
     fn a_handler_cant_touch_a_peripheral_whose_temp_the_main_loop_is_using() {
         let mut chip = lit();
@@ -5593,42 +4684,34 @@ mod tests {
         assert!(err.contains("TCB0's 16-bit"), "{err}");
     }
 
-    // From here on the tests drive the CPU too.
-
     const NOP: u16 = 0x0000;
     const SEI: u16 = 0x9478;
     const SEC: u16 = 0x9408;
     const SLEEP: u16 = 0x9588;
     const RETI: u16 = 0x9518;
-    /// `push r0`.
     const PUSH_R0: u16 = 0x920F;
     /// `rjmp` to itself.
     const SPIN: u16 = 0xCFFF;
 
-    /// `jmp`, to a byte address in the first 128 KB.
+    /// `to` is a byte address in the first 128 KB.
     fn jmp(to: u32) -> [u16; 2] {
         [0x940C, (to / 2) as u16]
     }
 
-    /// `sts a, r16`.
     fn sts_r16(a: usize) -> [u16; 2] {
         [0x9300, a as u16]
     }
 
-    /// `out a, r16`, for an I/O address.
     fn out_r16(a: usize) -> u16 {
         0xB800 | (a as u16 & 0x30) << 5 | 16 << 4 | a as u16 & 0x0F
     }
 
-    /// `st X, r16`.
     const ST_X_R16: u16 = 0x930C;
 
     fn image(words: impl IntoIterator<Item = u16>) -> Vec<u8> {
         words.into_iter().flat_map(u16::to_le_bytes).collect()
     }
 
-    /// A chip running `words` from reset, with `__unhandled_interrupt` and
-    /// `hw::halt` somewhere it never gets to.
     fn sim(words: impl IntoIterator<Item = u16>) -> Sim {
         let ends = Ends {
             unhandled: 0x1000,
@@ -5637,7 +4720,6 @@ mod tests {
         Sim::new(image(words), SRAM.start, ends).unwrap()
     }
 
-    /// Runs `words` to their end, with r16 at 0 and X at GPR0.
     fn stores(words: Vec<u16>) -> Result<(), String> {
         let end = words.len() as u32;
         let mut sim = sim(words);
@@ -5648,7 +4730,7 @@ mod tests {
         Ok(())
     }
 
-    /// Errata 2.2.3, with GPR1 standing for anything under 64.
+    // Errata 2.2.3, GPR1 standing for anything under 64.
     #[test]
     fn a_store_under_64_straight_after_one_over_64_is_lost() {
         let high = sts_r16(reg::RTC_PITINTFLAGS);
@@ -5663,17 +4745,14 @@ mod tests {
         assert!(err.contains("GPR.GPR0 straight after"), "{err}");
         let err = lost([high, sts_r16(reg::SLPCTRL_CTRLA)].concat());
         assert!(err.contains("SLPCTRL.CTRLA straight after"), "{err}");
-        // The workarounds.
         stores([&high[..], &[NOP], &low[..]].concat()).unwrap();
         stores([&high[..], &[out_r16(reg::GPR_GPR1)]].concat()).unwrap();
         stores([&high[..], &[NOP], &sts_r16(reg::SLPCTRL_CTRLA)[..]].concat()).unwrap();
-        // Two stores over 64 are fine.
         stores([high, sts_r16(reg::RTC_PITINTFLAGS)].concat()).unwrap();
     }
 
     #[test]
     fn found_lit_wants_out_cleared_by_the_first_register_write() {
-        // r16 is PC1, for DIR, and r17 is 0, for OUT.
         let out = |a: usize, r: u16| 0xB800 | (a as u16 & 0x30) << 5 | r << 4 | a as u16 & 0x0F;
         let run = |writes: [u16; 2]| {
             let image = image([ldi(16, ENABLE), ldi(17, 0)].into_iter().chain(writes));
@@ -5684,15 +4763,12 @@ mod tests {
         assert_eq!(run([clear, dir]), Ok(()));
         let err = run([dir, clear]).unwrap_err();
         assert!(err.contains("leaves PC1 set"), "{err}");
-        // Neither write, so it runs off the end of the image.
         assert!(run([ldi(16, 0), ldi(17, 0)]).is_err());
     }
 
-    /// Where `forced` puts vector 15's slot, as a byte address.
+    /// Vector 15's slot, as a byte address.
     const SLOT_15: u32 = 15 * VECTOR_WORDS * 2;
 
-    /// `sei`, then `nop`s up to vector 15's slot, which writes DAC0.DATA with
-    /// r1, low byte then high, with `halt` at `halt`.
     fn forced(halt: u32) -> Sim {
         let mut words = vec![SEI];
         words.resize(SLOT_15 as usize / 2, NOP);
@@ -5732,7 +4808,6 @@ mod tests {
     fn a_handler_in_halt_may_overwrite_temp_and_no_other_may() {
         let run = |halt: u32| {
             let mut sim = forced(halt);
-            // The main loop's halfway through DAC0.DATA.
             sim.chip.dac.temp = Some(0x40);
             sim.chip.force_interrupt(15);
             for _ in 0..3 {
@@ -5752,7 +4827,6 @@ mod tests {
         assert_eq!(sim.chip.dac.temp, None);
     }
 
-    /// Three bytes of .data, loaded from the start of flash, then two of .bss.
     fn statics() -> Layout {
         Layout {
             data: SRAM.start..SRAM.start + 3,
@@ -5784,10 +4858,8 @@ mod tests {
         assert!(err.contains("outside flash"), "{err}");
     }
 
-    /// `call`, to word 0.
     const CALL: [u16; 2] = [0x940E, 0];
 
-    /// The `ldi`s src/avr/rt.rs's startup loads `layout` with, in its order.
     fn loads(layout: &Layout) -> Vec<u16> {
         [
             (26, layout.data.start),
@@ -5816,7 +4888,6 @@ mod tests {
         patch_startup(&mut patched, 0, &linked, &moved).unwrap();
         assert_eq!(patched, image(loads(&moved).into_iter().chain(CALL)));
 
-        // The loads in another order, which is some other startup code.
         let mut swapped = loads(&linked);
         swapped.swap(0, 2);
         let mut swapped = image(swapped.into_iter().chain(CALL));
@@ -5868,8 +4939,6 @@ mod tests {
         );
     }
 
-    /// Words up to `vector`'s slot, starting with `sei`, then a `jmp` in the
-    /// slot to `handler`, which follows the table.
     fn handled_by(vector: u8, handler: &[u16]) -> Vec<u16> {
         let slot = usize::from(vector) * VECTOR_WORDS as usize;
         let after = VECTORS * VECTOR_WORDS as usize;
@@ -5880,8 +4949,6 @@ mod tests {
         words
     }
 
-    /// Runs a PORTD handler made of `body` and a `reti`, as far as its
-    /// return, with PD4's flag up.
     fn handle(body: &[u16]) -> Result<Sim, String> {
         let handler: Vec<u16> = body.iter().copied().chain([RETI]).collect();
         let mut sim = sim(handled_by(VECTOR_PORTD, &handler));
@@ -5919,8 +4986,6 @@ mod tests {
         assert!(err.contains("ran past 997 instructions"), "{err}");
     }
 
-    /// The PIT's slot holds a `jmp`, so it counts as handled, but the slot
-    /// itself is where `__unhandled_interrupt` is.
     #[test]
     fn taking_an_interrupt_into_unhandled_interrupt_is_refused() {
         let words = handled_by(VECTOR_RTC_PIT, &[RETI]);
@@ -5952,22 +5017,18 @@ mod tests {
         assert!(err.contains("didn't wait for a tick"), "{err}");
     }
 
-    /// `[first, sleep]` with SLPCTRL set for idle and nothing enabled, as far
-    /// as the end of the tick.
     fn stop_for_good(first: u16) -> Result<u64, String> {
         let mut sim = sim([first, SLEEP]);
         sim.chip.io[reg::SLPCTRL_CTRLA] = SLEEP_IDLE | SLPCTRL_SEN;
         sim.tick(false)
     }
 
-    /// `cli` then `sleep`, as `hw::halt` does it.
     #[test]
     fn a_pass_that_stops_for_good_fails() {
         let err = stop_for_good(0x94F8).unwrap_err();
         assert!(err.contains("stopped for good"), "{err}");
     }
 
-    /// `sei` then `sleep`, so only the enables being off keep it down.
     #[test]
     fn stopping_for_good_wants_sreg_i_clear_too() {
         let err = stop_for_good(SEI).unwrap_err();
@@ -5982,8 +5043,6 @@ mod tests {
         assert_eq!(err, "never cleared RSTCTRL.RSTFR");
     }
 
-    /// A start-up in the order `main` does it, each step at its place in
-    /// line.
     const IN_ORDER: Boot = Boot {
         flags_cleared: Some(1),
         flash_checked: Some(2),
@@ -6097,8 +5156,6 @@ mod tests {
         }
     }
 
-    /// The chip notes each step as `main` gets to it, and PORTC's writes and
-    /// the scan's setup aren't setting the chip up.
     #[test]
     fn the_chip_notes_each_step_of_start_up_as_it_happens() {
         let mut chip = Chip::new(Vec::new());
@@ -6142,11 +5199,7 @@ mod tests {
         boot.in_order().unwrap();
     }
 
-    /// The least a firmware can be and still tick. It reads the switch once a
-    /// pass, as the firmware does, and sleeps in idle, and its PIT handler
-    /// clears the flag with r16, which is set up beforehand so the handler
-    /// has nothing to give back. The chip is left as `hw::init` would have
-    /// it, the light off, with a watchdog too long to need feeding here.
+    /// The least a firmware can be and still tick.
     fn ticking() -> Sim {
         let handler = sts_r16(reg::RTC_PITINTFLAGS).into_iter().chain([RETI]);
         let mut words = handled_by(VECTOR_RTC_PIT, &handler.collect::<Vec<_>>());
@@ -6171,13 +5224,11 @@ mod tests {
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_PERIOD_MAX).unwrap();
         synced(&mut chip);
         chip.flash = std::mem::take(&mut sim.chip.flash);
-        // A few instructions that never drive the aux.
         chip.aux_unwired = true;
         sim.chip = chip;
         sim
     }
 
-    /// Ticks with the switch left alone and nothing wrong.
     fn quiet(ticks: usize) -> impl Iterator<Item = Sample> {
         iter::repeat_n(
             Sample {
@@ -6208,8 +5259,6 @@ mod tests {
         assert_eq!(err, "hw::start_watchdog never turned the watchdog on");
     }
 
-    /// A torch that's off rests, and the library has it power down, which
-    /// `ticking` never does.
     #[test]
     fn in_step_holds_the_sleep_to_the_librarys() {
         let err = in_step_fails(&mut ticking(), 8);
@@ -6219,8 +5268,6 @@ mod tests {
         );
     }
 
-    /// The light's off, as the library says, but DAC0's reference has been
-    /// left at 2.5 V, which the library's off doesn't have.
     #[test]
     fn in_step_holds_the_driver_to_the_librarys() {
         let mut sim = ticking();
@@ -6232,7 +5279,6 @@ mod tests {
         );
     }
 
-    /// The watchdog runs while the chip sleeps, and `ticking` never feeds it.
     #[test]
     fn a_firmware_that_never_feeds_the_watchdog_is_bitten() {
         let mut sim = ticking();
@@ -6249,9 +5295,6 @@ mod tests {
     fn a_failed_run_says_which_it_was_and_whether_interrupts_were_landing() {
         let power_on = || Ok(ticking());
         let failed = "the library says power down, but the firmware idled";
-        // Ticks 0 to 3 read the cell and VDDIO2, the check every torch makes
-        // on its first tick, so the library idles too. Tick 4's the first it
-        // rests.
         let err = run(&power_on, None, Landing::Watch).err().unwrap();
         assert_eq!(err, format!("random switching: tick 4: {failed}"));
         let err = run(&power_on, None, Landing::Until(5)).err().unwrap();
@@ -6268,8 +5311,7 @@ mod tests {
         );
     }
 
-    /// The forced vector has to be one the firmware leaves unhandled, or the
-    /// run would show nothing about `__unhandled_interrupt`.
+    // The forced vector has to be one the firmware leaves unhandled.
     #[test]
     fn the_forced_interrupt_has_to_be_one_with_no_handler() {
         let err = unhandled_interrupt(sim(handled_by(VECTOR_UNHANDLED, &[RETI]))).unwrap_err();
