@@ -1,32 +1,13 @@
-//! Test doubles shared by the library's own tests and xtask's simulators.
+//! Test doubles shared by the library's tests and xtask's simulators.
 //!
-//! So there's one fake ADC, one torch wired to it, one way of turning a
-//! voltage or a temperature into a raw reading, and one list of what the
-//! torch does ([`EXAMPLES`]).
-//!
-//! The firmware never sees it.
-//!
-//! # Scripts
-//!
-//! A script is Anduril's notation, a word at a time, like `1C 2H:1.5s wait:1s`.
-//! `NC` is N quick clicks. `NH` is N - 1 clicks then a hold (so `2H` is
-//! click, hold), for a second unless it says otherwise (`1H:500ms`).
-//! `wait:2s` leaves the switch alone. Every click or hold is followed by
-//! enough of a pause for it to count, so `1C 1C` is two single clicks,
-//! except a hold that's the script's last word. That one's never let go, so
-//! the script ends with the switch still down.
-//!
-//! Some words set the scene, taking no time. `cell:2.95V` is the cell from
-//! there on (3.8 V to start), and `heat:80C` the temperature (25 °C to
-//! start). A cell outside `battery::PLAUSIBLE`, such as `cell:0V`, is one
-//! the firmware can't read, and 0 V is what a dead ADC reads. `fault` starts
-//! a torch whose power-on checks failed, so it has to come before anything
-//! that takes time. So does `flash:corrupt`, a byte of flash that doesn't
-//! match its CRC. `vddio2:lost` is MVIO saying VDDIO2, the supply PC1 is on,
-//! is missing from there on, and `vddio2:back` that it's there again. Lost
-//! before anything that takes time, it's missing at power-on, which is a
-//! failed check. `adc:stuck` freezes the ADC on the cell's reading as it
-//! stands, for every channel, ground included, from there on.
+//! Script words, in Anduril's notation:
+//! - `NC`: N quick clicks. `NH`: N - 1 clicks then a hold, 1 s unless timed (`2H:1.5s`).
+//!   A hold that ends the script is never released.
+//! - `wait:1s`: the switch left alone.
+//! - `cell:2.95V` (3.8 V to start) and `heat:80C` (25 °C to start) take no time.
+//! - `fault` (power-on checks fail) and `flash:corrupt` go before anything that takes time.
+//! - `vddio2:lost` and `vddio2:back`: MVIO's VDDIO2 bit. Lost at power-on is a failed check.
+//! - `adc:stuck`: every channel, ground included, frozen on the cell's current reading.
 
 mod examples;
 
@@ -49,51 +30,29 @@ use crate::thermal;
 use crate::torch::Torch;
 use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Wake};
 
-/// The most four accumulated 12-bit conversions can read.
 pub const FULL_SCALE: u16 = 4 * 4095;
 
-/// A temperature sensor calibration for tests and the simulated chip's
-/// signature row.
-///
-/// It's the real one from the backup of this torch's
-/// signature row (backup/stock/prodsig.hex, `TEMPSENSE0` 0x03EE and
-/// `TEMPSENSE1` 0x0D24), at about a quarter of a kelvin a count, so 25 °C
-/// reads about 2151 a conversion, 8603 over four.
+/// Read off this torch's signature row (`TEMPSENSE0` 0x03EE, `TEMPSENSE1` 0x0D24).
 pub const CALIBRATION: Calibration = Calibration {
     offset: 0x0D24,
     slope: 0x03EE,
 };
 
-/// What four accumulated conversions of the ADC's GND input read here.
-///
-/// It's 20, the most table 38-24 of DS40002413B allows for the offset error,
-/// 5 LSb a conversion. A single-ended result can't go under zero, so the
-/// worst a working ADC can be is over it, and the most the table allows is
-/// the closest that gets to `sensors::GROUND_MAX` while still being in spec.
+/// Worst in-spec offset error, 5 LSb a conversion over four (DS40002413B table 38-24).
 pub const GROUND_READING: u16 = 4 * 5;
 
-/// The accumulated reading of VDD / 10 for a cell `battery::centivolts`
-/// reports as `cell`, the closest, saturating at four full-scale conversions.
 pub fn voltage_reading(cell: u16) -> u16 {
     closest(cell, battery::centivolts)
 }
 
-/// The temperature sensor reading, four accumulated 12-bit conversions,
-/// closest to `kelvin` with [`CALIBRATION`].
-///
-/// The reading falls as the
-/// temperature rises, so this searches it backwards, and of two readings
-/// that are as close, the higher wins.
 pub fn temperature_reading(kelvin: u16) -> u16 {
     let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE - raw);
     FULL_SCALE - closest(kelvin.saturating_mul(16), backwards)
 }
 
-/// The smallest raw reading whose `read` is closest to `target`. `read` never
-/// goes down as the reading goes up, so a binary search finds it.
+/// The smallest raw reading whose `read` is closest to `target`. `read` must
+/// never go down as the reading goes up.
 fn closest(target: u16, read: impl Fn(u16) -> u16) -> u16 {
-    // The first reading that reads as at least `value`, or one past full
-    // scale if none does.
     let first_at_least = |value: u16| {
         let (mut low, mut high) = (0, FULL_SCALE + 1);
         while low < high {
@@ -112,21 +71,13 @@ fn closest(target: u16, read: impl Fn(u16) -> u16) -> u16 {
     }
     let below = read(above - 1);
     if above > FULL_SCALE || target - below <= read(above) - target {
-        // Below wins ties, and a run of readings that read the same starts
-        // further down.
         first_at_least(below)
     } else {
         above
     }
 }
 
-/// An ADC that hands back a conversion's result a tick after it started, the
-/// way the firmware's loop sees the real one. A conversion measures what
-/// was there when it started.
-///
-/// `voltage`, `temperature` and `ground` are the raw results [`Adc::start`]
-/// reads. Anything else that knows what each channel reads can use
-/// [`Adc::start_with`] instead.
+/// Hands back a conversion's result a tick after it started, measured when it started.
 #[derive(Clone, Debug)]
 pub struct Adc {
     pub voltage: u16,
@@ -142,8 +93,7 @@ impl Default for Adc {
 }
 
 impl Adc {
-    /// 3.8 V, 25 °C with [`CALIBRATION`], and ground at
-    /// [`GROUND_READING`].
+    /// 3.8 V and 25 °C.
     pub const fn new() -> Self {
         Self {
             voltage: 6140,
@@ -153,19 +103,14 @@ impl Adc {
         }
     }
 
-    /// Stuck on `raw` for every channel, the way an ADC whose result
-    /// register or mux has stuck reads.
     pub const fn stuck(&mut self, raw: u16) {
         (self.voltage, self.temperature, self.ground) = (raw, raw, raw);
     }
 
-    /// The result of the conversion started last tick, if there was one.
     pub const fn result(&mut self) -> Option<u16> {
         self.pending.take()
     }
 
-    /// Starts `convert`, if there is one, reading `voltage` or
-    /// `temperature`.
     pub fn start(&mut self, convert: Option<Convert>) {
         let (voltage, temperature, ground) = (self.voltage, self.temperature, self.ground);
         self.start_with(convert, |channel| match channel {
@@ -176,76 +121,48 @@ impl Adc {
         });
     }
 
-    /// Starts `convert`, if there is one, reading whatever `read` says the
-    /// channel reads.
     pub fn start_with(&mut self, convert: Option<Convert>, read: impl FnOnce(Channel) -> u16) {
         self.pending = convert.map(|convert| read(convert.channel));
     }
 }
 
-/// How long a scripted click holds the switch down (about 60 ms).
 const PRESS_TICKS: u16 = 4;
-/// The pause after each scripted click, well inside `RELEASE_TICKS`.
+/// Must stay inside `RELEASE_TICKS`, or quick clicks stop counting as one group.
 const GAP_TICKS: u16 = 4;
-/// Released samples after a click or hold before the next action, enough
-/// for `button::Clicks` to send the click (see its `RELEASE_TICKS` check).
 const SETTLE_TICKS: u16 = RELEASE_TICKS + 1;
-/// A hold with no duration lasts a second.
 const DEFAULT_HOLD_TICKS: u16 = TICKS_PER_SECOND;
 
-/// One word of a script.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Action {
-    /// This many quick clicks.
     Clicks(u8),
-    /// `clicks` quick clicks, then the switch held down for `ticks`.
     Hold { clicks: u8, ticks: u16 },
-    /// The switch left alone for this many ticks.
     Wait(u16),
-    /// The cell from now on, in centivolts.
     Cell(u16),
-    /// The temperature from now on, in kelvin.
     Heat(u16),
-    /// Whether MVIO says VDDIO2 is there from now on.
     Vddio2(bool),
-    /// A flash byte that doesn't match the CRC. Power-on only.
     CorruptFlash,
-    /// The power-on checks fail. Power-on only.
     Fault,
-    /// The ADC sticks on the cell's reading as it is now, for every channel
-    /// and for good.
     AdcStuck,
 }
 
 impl Action {
-    /// Whether it takes time, rather than setting the scene.
     const fn takes_time(self) -> bool {
         matches!(self, Self::Clicks(_) | Self::Hold { .. } | Self::Wait(_))
     }
 }
 
-/// Why a word isn't an [`Action`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// No count of 1 or more before the C or H.
     Count,
-    /// Not clicks, a hold or anything else a script knows.
     Kind,
-    /// A click with a duration.
     TimedClick,
-    /// A hold too short to count as one.
     ShortHold,
-    /// A duration it can't read.
     Duration,
-    /// A duration that rounds to no ticks.
     UnderATick,
-    /// A duration of more ticks than a `u16` holds.
     TooLong,
     Voltage,
     Temperature,
-    /// `vddio2:` with anything but `lost` or `back`.
     Supply,
-    /// `fault` or `flash:corrupt` after something that takes time.
     NotAtPowerOn,
 }
 
@@ -277,8 +194,6 @@ impl fmt::Display for Error {
 impl FromStr for Action {
     type Err = Error;
 
-    /// `3C`, `2H`, `1H:500ms`, `wait:2s`, `cell:2.95V`, `heat:80C`,
-    /// `vddio2:lost`, `vddio2:back`, `fault`, `flash:corrupt` or `adc:stuck`.
     fn from_str(word: &str) -> Result<Self, Error> {
         if word == "fault" {
             return Ok(Self::Fault);
@@ -336,7 +251,6 @@ impl FromStr for Action {
     }
 }
 
-/// A word of a script and why it isn't one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScriptError<'a> {
     pub word: &'a str,
@@ -349,7 +263,6 @@ impl fmt::Display for ScriptError<'_> {
     }
 }
 
-/// Reads a script, word by word.
 pub fn parse<'a>(
     words: impl IntoIterator<Item = &'a str>,
 ) -> impl Iterator<Item = Result<Action, ScriptError<'a>>> {
@@ -365,8 +278,7 @@ pub fn parse<'a>(
     })
 }
 
-/// `whole.fraction`, times ten to the `places`, with no more than `places`
-/// digits after the point.
+/// `whole.fraction` times ten to the `places`.
 fn decimal(text: &str, places: u32) -> Option<u32> {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
     if fraction.len() > places as usize || !fraction.bytes().all(|b| b.is_ascii_digit()) {
@@ -381,7 +293,6 @@ fn decimal(text: &str, places: u32) -> Option<u32> {
     Some(value)
 }
 
-/// Centivolts from `2.95V`.
 fn centivolts(volts: &str) -> Result<u16, Error> {
     volts
         .strip_suffix('V')
@@ -390,7 +301,6 @@ fn centivolts(volts: &str) -> Result<u16, Error> {
         .ok_or(Error::Voltage)
 }
 
-/// Ticks from `500ms`, `2s` or `1.5s`, rounded to the nearest tick.
 fn ticks(duration: &str) -> Result<u16, Error> {
     let ms = if let Some(ms) = duration.strip_suffix("ms") {
         ms.parse().ok()
@@ -408,34 +318,24 @@ fn ticks(duration: &str) -> Result<u16, Error> {
     }
 }
 
-/// What the torch sees, as far as a script says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scene {
-    /// The cell, in centivolts, as `battery::centivolts` would report it.
+    /// Centivolts.
     pub cell: u16,
     pub kelvin: u16,
-    /// The power-on checks fail.
     pub fault: bool,
-    /// A flash byte doesn't match its CRC.
     pub corrupt_flash: bool,
-    /// The ADC never finishes a conversion, so the firmware's loop never sees
-    /// a result. No script word sets it.
+    /// The ADC never finishes a conversion. No script word sets it.
     pub adc_dead: bool,
-    /// Whether MVIO says VDDIO2, the supply PC1 is on, is there.
+    /// MVIO's bit.
     pub vddio2: bool,
-    /// The ADC's stuck on this raw reading for every channel, ground
-    /// included, whatever the cell does. `adc:stuck` sets it to the cell's
-    /// reading as it stands.
+    /// Raw reading for every channel, ground included.
     pub adc_stuck: Option<u16>,
-    /// VDDIO2's voltage in centivolts, as `battery::centivolts` would report
-    /// its VDDIO2 / 10 reading, or `None` for the same as the cell, a board
-    /// with the two tied together. It's what the ADC reads, where
-    /// [`Scene::vddio2`] is MVIO's bit. No script word sets it.
+    /// Centivolts read through the ADC, `None` for tied to the cell. No script word sets it.
     pub vddio2_level: Option<u16>,
 }
 
 impl Scene {
-    /// A cell at 3.8 V, a room at 25 °C and nothing wrong.
     pub const NORMAL: Self = Self {
         cell: 380,
         kelvin: thermal::celsius(25),
@@ -447,8 +347,6 @@ impl Scene {
         vddio2_level: None,
     };
 
-    /// What the power-on checks find, with `fault` standing for a fuse that
-    /// fails its read-back.
     pub const fn faults(&self) -> Faults {
         Faults {
             fuses: self.fault,
@@ -458,17 +356,13 @@ impl Scene {
         }
     }
 
-    /// The raw reading a conversion on `channel` gives.
     pub fn reading(&self, channel: Channel) -> u16 {
         if let Some(raw) = self.adc_stuck {
             return raw;
         }
         match channel {
             Channel::Voltage => voltage_reading(self.cell),
-            // With MVIO saying VDDIO2 is missing, it reads 0. DS40002413B
-            // doesn't say what VDDIO2 / 10 reads then (sections 19.3.2.2 and
-            // 33.5.7), so this is the reading furthest from a rail that's
-            // there.
+            // A guess. DS40002413B §19.3.2.2 and §33.5.7 don't say what a missing VDDIO2 reads.
             Channel::Vddio2 if !self.vddio2 => 0,
             Channel::Vddio2 => voltage_reading(self.vddio2_level.unwrap_or(self.cell)),
             Channel::Temperature => temperature_reading(self.kelvin),
@@ -477,14 +371,12 @@ impl Scene {
     }
 }
 
-/// One tick of a script, with the switch and what the torch sees.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub pressed: bool,
     pub scene: Scene,
 }
 
-/// The switch and the scene, one sample per tick, for a whole script.
 pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item = Sample> {
     let mut actions = actions.into_iter().peekable();
     let words = iter::from_fn(move || {
@@ -495,7 +387,6 @@ pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item 
     words.flat_map(move |(action, last)| {
         let (quick, held, released) = match action {
             Action::Clicks(n) => (n, 0, SETTLE_TICKS),
-            // The last word's hold is never let go.
             Action::Hold { clicks, ticks } => (clicks, ticks, if last { 0 } else { SETTLE_TICKS }),
             Action::Wait(ticks) => (0, 0, ticks),
             Action::Cell(cell) => {
@@ -531,7 +422,6 @@ pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item 
     })
 }
 
-/// `n` quick clicks, each a press then a short gap, one sample per tick.
 pub fn clicks(n: u8) -> impl Iterator<Item = bool> {
     (0..n).flat_map(|_| span(true, PRESS_TICKS).chain(span(false, GAP_TICKS)))
 }
@@ -540,34 +430,24 @@ fn span(pressed: bool, ticks: u16) -> impl Iterator<Item = bool> {
     iter::repeat_n(pressed, ticks.into())
 }
 
-/// The library's torch wired to an [`Adc`], the way `src/main.rs` wires it to
-/// the real one, with the result of last tick's conversion in and this tick's
-/// conversion out.
+/// The torch wired to an [`Adc`] the way `src/main.rs` wires it to the real one.
 #[derive(Clone, Debug)]
 pub struct Rig {
     pub torch: Torch,
-    /// What [`Rig::tick`] reads. [`Rig::tick_in`] reads a scene instead.
+    /// Read by [`Rig::tick`] only; [`Rig::tick_in`] reads its scene.
     pub adc: Adc,
-    /// Whether [`Rig::tick`] tells the torch VDDIO2 is there. A scene says
-    /// for [`Rig::tick_in`].
+    /// Read by [`Rig::tick`] only; [`Rig::tick_in`] reads its scene.
     pub vddio2: bool,
-    /// Whether both tell the torch the watchdog's lit setting is in force
-    /// (`Torch::tick`'s `lit_window`). Always, but for [`Paced`], which
-    /// asks its pacer.
     pub lit_window: bool,
 }
 
 impl Default for Rig {
-    /// A torch whose power-on checks passed, with a good cell at room
-    /// temperature.
     fn default() -> Self {
         Self::new(Faults::NONE)
     }
 }
 
 impl Rig {
-    /// A torch that's just had its cell put in, `faults` being what its
-    /// power-on checks found.
     pub const fn new(faults: Faults) -> Self {
         Self {
             torch: Torch::new(CALIBRATION, faults),
@@ -577,8 +457,6 @@ impl Rig {
         }
     }
 
-    /// One tick, the ADC reading `adc`'s `voltage` and `temperature`, and
-    /// MVIO saying what `vddio2` does.
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
         let event = self
             .torch
@@ -587,26 +465,21 @@ impl Rig {
         event
     }
 
-    /// One tick, the ADC and MVIO reading what `scene` says.
     pub fn tick_in(&mut self, pressed: bool, scene: &Scene) -> Option<Event> {
         let event = self
             .torch
             .tick(pressed, self.adc.result(), scene.vddio2, self.lit_window);
-        // A dead ADC is started on but never answers, so nothing's pending.
         let convert = self.torch.convert().filter(|_| !scene.adc_dead);
         self.adc
             .start_with(convert, |channel| scene.reading(channel));
         event
     }
 
-    /// Plays a script on a fresh torch, whose power-on checks find what the
-    /// first tick's scene says.
+    /// Power-on checks find what the first tick's scene says.
     pub fn play(actions: impl IntoIterator<Item = Action>) -> Self {
         Self::play_with(actions, |_, _| {})
     }
 
-    /// [`Rig::play`], calling `each` after every tick with the click or hold
-    /// it finished.
     pub fn play_with(
         actions: impl IntoIterator<Item = Action>,
         mut each: impl FnMut(&Self, Option<Event>),
@@ -630,28 +503,17 @@ impl Deref for Rig {
     }
 }
 
-/// When the PIT's first period after a change of period ends.
-///
-/// The datasheet only says the first after enabling is anything up to a
-/// whole period, from the prescaler's phase (§26.5.2.2), so the simulator
-/// runs all three.
+/// When the PIT's first period after a change of period ends. DS40002413B
+/// §26.5.2.2 only bounds it at a whole period, so the simulator runs all three.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PitPhase {
-    /// On the prescaler's next edge for the new period, so a slow tick lands
-    /// on every 64th point of the 64 Hz grid, counted from when the PIT
-    /// started, and a fast one on the next.
     #[default]
     Aligned,
-    /// On the next point of the 64 Hz grid, slow or fast, as soon as the
-    /// model goes.
     Early,
-    /// A whole period after it would be aligned, as late as the model goes.
     Late,
 }
 
 impl PitPhase {
-    /// The grid point the PIT ticks on first, after a change to `pit` during
-    /// the pass at grid point `at`.
     pub const fn first(self, at: u32, pit: Pit) -> u32 {
         match (self, pit) {
             (Self::Aligned | Self::Early, Pit::Fast) | (Self::Early, Pit::Slow) => at + 1,
@@ -662,44 +524,29 @@ impl PitPhase {
     }
 }
 
-/// Points of the 64 Hz grid in a slow tick.
 const SLOW_GRID: u32 = SLOW_TICKS as u32;
 
-/// The first slow tick of the prescaler's own after grid point `at`.
 pub const fn next_slow(at: u32) -> u32 {
     (at / SLOW_GRID + 1) * SLOW_GRID
 }
 
-/// The firmware's whole loop, src/main.rs's, on the 64 Hz grid of samples.
-///
-/// That's the [`Rig`], the AW2016's steps and the [`Pacer`], with the PIT
-/// ticking as [`PitPhase`] says. Each sample is a point of the grid, and a
-/// pass runs on it if the PIT ticks there, or if the switch moved since the
-/// last sample with the PIT slow. With the PIT slow most samples run no pass.
+/// The firmware's whole loop from `src/main.rs`, one sample per point of the 64 Hz grid.
 #[derive(Clone, Debug)]
 pub struct Paced {
     pub rig: Rig,
     pub aux: Aw2016,
     pub pacer: Pacer,
     pub phase: PitPhase,
-    /// Every AW2016 update fails, as on a bus with a fault on it.
     pub bus_fails: bool,
-    /// The end of the last pass.
     pub end: End,
-    /// The grid point the next sample is on, counted from when the PIT
-    /// started.
+    /// Grid points are counted from when the PIT started.
     grid: u32,
-    /// The grid point the PIT next ticks on.
     next_tick: u32,
-    /// The PIT's period.
     pit: Pit,
-    /// The switch at the last sample.
     pressed: bool,
 }
 
 impl Paced {
-    /// A torch whose power-on checks found `faults`, as `main` starts it,
-    /// with the first sample on grid point `grid`, where the PIT ticks.
     pub const fn new(faults: Faults, grid: u32) -> Self {
         let rig = Rig::new(faults);
         Self {
@@ -716,17 +563,14 @@ impl Paced {
         }
     }
 
-    /// What `main` sends to the driver, the torch's output.
     pub fn output(&self) -> Output {
         self.rig.torch.output()
     }
 
-    /// The PIT's period as the last pass left it.
     pub const fn pit(&self) -> Pit {
         self.pit
     }
 
-    /// One sample of the grid, and the pass it ran, if any.
     pub fn sample(&mut self, pressed: bool, scene: &Scene) -> Option<End> {
         let at = self.grid;
         self.grid += 1;
@@ -746,9 +590,7 @@ impl Paced {
         Some(self.pass(wake, at, scene))
     }
 
-    /// A pass that a switch edge with no switch movement ran, a bounce, on
-    /// the last sample's grid point, if the last pass left the switch able
-    /// to wake it.
+    /// A switch wake with no switch movement, on the last sample's grid point.
     pub fn bounce(&mut self, scene: &Scene) -> Option<End> {
         self.end
             .switch_wakes
@@ -757,9 +599,6 @@ impl Paced {
 
     fn pass(&mut self, wake: Wake, at: u32, scene: &Scene) -> End {
         let begin = self.pacer.begin(wake);
-        // `Torch::rest_for` is only exact with this, which the pacer only
-        // asks for after a pass the torch called quiet. Every host test and
-        // every simulator run comes through here.
         assert!(
             begin.rested == 0
                 || self
@@ -795,20 +634,16 @@ impl Deref for Paced {
     }
 }
 
-/// A small, fixed-seed random number generator (xorshift32), so tests can
-/// throw varied readings at the firmware's logic and still fail the same way
-/// every time. It's no good for anything else.
+/// Xorshift32, for repeatable test inputs only.
 #[derive(Clone, Debug)]
 pub struct Rng(u32);
 
 impl Rng {
-    /// Starts from `seed`. Xorshift never leaves zero, so a seed of zero
-    /// becomes 1.
     pub const fn new(seed: u32) -> Self {
         Self(if seed == 0 { 1 } else { seed })
     }
 
-    /// The next 16 bits, from the top of the state, which is the better end.
+    /// The top bits, the better end of xorshift's state.
     pub const fn next_u16(&mut self) -> u16 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
@@ -886,13 +721,10 @@ mod tests {
         }
         for kelvin in [273, 298, 323, 343, 373] {
             let got = CALIBRATION.sixteenths(temperature_reading(kelvin));
-            // A count of the sum is about a sixteenth.
             assert!(got.abs_diff(kelvin * 16) <= 2, "{kelvin} K reads as {got}");
         }
     }
 
-    /// The slow way, with every raw reading tried, the closest winning and the
-    /// smallest winning a tie.
     fn linear(target: u16, read: impl Fn(u16) -> u16) -> u16 {
         (0..=FULL_SCALE)
             .min_by_key(|&raw| (read(raw).abs_diff(target), raw))
@@ -909,7 +741,6 @@ mod tests {
                 "{cell} cV"
             );
         }
-        // Searched from the top down, so the highest reading wins a tie.
         let backwards = |raw| CALIBRATION.sixteenths(FULL_SCALE - raw);
         for kelvin in 0..=CALIBRATION.sixteenths(0) / 16 + 10 {
             assert_eq!(
@@ -1027,7 +858,6 @@ mod tests {
         assert!(cells.eq(iter::repeat_n(380, 64).chain(iter::repeat_n(295, 64))));
     }
 
-    /// The torch tests used to read `cell:3.8V` as 0.38 V, dropping the dot.
     #[test]
     fn a_cell_keeps_its_decimal_point() {
         assert_eq!(word("cell:3.8V"), Ok(Action::Cell(380)));
@@ -1035,14 +865,10 @@ mod tests {
         assert_eq!(word("cell:4V"), Ok(Action::Cell(400)));
     }
 
-    /// docs/ui.md's rows for a cell the firmware can't read lean on this.
-    /// There's no word for a broken reading, only a cell that can't be real.
     #[test]
     fn a_cell_outside_the_plausible_range_reads_as_one_the_firmware_cant_believe() {
         assert_eq!(word("cell:0V"), Ok(Action::Cell(0)));
-        // What a dead ADC gives.
         assert_eq!(voltage_reading(0), 0);
-        // What the firmware makes of the cell a script sets.
         let reads = |cell: &'static str| {
             let script = parse([cell, "wait:1s"]).map(Result::unwrap);
             let scene = samples(script).last().unwrap().scene;
@@ -1056,8 +882,6 @@ mod tests {
         }
     }
 
-    /// The torch tests used to start a fresh bench for `fault`, forgetting the
-    /// cell and the heat set before it.
     #[test]
     fn a_fault_keeps_the_cell_and_heat_before_it() {
         let script = parse(["cell:2.95V", "heat:80C", "fault", "1C"]).map(Result::unwrap);
@@ -1077,8 +901,6 @@ mod tests {
         assert!(expected.faults().fuses);
     }
 
-    /// The torch tests used to work out `wait:1500ms` as 1500 × 64 in a `u16`,
-    /// which overflows, and couldn't read `1.5s` or a lower-case `c` or `h`.
     #[test]
     fn durations_and_lower_case_read_as_simulate_reads_them() {
         assert_eq!(word("wait:1500ms"), Ok(Action::Wait(96)));

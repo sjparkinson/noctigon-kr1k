@@ -1,23 +1,15 @@
-//! What each click and hold does. docs/ui.md is the spec; keep them in step.
+//! What each click and hold does.
 
 use crate::button::Event;
 use crate::ramp::CEILING;
 
-/// The lowest level the UI goes to.
-///
-/// The same number as the TS26 firmware's, so the UI didn't change. On this
-/// curve it's the low path at DAC code 92, inside the range where the
-/// datasheet specifies the DAC's linearity (0x030 up, DS40002413B table
-/// 38-23). The moon path's levels under it stay for the low-voltage steps to
-/// fade through. How bright it is, and whether the levels under it light
-/// steadily, is unmeasured.
+/// Inside the range where the DAC's linearity is specified (0x030 up,
+/// DS40002413B table 38-23). How bright it is, and whether the levels under
+/// it light steadily, is unmeasured.
 pub const FLOOR: u8 = 13;
 
-/// Where every click on starts, low on the high path, at a few per cent of
-/// the ramp's top. Nothing's remembered, so it's this every time.
 pub const ON_LEVEL: u8 = 52;
 
-// The top of the UI's ramp is [`CEILING`].
 const _: () = assert!(FLOOR >= 1 && FLOOR < ON_LEVEL && ON_LEVEL < CEILING);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,33 +19,16 @@ pub enum Mode {
     Lockout,
 }
 
-/// What the RGB aux LEDs should be doing.
-///
-/// On the KR1K they hang off an AW2016 LED driver over TWI, and
-/// `crate::aw2016` turns the colour and [`Aux::bright`] into its register
-/// writes.
-///
-/// Every colour is steady, so they never report anything by flashing, and
-/// all but red are dim. Off and lockout, the two states a glance most needs,
-/// get one channel each.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Aux {
     Off,
-    /// Off, and nothing wrong.
     Blue,
-    /// Locked out. Bright, since dim red was hard to see on the TS26, so
-    /// `torch::Torch` only shows it for [`crate::torch::LOCKED_TICKS`] after a
-    /// press.
     Red,
-    /// The cell's flat. Red and green, the usual low-battery warning.
     Yellow,
-    /// A fault, which nothing short of a cell swap clears. All three.
     White,
 }
 
 impl Aux {
-    /// Whether this colour is the bright setting rather than the dim one.
-    /// Only lockout's red is.
     pub const fn bright(self) -> bool {
         matches!(self, Self::Red)
     }
@@ -62,10 +37,8 @@ impl Aux {
 #[derive(Clone, Debug)]
 pub struct Ui {
     mode: Mode,
-    /// The level it's at while on. Every click on starts it at [`ON_LEVEL`].
     level: u8,
-    /// Whether the last 1H ramped up. Each 1H goes the other way, and every
-    /// click on clears it, so the first 1H goes up.
+    /// Whether the last 1H ramped up.
     up: bool,
 }
 
@@ -88,7 +61,6 @@ impl Ui {
         self.mode
     }
 
-    /// The level the LEDs should be at right now, `0` meaning off.
     pub const fn output_level(&self) -> u8 {
         match self.mode {
             Mode::On => self.level,
@@ -96,11 +68,8 @@ impl Ui {
         }
     }
 
-    /// The most clicks that mean anything right now, for
-    /// `button::Clicks::tick_up_to`, so the click that makes it that many
-    /// counts as it's let go. On, only 1C does anything. Off, 3C is the most.
-    /// Locked, it waits as long as it ever did, so a fourth press in a pocket
-    /// is a 4C, which does nothing, rather than 3C to unlock and 1C to light.
+    /// Lockout has no limit on purpose, so a fourth press in a pocket makes a
+    /// 4C, which does nothing, rather than 3C to unlock and 1C to light.
     pub const fn most_clicks(&self) -> Option<u8> {
         match self.mode {
             Mode::On => Some(1),
@@ -109,7 +78,6 @@ impl Ui {
         }
     }
 
-    /// The aux LEDs give way to the main LED whenever it's lit.
     pub const fn aux(&self) -> Aux {
         match self.mode {
             Mode::On => Aux::Off,
@@ -145,8 +113,6 @@ impl Ui {
         }
     }
 
-    /// Puts the light out. This is 1C, and it's also how low-voltage
-    /// protection turns the light off. A locked torch stays locked.
     pub const fn off(&mut self) {
         if matches!(self.mode, Mode::On) {
             self.mode = Mode::Off;
@@ -281,8 +247,6 @@ mod tests {
         }
     }
 
-    /// Clicks past `most_clicks` would never reach `handle`, so none may mean
-    /// anything.
     #[test]
     fn nothing_past_most_clicks_does_anything() {
         for setup in [&[][..], &[Event::Click(1)], &[Event::Click(3)]] {

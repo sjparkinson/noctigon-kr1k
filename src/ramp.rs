@@ -1,60 +1,25 @@
-//! The 150 levels, and what each one asks of the Lume X1-C driver.
-//!
-//! The driver regulates the LED's current to a setpoint, so there's no PWM.
-//! Three things set the current (docs/hardware.md has the board).
-//!
-//! - DAC0's 10-bit code, 0 to 1023, out on PD6 as `code / 1024` of its
-//!   reference (DS40002413B section 34.3.2.3).
-//! - That reference, `VREF.DAC0REF`, which this firmware runs at 1.024 V or
-//!   2.5 V (section 21.5.2).
-//! - The power paths, PA7 alone (moon), PA7 and PA6 (low), or all three
-//!   (high). Each adds a sense resistor in parallel, so the same DAC voltage
-//!   asks for more current.
-//!
-//! So the current goes as `code × reference × gain`, where the gain is the
-//! path's. Nobody has measured the gains. [`LOW_GAIN`] and [`HIGH_GAIN`] are
-//! estimates from where the stock firmware changes path, read for their range
-//! only, and if they're off the ramp has a step or a dip where it changes
-//! path, which is a matter of looks, not of safety. Nothing above the table's
-//! top depends on them, since the top is all on the high path.
-//!
-//! The curve is this firmware's own, a cubic in that modelled current from
-//! [`FLOOR`] to [`TOP`], like the TS26 firmware's, worked out at compile time.
-//! Each level uses the lowest path and reference that can reach it, so the
-//! DAC code sits as high in its range as it can. Where a path change leaves a
-//! code under 0x030, the DAC's linearity isn't specified (table 38-23), and
-//! its offset error of up to 5 codes is a large share of a code that small,
-//! so those few levels could come out a little off the curve. Nobody's
-//! measured what any level comes out as in lumens.
+//! The 150 levels, and what each one asks of the Lume X1-C driver. The current
+//! is modelled as DAC code × reference × path gain, and nobody has measured it.
 
 use crate::board::{PATH1, PATH2, PATH3};
 
-/// How many levels the ramp has. Level 0 is off.
 pub const LEVELS: u8 = 150;
 
-/// The highest level the firmware will run at, until thermal regulation has
-/// been checked on a real light.
-///
-/// Level 120 on this curve is about half of [`TOP`], so about half the power
-/// the stock firmware runs this torch at. The TS26 firmware stopped at about
-/// half its stock power too. Raise it to [`LEVELS`] once a real head has
-/// been measured, and nothing goes past the stock firmware's top even then.
+/// Held under [`LEVELS`] until thermal regulation has been checked on a real light.
 pub const CEILING: u8 = 120;
 
-/// The DAC's biggest code.
+/// DAC0 is 10-bit (DS40002413B §34.3.2.3).
 pub const DAC_MAX: u16 = 1023;
 
-/// The DAC reference, `VREF.DAC0REF`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Vref {
-    /// 1.024 V, specified for VDD from 2.5 V (table 38-18).
+    /// Specified for VDD from 2.5 V (DS40002413B table 38-18).
     V1024,
-    /// 2.5 V, specified for VDD from 2.7 V.
+    /// Specified for VDD from 2.7 V.
     V2500,
 }
 
 impl Vref {
-    /// The reference in millivolts.
     pub const fn millivolts(self) -> u16 {
         match self {
             Self::V1024 => 1024,
@@ -63,21 +28,16 @@ impl Vref {
     }
 }
 
-/// Which power paths are on. Each includes the ones before it, as the stock
-/// firmware has them.
+/// Each includes the ones before it, as the stock firmware has them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Paths {
     None,
-    /// PA7.
     Moon,
-    /// PA7 and PA6.
     Low,
-    /// PA7, PA6 and PA5.
     High,
 }
 
 impl Paths {
-    /// The PORTA pins that are high, as a mask.
     pub const fn mask(self) -> u8 {
         match self {
             Self::None => 0,
@@ -87,7 +47,6 @@ impl Paths {
         }
     }
 
-    /// The modelled gain, relative to the moon path alone.
     const fn gain(self) -> u64 {
         match self {
             Self::None => 0,
@@ -99,27 +58,22 @@ impl Paths {
 }
 
 /// The low path's current over the moon path's, for the same DAC voltage.
-/// Likely about this, from where the stock firmware moves between them, and
-/// unmeasured.
+/// Likely about this, from where the stock firmware changes path, and unmeasured.
 pub const LOW_GAIN: u64 = 200;
 
-/// The high path's current over the low path's. Likely about this, from where
-/// the stock firmware moves between them, give or take 15 %, and unmeasured.
+/// The high path's over the low path's. Likely within 15 %, and unmeasured.
 pub const HIGH_GAIN: u64 = 100;
 
-/// What the main LED's driver should be doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Output {
     /// The boost converter and amplifier's enable, PC1.
     pub enable: bool,
-    /// DAC0's code, 0 to [`DAC_MAX`].
     pub dac: u16,
     pub vref: Vref,
     pub paths: Paths,
 }
 
 impl Output {
-    /// Everything off and at its lowest, as the stock firmware turns off.
     pub const OFF: Self = Self {
         enable: false,
         dac: 0,
@@ -127,17 +81,15 @@ impl Output {
         paths: Paths::None,
     };
 
-    /// The boost converter and amplifier on, asked for no current. `Torch`
-    /// sends this for one tick before any level, the way the stock firmware
-    /// waits 8 ms after raising PC1 before it sets the DAC.
+    /// Sent for one tick before any level, the way the stock firmware waits
+    /// 8 ms after raising PC1 before it sets the DAC.
     pub const STARTING: Self = Self {
         enable: true,
         ..Self::OFF
     };
 
-    /// The current this asks for, in the model's units: DAC code times
-    /// reference millivolts times path gain. For the table and tests. It's a
-    /// 64-bit multiply, so it never runs on the chip.
+    /// In the model's units, DAC code × reference millivolts × path gain. A
+    /// 64-bit multiply, so it must never run on the chip.
     #[expect(
         clippy::arithmetic_side_effects,
         reason = "1023 × 2500 × 20,000 is about 5e10, far inside a u64"
@@ -158,9 +110,8 @@ const fn widen(value: u16) -> u64 {
     value as u64
 }
 
-/// Level 1, the moon path at code 100 against 1.024 V. That's about the
-/// lowest setting the stock firmware uses. Whether lower lights steadily is
-/// unmeasured.
+/// Level 1, about the lowest setting the stock firmware uses. Whether lower
+/// lights steadily is unmeasured.
 pub const FLOOR: Output = Output {
     enable: true,
     dac: 100,
@@ -168,9 +119,8 @@ pub const FLOOR: Output = Output {
     paths: Paths::Moon,
 };
 
-/// Level 150, the high path at code 716 against 2.5 V, which is the top of
-/// the stock firmware's 32 W build, the one the backup of this torch found
-/// (0284). It's 70 % of the driver's full scale.
+/// Level 150, the top of the stock firmware's 32 W build, which is the one
+/// read off this torch (model 0284).
 pub const TOP: Output = Output {
     enable: true,
     dac: 716,
@@ -178,8 +128,7 @@ pub const TOP: Output = Output {
     paths: Paths::High,
 };
 
-/// Every path and reference, from the least current a code asks for to the
-/// most.
+/// In order of the current a code asks for, least first.
 const GEARS: [(Paths, Vref); 6] = [
     (Paths::Moon, Vref::V1024),
     (Paths::Moon, Vref::V2500),
@@ -189,8 +138,6 @@ const GEARS: [(Paths, Vref); 6] = [
     (Paths::High, Vref::V2500),
 ];
 
-/// Each level packed in a `u16`, the code in bits 0 to 9, the reference in
-/// bit 10 and the paths in 11 and 12.
 #[expect(
     clippy::as_conversions,
     reason = "widening u8 to usize for an array length, where From can't be called"
@@ -203,8 +150,6 @@ const PATHS_SHIFT: u8 = 11;
 const _: () = assert!(DAC_MAX < VREF_BIT);
 const _: () = assert!(CEILING > 0 && CEILING <= LEVELS);
 
-/// The output for `level`. Level 0 is off, and anything over [`CEILING`] runs
-/// at the ceiling.
 pub fn output(level: u8) -> Output {
     let Some(index) = level.min(CEILING).checked_sub(1) else {
         return Output::OFF;
@@ -244,8 +189,6 @@ const fn pack(output: Output) -> u16 {
     output.dac | vref | (output.paths as u16) << PATHS_SHIFT
 }
 
-/// The lowest gear whose codes reach `target`, and the code there, rounded
-/// to the nearest or up.
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
@@ -279,8 +222,6 @@ const fn choose(target: u64, up: bool) -> Output {
     panic!("over the driver's full scale")
 }
 
-/// Worked out at compile time, so the wide maths never reaches the chip. Each
-/// level is held to more current than the last, by the model.
 #[expect(
     clippy::arithmetic_side_effects,
     clippy::indexing_slicing,
@@ -354,7 +295,6 @@ mod tests {
 
     #[test]
     fn each_level_uses_the_lowest_gear_that_reaches_it() {
-        // A lower gear would need a code over the top of the DAC.
         for level in all() {
             let at = GEARS
                 .iter()
