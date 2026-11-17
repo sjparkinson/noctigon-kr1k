@@ -9,7 +9,7 @@ You find out what's true about the Noctigon KR1K with loneoceans' Lume X1-C driv
 
 Sources, in order of trust.
 
-1. What's been read off this torch, recorded in docs/hardware.md and docs/breakout.md (signature, silicon revision, fuses, lock bits, pads). The backup itself is in `backup/stock/` in the main checkout (gitignored).
+1. What's been read off this torch, recorded in docs/hardware.md (signature, silicon revision, fuses, lock bits, pads). The backup itself is in `backup/stock/` in the main checkout (gitignored).
 2. Microchip's ATDF, vendored at `vendor/AVR32DD20.atdf`, for anything about the chip itself. Read the local copy.
 3. The AVR32DD20/14 datasheet (DS40002413B), its errata (DS80001026D) and Microchip's app notes. Local copies are in `docs/microchip/` (gitignored, so look in the main checkout if you're in a worktree), with extracted text in `docs/microchip/txt/`. Search with `rg`, or ask the caller to run the `microchip-docs` agent for a long dig. Cite section and revision letter.
 4. The AW2016's datasheet (Awinic), for the aux driver's I2C interface, current settings and standby draw.
