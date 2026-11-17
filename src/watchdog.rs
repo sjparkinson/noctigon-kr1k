@@ -123,7 +123,7 @@ const _: () = {
 };
 
 /// Counts ticks between feeds.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Feeder {
     /// Ticks until the next feed.
     wait: u8,
@@ -136,6 +136,15 @@ impl Feeder {
         Self {
             wait: 0,
             fed: false,
+        }
+    }
+
+    /// A feeder whose last tick fed the watchdog, for the pass that puts
+    /// the lit setting back after a rest ([`Pacer`]), which feeds it itself.
+    pub const fn just_fed() -> Self {
+        Self {
+            wait: FEED_TICKS - 1,
+            fed: true,
         }
     }
 
@@ -171,8 +180,363 @@ impl Feeder {
     }
 }
 
+/// Ticks one slow tick stands for. `hw::set_pit` slows the PIT from 512
+/// cycles of the 32 kHz oscillator to 32,768, 1 Hz.
+pub const SLOW_TICKS: u16 = TICKS_PER_SECOND;
+
+/// Quiet passes in a row, a second's worth, before the tick slows down, so
+/// a torch that's just gone out, or just been clicked, stays quick for a
+/// moment.
+pub const SETTLE_TICKS: u8 = 64;
+
+/// Slow ticks between feeds at rest.
+pub const FEED_SLOW_TICKS: u8 = 4;
+
+/// The watchdog's timeout at rest, in WDT clocks, normal mode with no window.
+/// `hw::set_watchdog` sets `WDT.CTRLA.PERIOD` to match, about 8 s.
+pub const REST_CLOCKS: u16 = 8192;
+
+/// The most a pass is allowed to take, in WDT clocks, which is `cargo xtask
+/// hex`'s budget of a quarter of a tick.
+const PASS_CLOCKS: u16 = CLOCKS_PER_TICK / 4;
+
+/// How long a write to `WDT.CTRLA` is taken to take to sync, in WDT clocks.
+/// The datasheet only gives `wdr`'s, two to three (§22.3.6), so this is the
+/// simulator's worst case, likely, not stated.
+pub const SYNC_CLOCKS: u16 = 3;
+
+/// How far apart two `wdr`s can sync, beyond how far apart they ran, since
+/// each takes two to three WDT clocks (§22.3.6).
+const SYNC_SPREAD: u16 = 1;
+
+/// Passes after the first one to see a press before the lit setting is back
+/// with a `wdr` behind it, at the end of the pass. See [`Pacer`].
+pub const EXIT_PASSES: u16 = 2;
+
+#[expect(
+    clippy::as_conversions,
+    reason = "widening u8 to u16 in a const, where From can't be called"
+)]
+const _: () = {
+    use crate::button::{HOLD_TICKS, RELEASE_TICKS};
+    // A press seen on pass P lights nothing before pass P + 1 +
+    // RELEASE_TICKS, as a click, or P + HOLD_TICKS, as a hold. The lit
+    // setting is back by the end of pass P + EXIT_PASSES.
+    assert!(RELEASE_TICKS + 1 > EXIT_PASSES && HOLD_TICKS > EXIT_PASSES);
+    // The longest gap between `wdr`s at rest. The last one ends a pass, the
+    // pass after it slows the PIT a tick later, and the first slow period
+    // can be up to two (the first PIT period after a change isn't stated,
+    // §26.5.2.2), then the rest of the slow ticks, then the first fast tick,
+    // up to two ticks, and the pass that feeds.
+    let slow = SLOW_TICKS * CLOCKS_PER_TICK;
+    let rest = CLOCKS_PER_TICK
+        + 2 * slow
+        + (FEED_SLOW_TICKS as u16 - 1) * slow
+        + 2 * CLOCKS_PER_TICK
+        + PASS_CLOCKS
+        + SYNC_SPREAD;
+    assert!(rest < REST_CLOCKS * 2 / 3);
+    // Putting the lit setting back. The `wdr` before it ended the pass
+    // before, the write starts this one and its `wdr` ends it once the write
+    // has synced. If the write doesn't restart the count, which the
+    // datasheet doesn't say, that `wdr` has the open window alone to land in,
+    // since window mode only starts with it (§22.3.3.2).
+    assert!(CLOCKS_PER_TICK + max(PASS_CLOCKS, SYNC_CLOCKS) + SYNC_SPREAD < OPEN_CLOCKS);
+    // Going to rest. The write comes a tick after a lit feed, and has to sync
+    // before the lit timeout, both windows.
+    assert!(
+        CLOCKS_PER_TICK + PASS_CLOCKS + SYNC_CLOCKS + SYNC_SPREAD < CLOSED_CLOCKS + OPEN_CLOCKS
+    );
+};
+
+/// The larger of two, in a const.
+const fn max(a: u16, b: u16) -> u16 {
+    if a > b { a } else { b }
+}
+
+/// What ended the sleep before a pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wake {
+    /// The PIT's tick.
+    Tick,
+    /// An edge on the switch, which only ends a sleep with the PIT slow.
+    Switch,
+}
+
+/// The watchdog's two settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Setting {
+    /// Window mode, [`CLOSED_CLOCKS`] closed and [`OPEN_CLOCKS`] open, fed
+    /// every [`FEED_TICKS`]. The only setting PC1 rises under.
+    Lit,
+    /// Normal mode, [`REST_CLOCKS`], fed every [`FEED_SLOW_TICKS`] slow
+    /// ticks.
+    Rest,
+}
+
+/// The PIT's two periods.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Pit {
+    /// 64 Hz.
+    Fast,
+    /// 1 Hz, [`SLOW_TICKS`] ticks.
+    Slow,
+}
+
+/// What a pass does first, before it reads the switch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Begin {
+    /// Resting ticks the wait just slept through, beyond the pass's own,
+    /// for `torch::Torch::rest_for`.
+    pub rested: u16,
+    /// A setting to write to the watchdog. The pass carries on while it
+    /// syncs, and [`End::synced`] waits for it.
+    pub watchdog: Option<Setting>,
+}
+
+/// What a pass does last, after the output, in this order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct End {
+    /// Wait for [`Begin::watchdog`]'s write to sync.
+    pub synced: bool,
+    /// `wdr`.
+    pub feed: bool,
+    /// A period to give the PIT.
+    pub pit: Option<Pit>,
+    /// Sleep in power-down rather than idle.
+    pub power_down: bool,
+    /// An edge on the switch ends the sleep, as well as the PIT. Only with
+    /// the PIT slow.
+    pub switch_wakes: bool,
+}
+
+impl End {
+    /// The sleep before the first pass, which is power-down if the torch
+    /// starts out `resting`, as [`Feeder::power_down`] has it.
+    pub const fn start(resting: bool) -> Self {
+        Self {
+            synced: false,
+            feed: false,
+            pit: None,
+            power_down: resting,
+            switch_wakes: false,
+        }
+    }
+
+    const fn fed() -> Self {
+        Self {
+            synced: false,
+            feed: true,
+            pit: None,
+            power_down: false,
+            switch_wakes: false,
+        }
+    }
+
+    const fn slow() -> Self {
+        Self {
+            synced: false,
+            feed: false,
+            pit: Some(Pit::Slow),
+            power_down: true,
+            switch_wakes: true,
+        }
+    }
+}
+
+/// Where the [`Pacer`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum State {
+    /// The lit setting and the 64 Hz tick, fed by the [`Feeder`]. The only
+    /// state the light can be on in.
+    Fast,
+    /// The pass after a lit feed, which writes the rest setting.
+    Entering,
+    /// The 1 Hz tick at rest, with `since` slow ticks since the last feed.
+    Slow { since: u8 },
+    /// The PIT's just gone back to 64 Hz with the rest setting, and this pass
+    /// feeds.
+    Bridge,
+    /// Fed last pass with the rest setting. This pass slows the PIT again if
+    /// it's still quiet.
+    Returning,
+    /// This pass writes the lit setting, and feeds once it's synced.
+    Restoring,
+}
+
+/// Paces the loop, 64 Hz while there's anything to do and 1 Hz at rest.
+///
+/// That's the 64 Hz tick and the lit watchdog setting whenever there's
+/// anything to do, and a 1 Hz tick with a long watchdog timeout at rest, so
+/// a torch that's off wakes once a second, not 64 times. The torch is quiet when it's [resting](crate::torch::Torch::resting), with
+/// nothing timed for more than a slow tick (`torch::Torch::quiet_for`) and
+/// the aux settled (`aw2016::Aw2016::settled`). After [`SETTLE_TICKS`] quiet
+/// passes in a row it waits for a lit feed, and the pass after that writes
+/// [`Setting::Rest`] and slows the PIT. Each slow tick stands for
+/// [`SLOW_TICKS`] (`torch::Torch::rest_for`), and an edge on the switch ends
+/// a slow sleep too, so the pass that sees a press runs on the press, not up
+/// to a second later.
+///
+/// No `wdr` ever goes before a power-down, so every feed at rest is a short
+/// trip back to 64 Hz. Every [`FEED_SLOW_TICKS`] slow ticks, the PIT goes
+/// fast with no feed, the first fast tick feeds and idles, and the next slows
+/// the PIT again. A pass that isn't quiet, or follows a switch edge, takes the
+/// same way back and then writes [`Setting::Lit`] at the start of the next
+/// pass and feeds at its end, once the write has synced. That's at most
+/// [`EXIT_PASSES`] passes after the press, long before the press can light
+/// anything.
+///
+/// The first PIT period after a change of period is anything from next to
+/// nothing to a whole one (§26.5.2.2), so a slow tick can stand for more
+/// time than went by. The five-minute check of the cell can come up to a
+/// second or so early for each slow stretch, and nothing on this page counts
+/// on it being late.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Pacer {
+    state: State,
+    feeder: Feeder,
+    /// Quiet passes in a row, up to [`SETTLE_TICKS`].
+    settle: u8,
+}
+
+impl Default for Pacer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pacer {
+    /// Fast and lit, as `hw::init` and `hw::start_watchdog` leave the chip.
+    pub const fn new() -> Self {
+        Self {
+            state: State::Fast,
+            feeder: Feeder::new(),
+            settle: 0,
+        }
+    }
+
+    /// Whether the lit setting is in force, with a `wdr` since it was
+    /// written, so PC1 may rise.
+    pub const fn lit(&self) -> bool {
+        matches!(self.state, State::Fast)
+    }
+
+    /// Whether the PIT is slow for the sleep the last pass ended in.
+    pub const fn slow(&self) -> bool {
+        matches!(self.state, State::Slow { .. })
+    }
+
+    /// The start of a pass that `wake` began.
+    pub const fn begin(&mut self, wake: Wake) -> Begin {
+        if matches!(wake, Wake::Switch) {
+            self.settle = 0;
+        }
+        let rested = match (self.state, wake) {
+            (State::Slow { .. }, Wake::Tick) => SLOW_TICKS - 1,
+            _ => 0,
+        };
+        let watchdog = match self.state {
+            State::Entering => Some(Setting::Rest),
+            State::Restoring => Some(Setting::Lit),
+            _ => None,
+        };
+        Begin { rested, watchdog }
+    }
+
+    /// The end of a pass, `resting` being `torch::Torch::resting` and
+    /// `quiet` whether the torch has nothing timed for more than a slow tick
+    /// and the aux are settled.
+    pub const fn end(&mut self, resting: bool, quiet: bool) -> End {
+        self.settle = if quiet && self.settle < SETTLE_TICKS {
+            self.settle.saturating_add(1)
+        } else if quiet {
+            SETTLE_TICKS
+        } else {
+            0
+        };
+        let settled = self.settle >= SETTLE_TICKS;
+        let (next, end) = match self.state {
+            State::Fast => {
+                let feed = self.feeder.tick();
+                let end = End {
+                    synced: false,
+                    feed,
+                    pit: None,
+                    power_down: self.feeder.power_down(resting),
+                    switch_wakes: false,
+                };
+                (
+                    if feed && settled {
+                        State::Entering
+                    } else {
+                        State::Fast
+                    },
+                    end,
+                )
+            }
+            // The rest setting went in at the start of this pass. Still
+            // quiet, so slow down. A press since, so feed under it and put
+            // the lit setting back.
+            State::Entering if settled => (
+                State::Slow { since: 0 },
+                End {
+                    synced: true,
+                    ..End::slow()
+                },
+            ),
+            State::Entering => (
+                State::Restoring,
+                End {
+                    synced: true,
+                    ..End::fed()
+                },
+            ),
+            State::Slow { since } => {
+                let since = since.saturating_add(1);
+                if settled && since < FEED_SLOW_TICKS {
+                    (
+                        State::Slow { since },
+                        End {
+                            pit: None,
+                            ..End::slow()
+                        },
+                    )
+                } else {
+                    (
+                        State::Bridge,
+                        End {
+                            synced: false,
+                            feed: false,
+                            pit: Some(Pit::Fast),
+                            power_down: resting,
+                            switch_wakes: false,
+                        },
+                    )
+                }
+            }
+            State::Bridge if settled => (State::Returning, End::fed()),
+            State::Returning if settled => (State::Slow { since: 0 }, End::slow()),
+            State::Bridge | State::Returning => (State::Restoring, End::fed()),
+            State::Restoring => {
+                self.feeder = Feeder::just_fed();
+                (
+                    State::Fast,
+                    End {
+                        synced: true,
+                        ..End::fed()
+                    },
+                )
+            }
+        };
+        self.state = next;
+        end
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    extern crate std;
+
     use super::*;
 
     #[test]
@@ -237,6 +601,194 @@ mod tests {
             assert!(!feeder.power_down(false));
             feeder.tick();
         }
+    }
+
+    /// A pass of a pacer, the way `main` runs one, with the torch's
+    /// `resting` and `quiet` as given.
+    fn pass(pacer: &mut Pacer, wake: Wake, resting: bool, quiet: bool) -> (Begin, End) {
+        let begin = pacer.begin(wake);
+        (begin, pacer.end(resting, quiet))
+    }
+
+    /// Runs quiet ticks until the pacer's slowed the PIT, and returns how many.
+    fn to_slow(pacer: &mut Pacer) -> u16 {
+        for n in 1..=200 {
+            if pass(pacer, Wake::Tick, true, true).1.pit == Some(Pit::Slow) {
+                return n;
+            }
+        }
+        panic!("never slowed down");
+    }
+
+    #[test]
+    fn slows_down_after_a_quiet_second_on_the_pass_after_a_feed() {
+        let mut pacer = Pacer::new();
+        let mut feeds = 0;
+        for n in 1..=200u16 {
+            let (begin, end) = pass(&mut pacer, Wake::Tick, true, true);
+            if end.pit == Some(Pit::Slow) {
+                assert!(n > u16::from(SETTLE_TICKS), "after {n}");
+                assert_eq!(
+                    begin.watchdog,
+                    Some(Setting::Rest),
+                    "writes the rest setting"
+                );
+                assert!(end.synced && !end.feed && end.power_down && end.switch_wakes);
+                assert!(feeds > 0);
+                assert!(pacer.slow() && !pacer.lit());
+                return;
+            }
+            assert_eq!(begin.watchdog, None);
+            feeds += u32::from(end.feed);
+        }
+        panic!("never slowed down");
+    }
+
+    #[test]
+    fn stays_fast_while_anything_is_going_on() {
+        let mut pacer = Pacer::new();
+        for n in 0..1000 {
+            let quiet = n % 50 != 0;
+            let (begin, end) = pass(&mut pacer, Wake::Tick, quiet, quiet);
+            assert_eq!(end.pit, None, "pass {n}");
+            assert_eq!(begin.watchdog, None);
+            assert!(pacer.lit());
+        }
+    }
+
+    #[test]
+    fn a_slow_tick_stands_for_a_second_of_ticks_and_a_switch_wake_for_none() {
+        let mut pacer = Pacer::new();
+        to_slow(&mut pacer);
+        let (begin, end) = pass(&mut pacer, Wake::Tick, true, true);
+        assert_eq!(begin.rested, SLOW_TICKS - 1);
+        assert_eq!(end.pit, None);
+        let begin = pacer.begin(Wake::Switch);
+        assert_eq!(begin.rested, 0);
+    }
+
+    #[test]
+    fn feeds_at_rest_by_way_of_the_fast_tick_and_never_before_a_power_down() {
+        let mut pacer = Pacer::new();
+        to_slow(&mut pacer);
+        let mut ends = std::vec::Vec::new();
+        for _ in 0..40 {
+            ends.push(pass(&mut pacer, Wake::Tick, true, true).1);
+        }
+        for end in &ends {
+            assert!(!(end.feed && end.power_down), "{end:?}");
+            assert!(!end.synced, "nothing's written at rest");
+        }
+        // Four slow ticks, the last of them switching the PIT fast, then a
+        // fast tick that feeds, then one that slows the PIT again.
+        let pattern: std::vec::Vec<(bool, Option<Pit>)> =
+            ends.iter().map(|end| (end.feed, end.pit)).collect();
+        let cycle = [
+            (false, None),
+            (false, None),
+            (false, None),
+            (false, Some(Pit::Fast)),
+            (true, None),
+            (false, Some(Pit::Slow)),
+        ];
+        for (n, chunk) in pattern.chunks(cycle.len()).enumerate() {
+            assert_eq!(chunk, &cycle[..chunk.len()], "cycle {n}");
+        }
+    }
+
+    /// Every way a press can come up at rest, and the passes until the lit
+    /// setting is back with a `wdr` behind it.
+    #[test]
+    fn a_press_at_rest_has_the_lit_setting_back_within_exit_passes() {
+        // Slow passes, then the press on each pass of a feed trip in turn.
+        for at in 0..12 {
+            let mut pacer = Pacer::new();
+            to_slow(&mut pacer);
+            for _ in 0..at {
+                pass(&mut pacer, Wake::Tick, true, true);
+            }
+            let wake = if pacer.slow() {
+                Wake::Switch
+            } else {
+                Wake::Tick
+            };
+            let mut lit_at = None;
+            for n in 0..=EXIT_PASSES {
+                let (begin, end) = pass(
+                    &mut pacer,
+                    if n == 0 { wake } else { Wake::Tick },
+                    false,
+                    false,
+                );
+                if begin.watchdog == Some(Setting::Lit) {
+                    assert!(end.synced && end.feed, "{end:?}");
+                    lit_at = Some(n);
+                    break;
+                }
+                assert!(!pacer.lit());
+            }
+            assert!(lit_at.is_some(), "press {at} passes into the rest");
+            assert!(pacer.lit());
+        }
+        // On the pass that goes to rest.
+        let mut pacer = Pacer::new();
+        for _ in 0..200 {
+            if pacer.state == State::Entering {
+                break;
+            }
+            pass(&mut pacer, Wake::Tick, true, true);
+        }
+        assert_eq!(pacer.state, State::Entering);
+        let (_, end) = pass(&mut pacer, Wake::Tick, false, false);
+        assert!(end.synced && end.feed && end.pit.is_none() && !end.power_down);
+        let (begin, end) = pass(&mut pacer, Wake::Tick, false, false);
+        assert_eq!(begin.watchdog, Some(Setting::Lit));
+        assert!(end.synced && end.feed);
+        assert!(pacer.lit());
+    }
+
+    /// A switch edge that the pass finds released, a bounce, still puts the
+    /// tick back to 64 Hz for a second.
+    #[test]
+    fn a_switch_wake_starts_the_quiet_second_again() {
+        let mut pacer = Pacer::new();
+        to_slow(&mut pacer);
+        let (_, end) = pass(&mut pacer, Wake::Switch, true, true);
+        assert_eq!(end.pit, Some(Pit::Fast));
+        assert!(end.power_down, "nothing to do, and no feed this pass");
+        let n = to_slow(&mut pacer);
+        assert!(n > u16::from(SETTLE_TICKS), "{n}");
+    }
+
+    /// The lit feeds after putting the lit setting back keep to the window
+    /// as ever.
+    #[test]
+    fn lit_feeds_carry_on_every_third_pass_after_a_rest() {
+        let mut pacer = Pacer::new();
+        to_slow(&mut pacer);
+        let mut feeds = std::vec::Vec::new();
+        let mut wake = Wake::Switch;
+        for _ in 0..20 {
+            let (_, end) = pass(&mut pacer, wake, false, false);
+            wake = Wake::Tick;
+            if pacer.lit() {
+                feeds.push(end.feed);
+            }
+        }
+        let (t, f) = (true, false);
+        assert_eq!(&feeds[..7], &[t, f, f, t, f, f, t]);
+    }
+
+    #[test]
+    fn the_margins_at_rest() {
+        let slow = SLOW_TICKS * CLOCKS_PER_TICK;
+        assert_eq!(slow, 1024);
+        // The longest gap between feeds at rest, against 8,192 clocks.
+        let rest = CLOCKS_PER_TICK + 2 * slow + 3 * slow + 2 * CLOCKS_PER_TICK + 4 + 1;
+        assert_eq!(rest, 5173);
+        assert_eq!(u32::from(rest) * 100 / u32::from(REST_CLOCKS), 63);
+        // The gap a write of the lit setting has to fit in, against 32.
+        assert_eq!(CLOCKS_PER_TICK + 4 + 1, 21);
     }
 
     #[test]

@@ -10,6 +10,7 @@ use crate::selftest::Faults;
 use crate::sensors::{Convert, Supplies};
 use crate::temp::Calibration;
 use crate::ui::{Aux, Mode, Ui};
+use crate::watchdog;
 
 /// How long the aux LEDs say why the light won't come on.
 ///
@@ -189,6 +190,54 @@ impl Torch {
         self.quiet() && !self.checking
     }
 
+    /// How many resting ticks in a row would change nothing but counters,
+    /// so [`Torch::rest_for`] can take them at once. `None` while it isn't
+    /// [resting](Self::resting), or while the aux are showing a colour for a
+    /// while ([`SHOW_TICKS`], [`LOCKED_TICKS`]). Otherwise the ticks until
+    /// the next check of the cell, or [`u16::MAX`] with a fault, which skips
+    /// them.
+    pub const fn quiet_for(&self) -> Option<u16> {
+        if !self.resting() || self.showing > 0 {
+            None
+        } else if matches!(self.limits.health(), Health::Fault) {
+            Some(u16::MAX)
+        } else {
+            Some(self.check_in)
+        }
+    }
+
+    /// Whether a slow tick, [`watchdog::SLOW_TICKS`] at once, would miss
+    /// nothing of the torch's. The firmware's loop ands this with the aux
+    /// being settled to tell `watchdog::Pacer` it's quiet.
+    pub fn can_slow(&self) -> bool {
+        self.quiet_for()
+            .is_some_and(|ticks| ticks > watchdog::SLOW_TICKS)
+    }
+
+    /// `ticks` calls of [`Torch::tick`] with the switch up and no ADC result,
+    /// for the firmware's slow tick at rest (`watchdog::Pacer`). With
+    /// [`Torch::quiet_for`] at `ticks` or more that's a few sums, and
+    /// otherwise it's the ticks themselves, so it always lands where they
+    /// would. Resting ticks don't look at VDDIO2, and the fallback's take it
+    /// as there, since nothing was read in the time they stand for.
+    pub fn rest_for(&mut self, ticks: u16) {
+        if ticks == 0 {
+            return;
+        }
+        if self.quiet_for().is_none_or(|quiet| quiet < ticks) {
+            for _ in 0..ticks {
+                self.tick(false, None, true);
+            }
+            return;
+        }
+        // Resting, so the light's off, `showing` is 0 and no click is
+        // counting, and every one of these ticks finds `check_in` above 0.
+        self.warm = false;
+        self.clicks.wait(ticks);
+        self.limits.rest_for(ticks);
+        self.check_in = self.check_in.saturating_sub(ticks);
+    }
+
     /// The level the LEDs should be at right now, `0` meaning off. That's what
     /// the UI wants, as far as the cell and the temperature allow.
     pub const fn level(&self) -> u8 {
@@ -343,6 +392,133 @@ mod tests {
             found = true;
         }
         assert!(found, "docs/ui.md has no examples");
+    }
+
+    /// Every row's example again, paced the way the firmware's loop is, with
+    /// a 1 Hz tick at rest, in each of the PIT's phases.
+    #[test]
+    fn every_example_in_docs_ui_md_holds_paced() {
+        use crate::testing::{Paced, PitPhase, Scene, samples};
+        for phase in [PitPhase::Aligned, PitPhase::Early, PitPhase::Late] {
+            for example in examples(UI_MD) {
+                let example = example.unwrap();
+                let mut script = samples(example.actions()).peekable();
+                let power_on = script.peek().map_or(Scene::NORMAL, |s| s.scene);
+                let mut paced = Paced::new(power_on.faults(), 0);
+                paced.phase = phase;
+                for sample in script {
+                    paced.sample(sample.pressed, &sample.scene);
+                }
+                assert!(
+                    example.expect.holds(paced.level()),
+                    "docs/ui.md:{}: {} {phase:?}: ends at level {}",
+                    example.line,
+                    example.row,
+                    paced.level()
+                );
+            }
+        }
+    }
+
+    /// Random clicks, holds and long rests, the plain torch ticking every
+    /// sample and the paced one only on its passes. The paced light only
+    /// comes on with the lit watchdog setting in force, and it does slow
+    /// down. With the PIT aligned, the light is the same as the plain torch's
+    /// on every sample. Early and late, the first tick after a change of
+    /// period really does move, so a press can count a tick sooner or later.
+    #[test]
+    fn pacing_never_changes_the_light_and_only_lights_it_lit() {
+        use crate::testing::{Paced, PitPhase, Scene};
+        for (seed, phase) in [
+            (1, PitPhase::Aligned),
+            (2, PitPhase::Early),
+            (3, PitPhase::Late),
+        ] {
+            let mut rng = Rng::new(seed);
+            let mut plain = Rig::default();
+            let mut paced = Paced::new(Faults::NONE, 0);
+            paced.phase = phase;
+            let (mut slow, mut passes, mut lit) = (0u32, 0u32, 0u32);
+            for _ in 0..400 {
+                let (pressed, ticks) = match rng.next_u16() % 4 {
+                    0 => (true, 2 + rng.next_u16() % 6),
+                    1 => (true, 20 + rng.next_u16() % 100),
+                    2 => (false, 2 + rng.next_u16() % 20),
+                    _ => (false, rng.next_u16() % 600),
+                };
+                for _ in 0..ticks {
+                    plain.tick_in(pressed, &Scene::NORMAL);
+                    if paced.sample(pressed, &Scene::NORMAL).is_some() {
+                        passes += 1;
+                    }
+                    slow += u32::from(paced.pacer.slow());
+                    if phase == PitPhase::Aligned {
+                        assert_eq!(paced.output(), plain.output());
+                    }
+                    lit += u32::from(paced.output().enable);
+                    assert!(!paced.output().enable || paced.pacer.lit(), "{phase:?}");
+                }
+            }
+            assert!(slow > 10_000, "{phase:?} hardly ever slowed: {slow}");
+            assert!(passes > 0 && lit > 1000, "{phase:?}: lit for {lit}");
+        }
+    }
+
+    /// `rest_for(n)` lands where n resting ticks would, from anywhere.
+    #[test]
+    fn resting_for_a_while_is_resting_tick_by_tick() {
+        let mut rng = Rng::new(9);
+        let mut torch = Rig::default();
+        for round in 0..3000 {
+            // Somewhere random, with the switch up for a moment at the end.
+            let pressed = rng.next_u16() % 3 == 0;
+            for _ in 0..rng.next_u16() % 40 {
+                torch.tick(pressed);
+            }
+            if round % 7 == 0 {
+                run(&mut torch, false, rng.next_u16() % 20_000);
+            }
+            let ticks = rng.next_u16() % 200;
+            let mut by_tick = torch.torch.clone();
+            for _ in 0..ticks {
+                by_tick.tick(false, None, true);
+            }
+            let mut at_once = torch.torch.clone();
+            at_once.rest_for(ticks);
+            assert_eq!(
+                std::format!("{at_once:?}"),
+                std::format!("{by_tick:?}"),
+                "round {round}, {ticks} ticks"
+            );
+            torch.torch = at_once;
+        }
+    }
+
+    #[test]
+    fn quiet_only_at_rest_with_nothing_showing() {
+        let mut torch = Rig::default();
+        assert_eq!(torch.quiet_for(), Some(0), "the cell's due a check");
+        run(&mut torch, false, 8);
+        assert!(torch.quiet_for() > Some(CHECK_TICKS - 8), "checked");
+        assert!(torch.can_slow());
+        torch.tick(true);
+        assert_eq!(torch.quiet_for(), None, "pressed");
+        let mut torch = Rig::default();
+        tap(&mut torch, 3, Event::Click(3));
+        run(&mut torch, false, 4);
+        assert_eq!(torch.quiet_for(), None, "red's showing");
+        run(&mut torch, false, LOCKED_TICKS);
+        assert!(torch.can_slow());
+        let mut faulty = Rig::new(crate::selftest::Faults {
+            hang: true,
+            ..Faults::NONE
+        });
+        run(&mut faulty, false, SHOW_TICKS + 4);
+        assert_eq!(
+            faulty.quiet_for(),
+            Some(u16::MAX),
+            "a fault skips the checks"
+        );
     }
 
     #[test]

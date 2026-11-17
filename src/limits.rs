@@ -182,8 +182,17 @@ impl Limits {
     /// isn't a fault. The light can't come on without ticks of
     /// [`Limits::tick`] first, and those look.
     pub const fn rest(&mut self) {
+        self.rest_for(1);
+    }
+
+    /// `ticks` of [`Limits::rest`] at once, for a slow tick at rest
+    /// (`watchdog::SLOW_TICKS`). None is no rest at all.
+    pub const fn rest_for(&mut self, ticks: u16) {
+        if ticks == 0 {
+            return;
+        }
         self.schedule.rest();
-        self.protection.rest();
+        self.protection.rest_for(ticks);
         self.ground.rest();
         self.convert = None;
         self.on = false;

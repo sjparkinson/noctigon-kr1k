@@ -49,6 +49,7 @@ use core::ops::Deref;
 use core::str::{FromStr, Lines};
 
 use crate::TICKS_PER_SECOND;
+use crate::aw2016::Aw2016;
 use crate::battery;
 use crate::button::{Event, HOLD_TICKS, RELEASE_TICKS};
 use crate::selftest::Faults;
@@ -56,6 +57,7 @@ use crate::sensors::{Channel, Convert};
 use crate::temp::Calibration;
 use crate::thermal;
 use crate::torch::Torch;
+use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Wake};
 
 /// The most four accumulated 12-bit conversions can read.
 pub const FULL_SCALE: u16 = 4 * 4095;
@@ -626,6 +628,152 @@ impl Deref for Rig {
 
     fn deref(&self) -> &Torch {
         &self.torch
+    }
+}
+
+/// When the PIT's first period after a change of period ends.
+///
+/// The datasheet only says the first after enabling is anything up to a
+/// whole period, from the prescaler's phase (§26.5.2.2), so the simulator
+/// runs all three.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PitPhase {
+    /// On the prescaler's next edge for the new period, so a slow tick lands
+    /// on every 64th point of the 64 Hz grid, counted from when the PIT
+    /// started, and a fast one on the next.
+    #[default]
+    Aligned,
+    /// On the next point of the 64 Hz grid, slow or fast, as soon as the
+    /// model goes.
+    Early,
+    /// A whole period after it would be aligned, as late as the model goes.
+    Late,
+}
+
+impl PitPhase {
+    /// The grid point the PIT ticks on first, after a change to `pit` during
+    /// the pass at grid point `at`.
+    pub const fn first(self, at: u32, pit: Pit) -> u32 {
+        match (self, pit) {
+            (Self::Aligned | Self::Early, Pit::Fast) | (Self::Early, Pit::Slow) => at + 1,
+            (Self::Late, Pit::Fast) => at + 2,
+            (Self::Aligned, Pit::Slow) => next_slow(at),
+            (Self::Late, Pit::Slow) => next_slow(at) + SLOW_GRID,
+        }
+    }
+}
+
+/// Points of the 64 Hz grid in a slow tick.
+const SLOW_GRID: u32 = SLOW_TICKS as u32;
+
+/// The first slow tick of the prescaler's own after grid point `at`.
+pub const fn next_slow(at: u32) -> u32 {
+    (at / SLOW_GRID + 1) * SLOW_GRID
+}
+
+/// The firmware's whole loop, src/main.rs's, on the 64 Hz grid of samples.
+///
+/// That's the [`Rig`], the AW2016's steps and the [`Pacer`], with the PIT
+/// ticking as [`PitPhase`] says. Each sample is a point of the grid, and a
+/// pass runs on it if the PIT ticks there, or if the switch moved since the
+/// last sample with the PIT slow. With the PIT slow most samples run no pass.
+#[derive(Clone, Debug)]
+pub struct Paced {
+    pub rig: Rig,
+    pub aux: Aw2016,
+    pub pacer: Pacer,
+    pub phase: PitPhase,
+    /// Every AW2016 update fails, as on a bus with a fault on it.
+    pub bus_fails: bool,
+    /// The end of the last pass.
+    pub end: End,
+    /// The grid point the next sample is on, counted from when the PIT
+    /// started.
+    grid: u32,
+    /// The grid point the PIT next ticks on.
+    next_tick: u32,
+    /// The PIT's period.
+    pit: Pit,
+    /// The switch at the last sample.
+    pressed: bool,
+}
+
+impl Paced {
+    /// A torch whose power-on checks found `faults`, as `main` starts it,
+    /// with the first sample on grid point `grid`, where the PIT ticks.
+    pub const fn new(faults: Faults, grid: u32) -> Self {
+        let rig = Rig::new(faults);
+        Self {
+            end: End::start(rig.torch.resting()),
+            rig,
+            aux: Aw2016::new(),
+            pacer: Pacer::new(),
+            phase: PitPhase::Aligned,
+            bus_fails: false,
+            grid,
+            next_tick: grid,
+            pit: Pit::Fast,
+            pressed: false,
+        }
+    }
+
+    /// The PIT's period as the last pass left it.
+    pub const fn pit(&self) -> Pit {
+        self.pit
+    }
+
+    /// One sample of the grid, and the pass it ran, if any.
+    pub fn sample(&mut self, pressed: bool, scene: &Scene) -> Option<End> {
+        let at = self.grid;
+        self.grid += 1;
+        let moved = pressed != self.pressed;
+        self.pressed = pressed;
+        let wake = if at == self.next_tick {
+            self.next_tick = match self.pit {
+                Pit::Fast => at + 1,
+                Pit::Slow => next_slow(at),
+            };
+            Wake::Tick
+        } else if moved && self.end.switch_wakes {
+            Wake::Switch
+        } else {
+            return None;
+        };
+        Some(self.pass(wake, at, scene))
+    }
+
+    /// A pass that a switch edge with no switch movement ran, a bounce, on
+    /// the last sample's grid point, if the last pass left the switch able
+    /// to wake it.
+    pub fn bounce(&mut self, scene: &Scene) -> Option<End> {
+        self.end
+            .switch_wakes
+            .then(|| self.pass(Wake::Switch, self.grid - 1, scene))
+    }
+
+    fn pass(&mut self, wake: Wake, at: u32, scene: &Scene) -> End {
+        let begin = self.pacer.begin(wake);
+        self.rig.torch.rest_for(begin.rested);
+        self.rig.tick_in(self.pressed, scene);
+        if self.aux.step(self.rig.torch.aux()).is_some() && self.bus_fails {
+            self.aux.failed();
+        }
+        let quiet = self.rig.torch.can_slow() && self.aux.settled(self.rig.torch.aux());
+        let end = self.pacer.end(self.rig.torch.resting(), quiet);
+        if let Some(pit) = end.pit {
+            self.pit = pit;
+            self.next_tick = self.phase.first(at, pit);
+        }
+        self.end = end;
+        end
+    }
+}
+
+impl Deref for Paced {
+    type Target = Torch;
+
+    fn deref(&self) -> &Torch {
+        &self.rig.torch
     }
 }
 

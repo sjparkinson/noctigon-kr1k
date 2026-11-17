@@ -417,10 +417,19 @@ impl Protection {
     /// does [`Protection::flat`]. The filter stays too, until
     /// [`FORGET_TICKS`] have gone by.
     pub const fn rest(&mut self) {
+        self.rest_for(1);
+    }
+
+    /// `ticks` of [`Protection::rest`] at once, for a slow tick at rest
+    /// (`watchdog::SLOW_TICKS`). None is no rest at all.
+    pub const fn rest_for(&mut self, ticks: u16) {
+        if ticks == 0 {
+            return;
+        }
         (self.low_samples, self.flat_samples, self.high_samples) = (0, 0, 0);
         self.sagging = 0;
         self.implausible = 0;
-        self.rested = self.rested.saturating_add(1);
+        self.rested = self.rested.saturating_add(ticks);
         if self.rested >= FORGET_TICKS {
             self.filtered = 0;
         }

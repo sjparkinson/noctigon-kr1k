@@ -318,6 +318,13 @@ impl Aw2016 {
         Some(update)
     }
 
+    /// Whether [`Aw2016::step`] would send nothing for `want`, so the aux
+    /// need no more ticks.
+    pub const fn settled(&self, want: Aux) -> bool {
+        let mut next = *self;
+        next.step(want).is_none()
+    }
+
     /// The last step's transfers didn't all go through, so its colour is
     /// given up on.
     pub const fn failed(&mut self) {

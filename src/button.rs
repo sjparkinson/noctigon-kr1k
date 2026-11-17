@@ -47,6 +47,13 @@ impl Clicks {
         !self.pressed && self.count == 0
     }
 
+    /// `ticks` samples with the switch up at once, for a slow tick at rest.
+    /// Only for when it's [idle](Self::idle), where that's all a released
+    /// sample changes.
+    pub const fn wait(&mut self, ticks: u16) {
+        self.ticks = self.ticks.saturating_add(ticks);
+    }
+
     /// Feeds in one sample, `true` meaning the switch is down.
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
         self.tick_up_to(pressed, None)
