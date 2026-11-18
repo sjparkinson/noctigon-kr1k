@@ -51,8 +51,15 @@ pub const EXAMPLES: &[Example] = &[
     ex("Off: 4C or more", "5C 1C", Off),
     ex("Off: Anything else", "2C 1H:2s 2H:2s wait:1s", Off),
     ex("On: 1C", "1C 1C", Off),
+    ex("On: 1C, after ramping", "1C 1H:3s 1C", Off),
+    ex("On: 3C", "1C 3C 1C", Level(52)),
     ex("On: 1H", "1C 1H:3s", Level(ramp::CEILING)),
     ex("On: 1H again", "1C 1H:3s 1H:3s", Level(13)),
+    ex(
+        "On: 1H, a third time",
+        "1C 1H:3s 1H:3s 1H:3s",
+        Level(ramp::CEILING),
+    ),
     ex(
         "On: 1H, after one that stopped partway",
         "1C 1H:1s 1H:500ms",
