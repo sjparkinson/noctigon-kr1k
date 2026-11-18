@@ -159,6 +159,34 @@ pub fn output(level: u8) -> Output {
     }
 }
 
+/// Steps between one level and the next.
+pub const FRACTION: u16 = 16;
+
+const _: () = assert!(FRACTION.is_power_of_two());
+
+/// `sixteenths` is a level in [`FRACTION`]ths.
+#[expect(
+    clippy::arithmetic_side_effects,
+    reason = "a gap of DAC_MAX at most times a part under FRACTION is 15,345 at most"
+)]
+pub fn output_between(sixteenths: u16) -> Output {
+    let level = u8::try_from(sixteenths / FRACTION).unwrap_or(CEILING);
+    let low = output(level);
+    let part = sixteenths % FRACTION;
+    if part == 0 || level == 0 || level >= CEILING {
+        return low;
+    }
+    let high = output(level.saturating_add(1));
+    if (high.vref, high.paths) != (low.vref, low.paths) {
+        return low;
+    }
+    let rise = high.dac.saturating_sub(low.dac).min(DAC_MAX) * part / FRACTION;
+    Output {
+        dac: low.dac.saturating_add(rise),
+        ..low
+    }
+}
+
 const fn unpack(packed: u16) -> Output {
     Output {
         enable: true,
@@ -325,6 +353,64 @@ mod tests {
     fn nothing_runs_above_the_ceiling() {
         assert_eq!(output(LEVELS), output(CEILING));
         assert_eq!(output(u8::MAX), output(CEILING));
+    }
+
+    fn gear(output: Output) -> (Paths, Vref) {
+        (output.paths, output.vref)
+    }
+
+    #[test]
+    fn a_whole_level_between_is_the_level() {
+        for level in 0..=LEVELS {
+            assert_eq!(output_between(u16::from(level) * FRACTION), output(level));
+        }
+    }
+
+    #[test]
+    fn under_level_one_is_off_and_over_the_ceiling_is_the_ceiling() {
+        for sixteenths in 0..FRACTION {
+            assert_eq!(output_between(sixteenths), Output::OFF);
+        }
+        let top = u16::from(CEILING) * FRACTION;
+        for sixteenths in [top + 1, top + FRACTION, u16::MAX] {
+            assert_eq!(output_between(sixteenths), output(CEILING));
+        }
+    }
+
+    #[test]
+    fn between_two_levels_in_one_gear_is_a_code_between_theirs() {
+        let mut changes = 0;
+        for level in 1..CEILING {
+            let (low, high) = (output(level), output(level + 1));
+            changes += usize::from(gear(low) != gear(high));
+            for part in 1..FRACTION {
+                let out = output_between(u16::from(level) * FRACTION + part);
+                if gear(low) == gear(high) {
+                    assert_eq!((out.enable, gear(out)), (true, gear(low)));
+                    assert!(low.dac <= out.dac && out.dac < high.dac, "{level} {part}");
+                } else {
+                    assert_eq!(out, low, "{level} {part}");
+                }
+            }
+        }
+        assert_eq!(changes, GEARS.len() - 1);
+    }
+
+    #[test]
+    fn between_never_asks_for_less_as_it_climbs() {
+        let mut last = 0;
+        for sixteenths in FRACTION..=u16::from(CEILING) * FRACTION {
+            let now = output_between(sixteenths).modelled();
+            assert!(now >= last, "{sixteenths}");
+            last = now;
+        }
+    }
+
+    #[test]
+    fn halfway_between_the_top_two_levels_is_halfway_between_their_codes() {
+        assert_eq!((output(149).dac, output(150).dac), (702, 716));
+        let halfway = 149 * FRACTION + FRACTION / 2;
+        assert_eq!(output_between(halfway).dac, 709);
     }
 
     #[test]
