@@ -1,7 +1,52 @@
 //! A level that follows a target one step at a time, so a step-down fades
 //! rather than jumps.
 
-use crate::ramp::CEILING;
+use crate::ramp::{CEILING, FRACTION};
+
+/// Ticks, the time constant of a [`Fade`]. Unmeasured.
+pub const FADE_TICKS: u16 = 16;
+
+const _: () = assert!(FADE_TICKS.is_power_of_two());
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fade {
+    /// A level in [`FRACTION`]ths, `0` for off.
+    position: u16,
+    /// What's left of the gap after a step, under [`FADE_TICKS`].
+    owed: u16,
+}
+
+impl Fade {
+    pub const fn new() -> Self {
+        Self {
+            position: 0,
+            owed: 0,
+        }
+    }
+
+    pub const fn position(&self) -> u16 {
+        self.position
+    }
+
+    /// Jumps to `level` unless `gentle`, and always from off or to it.
+    pub fn tick(&mut self, level: u8, gentle: bool) -> u16 {
+        let target = u16::from(level).saturating_mul(FRACTION);
+        if !gentle || level == 0 || self.position == 0 {
+            self.position = target;
+            self.owed = 0;
+            return target;
+        }
+        let owed = self.owed.saturating_add(target.abs_diff(self.position));
+        let step = owed / FADE_TICKS;
+        self.owed = owed % FADE_TICKS;
+        self.position = if target < self.position {
+            self.position.saturating_sub(step).max(target)
+        } else {
+            self.position.saturating_add(step).min(target)
+        };
+        self.position
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Gradual {
@@ -185,6 +230,93 @@ mod tests {
         gradual.cap(98);
         assert_eq!(run(&mut gradual, 0, 3), 98);
         assert_eq!(gradual.tick(0), 97);
+    }
+
+    fn at(level: u8) -> u16 {
+        u16::from(level) * FRACTION
+    }
+
+    fn lit(level: u8) -> Fade {
+        let mut fade = Fade::new();
+        fade.tick(level, false);
+        fade
+    }
+
+    #[test]
+    fn a_fade_starts_off_and_jumps_from_off_and_to_it_however_gentle() {
+        let mut fade = Fade::new();
+        assert_eq!(fade.position(), 0);
+        assert_eq!(fade.tick(150, true), at(150));
+        assert_eq!(fade.tick(0, true), 0);
+        assert_eq!(fade.tick(52, true), at(52));
+    }
+
+    #[test]
+    fn a_fade_that_isnt_gentle_jumps() {
+        let mut fade = lit(150);
+        assert_eq!(fade.tick(50, false), at(50));
+        assert_eq!(fade.tick(120, false), at(120));
+        fade.tick(100, true);
+        assert_eq!(fade.tick(100, false), at(100));
+    }
+
+    #[test]
+    fn a_gentle_fade_takes_a_level_in_53_ticks_and_half_of_it_in_11() {
+        for (from, to) in [(150, 149), (149, 150), (51, 50)] {
+            let mut fade = lit(from);
+            let (mut ticks, mut halfway, mut last) = (0, None, at(from));
+            while fade.position() != at(to) {
+                let now = fade.tick(to, true);
+                ticks += 1;
+                assert!(now.abs_diff(last) <= 1, "{last} → {now}");
+                last = now;
+                if halfway.is_none() && now.abs_diff(at(to)) <= FRACTION / 2 {
+                    halfway = Some(ticks);
+                }
+            }
+            assert_eq!((halfway, ticks), (Some(11), 53), "{from} → {to}");
+            assert_eq!(fade.tick(to, true), at(to));
+        }
+    }
+
+    #[test]
+    fn a_gentle_fade_closes_in_and_never_overshoots() {
+        let mut fade = lit(100);
+        let mut seed = 1u32;
+        for _ in 0..10_000 {
+            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            let target = at(1 + (seed >> 16) as u8 % CEILING);
+            for _ in 0..=(seed >> 24) % 40 {
+                let before = fade.position();
+                let after = fade.tick((target / FRACTION) as u8, true);
+                assert!(
+                    after.abs_diff(target) <= before.abs_diff(target),
+                    "{before} → {after} fading to {target}"
+                );
+                assert!(
+                    (before < target) == (after < target) || after == target,
+                    "{before} → {after} past {target}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_gentle_fade_trails_a_level_every_two_ticks_by_under_eight_levels() {
+        let mut fade = lit(150);
+        let mut worst = 0;
+        for level in (50..150).rev() {
+            for _ in 0..2 {
+                worst = worst.max(fade.tick(level, true) - at(level));
+            }
+        }
+        assert!(worst > at(7) && worst < at(8), "{worst}");
+        let mut ticks = 0;
+        while fade.position() != at(50) {
+            fade.tick(50, true);
+            ticks += 1;
+            assert!(ticks < 2 * 64, "still at {}", fade.position());
+        }
     }
 
     #[test]
