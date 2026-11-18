@@ -1314,6 +1314,36 @@ mod tests {
     }
 
     #[test]
+    fn heat_crosses_the_change_of_reference_without_a_step() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.temperature = temperature_reading(thermal::LIMIT + 1);
+        let (below, above) = (ramp::output(125), ramp::output(126));
+        assert_ne!(below.vref, above.vref);
+        let (mut last, mut swaps, mut bridged) = (torch.output(), 0_u32, 0_u32);
+        for _ in 0..60 * TICKS_PER_SECOND {
+            if torch.level() < 120 {
+                break;
+            }
+            torch.tick(false);
+            let now = torch.output();
+            let (from, to) = (last.modelled(), now.modelled());
+            assert!(from.abs_diff(to) * 400 <= from, "{last:?} → {now:?}");
+            if now.vref == below.vref {
+                assert!(now.modelled() <= below.modelled(), "{now:?}");
+            } else {
+                assert!(now.modelled() > below.modelled(), "{now:?}");
+                bridged += u32::from(now.dac < above.dac);
+            }
+            swaps += u32::from(now.vref != last.vref);
+            last = now;
+        }
+        assert!(torch.level() < 120, "level {}", torch.level());
+        assert_eq!(swaps, 1);
+        assert!(bridged > 10, "{bridged}");
+    }
+
+    #[test]
     fn a_ramp_by_hand_while_hot_still_moves_a_level_a_tick() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);

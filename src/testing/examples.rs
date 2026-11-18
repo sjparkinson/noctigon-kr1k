@@ -151,6 +151,11 @@ pub const EXAMPLES: &[Example] = &[
         "heat:80C 1C 1H:3s wait:120s heat:25C wait:120s",
         Level(150),
     ),
+    ex(
+        "A degree over the limit",
+        "1C 1H:3s heat:51C wait:40s",
+        Level(111),
+    ),
     ex("A failed check at power-on", "fault 1C", Off),
     ex(
         "Flash that doesn't match its checksum",
