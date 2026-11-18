@@ -177,14 +177,67 @@ pub fn output_between(sixteenths: u16) -> Output {
         return low;
     }
     let high = output(level.saturating_add(1));
-    if (high.vref, high.paths) != (low.vref, low.paths) {
+    let from = if (high.vref, high.paths) == (low.vref, low.paths) {
+        low.dac
+    } else if let Some(code) = bridge(level) {
+        code
+    } else {
         return low;
-    }
-    let rise = high.dac.saturating_sub(low.dac).min(DAC_MAX) * part / FRACTION;
+    };
+    let rise = high.dac.saturating_sub(from).min(DAC_MAX) * part / FRACTION;
     Output {
-        dac: low.dac.saturating_add(rise),
-        ..low
+        dac: from.saturating_add(rise),
+        ..high
     }
+}
+
+static BRIDGES: [Option<(u8, u16)>; GEARS.len() - 1] = bridges();
+
+fn bridge(level: u8) -> Option<u16> {
+    BRIDGES
+        .iter()
+        .flatten()
+        .find(|&&(from, _)| from == level)
+        .map(|&(_, code)| code)
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "only ever run to build BRIDGES, where an overflow or the assert fails the build, \
+              and the code is checked against the next level's before it's narrowed"
+)]
+const fn bridge_between(low: Output, high: Output) -> Option<u16> {
+    if low.paths.mask() != high.paths.mask() || low.vref.millivolts() == high.vref.millivolts() {
+        return None;
+    }
+    let scale = widen(high.vref.millivolts()) * high.paths.gain();
+    let code = low.modelled().div_ceil(scale);
+    assert!(code >= 1 && code <= widen(high.dac));
+    Some(code as u16)
+}
+
+#[expect(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation,
+    clippy::as_conversions,
+    reason = "only ever run to build BRIDGES, where an overflow or a bad index fails the build, \
+              and a level is LEVELS at most, which is a u8"
+)]
+const fn bridges() -> [Option<(u8, u16)>; GEARS.len() - 1] {
+    let table = table();
+    let mut bridges = [None; GEARS.len() - 1];
+    let (mut found, mut level) = (0, 1);
+    while level < LEVELS as usize {
+        if let Some(code) = bridge_between(unpack(table[level - 1]), unpack(table[level])) {
+            bridges[found] = Some((level as u8, code));
+            found += 1;
+        }
+        level += 1;
+    }
+    bridges
 }
 
 const fn unpack(packed: u16) -> Output {
@@ -378,22 +431,69 @@ mod tests {
     }
 
     #[test]
-    fn between_two_levels_in_one_gear_is_a_code_between_theirs() {
-        let mut changes = 0;
+    fn between_two_levels_is_between_them_unless_the_paths_change() {
+        let (mut references, mut paths) = (0, 0);
         for level in 1..CEILING {
             let (low, high) = (output(level), output(level + 1));
-            changes += usize::from(gear(low) != gear(high));
+            references += usize::from(low.paths == high.paths && low.vref != high.vref);
+            paths += usize::from(low.paths != high.paths);
             for part in 1..FRACTION {
                 let out = output_between(u16::from(level) * FRACTION + part);
                 if gear(low) == gear(high) {
                     assert_eq!((out.enable, gear(out)), (true, gear(low)));
                     assert!(low.dac <= out.dac && out.dac < high.dac, "{level} {part}");
+                } else if low.paths == high.paths {
+                    assert_eq!((out.enable, gear(out)), (true, gear(high)));
+                    let between = low.modelled()..=high.modelled();
+                    assert!(between.contains(&out.modelled()), "{level} {part}");
                 } else {
                     assert_eq!(out, low, "{level} {part}");
                 }
             }
         }
-        assert_eq!(changes, GEARS.len() - 1);
+        assert_eq!((references, paths), (3, 2));
+        assert_eq!(references + paths, GEARS.len() - 1);
+    }
+
+    #[test]
+    fn just_over_level_125_is_its_current_on_the_next_levels_reference() {
+        let (low, high) = (output(125), output(126));
+        assert_eq!((low.vref, low.dac), (Vref::V1024, 1008));
+        assert_eq!((high.vref, high.dac), (Vref::V2500, 423));
+        let out = output_between(125 * FRACTION + 1);
+        assert_eq!(out, Output { dac: 413, ..high });
+        assert!(out.modelled() - low.modelled() < low.modelled() / 1000);
+    }
+
+    #[test]
+    fn every_bridge_is_the_lowest_code_that_asks_for_no_less() {
+        assert_eq!(
+            BRIDGES.map(|bridge| bridge.map(|(level, _)| level)),
+            [Some(5), Some(27), Some(125), None, None]
+        );
+        for (level, code) in BRIDGES.into_iter().flatten() {
+            let (low, high) = (output(level), output(level + 1));
+            let on_the_next = |dac| Output { dac, ..high }.modelled();
+            assert!(on_the_next(code) >= low.modelled(), "{level}");
+            assert!(on_the_next(code - 1) < low.modelled(), "{level}");
+            assert!(code <= high.dac, "{level}");
+        }
+        assert_eq!(bridge(0), None);
+    }
+
+    #[test]
+    fn from_level_50_up_no_sixteenth_is_a_step() {
+        let mut last = output_between(50 * FRACTION);
+        for sixteenths in 50 * FRACTION + 1..=u16::from(CEILING) * FRACTION {
+            let now = output_between(sixteenths);
+            if gear(now) == gear(last) {
+                assert!(now.dac - last.dac <= 2, "{sixteenths}");
+            } else {
+                let rise = now.modelled() - last.modelled();
+                assert!(rise < last.modelled() / 1000, "{sixteenths}");
+            }
+            last = now;
+        }
     }
 
     #[test]
