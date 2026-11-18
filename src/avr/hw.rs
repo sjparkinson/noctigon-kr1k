@@ -342,7 +342,6 @@ fn adc_channel(channel: Channel) {
         Channel::Voltage => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDDIV10),
         Channel::Temperature => (regs::VREF_REFSEL_2V048, regs::ADC_MUXPOS_TEMPSENSE),
         Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_GND),
-        Channel::Vddio2 => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_VDDIO2DIV10),
     };
     write(reg::VREF_ADC0REF, reference);
     write(reg::ADC0_MUXPOS, muxpos);

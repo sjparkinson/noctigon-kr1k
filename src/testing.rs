@@ -114,8 +114,7 @@ impl Adc {
     pub fn start(&mut self, convert: Option<Convert>) {
         let (voltage, temperature, ground) = (self.voltage, self.temperature, self.ground);
         self.start_with(convert, |channel| match channel {
-            // VDDIO2 reads as the cell here, as if the two were one rail.
-            Channel::Voltage | Channel::Vddio2 => voltage,
+            Channel::Voltage => voltage,
             Channel::Temperature => temperature,
             Channel::Ground => ground,
         });
@@ -358,9 +357,7 @@ impl Scene {
             return raw;
         }
         match channel {
-            // A guess. DS40002413B §19.3.2.2 and §33.5.7 don't say what a missing VDDIO2 reads.
-            Channel::Vddio2 if !self.vddio2 => 0,
-            Channel::Voltage | Channel::Vddio2 => voltage_reading(self.cell),
+            Channel::Voltage => voltage_reading(self.cell),
             Channel::Temperature => temperature_reading(self.kelvin),
             Channel::Ground => GROUND_READING,
         }

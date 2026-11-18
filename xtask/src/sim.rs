@@ -41,12 +41,12 @@ use crate::world::{CALIBRATION, FUSE_NAMES, World};
 // src/regs.rs is the firmware's choice.
 use kr1k::regs::{
     self, ADC_ENABLE, ADC_INITDLY, ADC_MUXPOS_GND, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_VDDDIV10,
-    ADC_MUXPOS_VDDIO2DIV10, ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN,
-    ADC_SAMPNUM, ADC_SAMPNUM_ACC4, ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK,
-    CRCSCAN_SRC_FLASH, DAC_ENABLE, DAC_OUTEN, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN,
-    RSTCTRL_PORF, RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE,
-    VREF_REFSEL_1V024, VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY,
-    WDT_WINDOW, addr as reg,
+    ADC_PRESC, ADC_RESRDY, ADC_RESSEL_12BIT, ADC_SAMPDLY, ADC_SAMPLEN, ADC_SAMPNUM,
+    ADC_SAMPNUM_ACC4, ADC_STCONV, CRCSCAN_BUSY, CRCSCAN_ENABLE, CRCSCAN_OK, CRCSCAN_SRC_FLASH,
+    DAC_ENABLE, DAC_OUTEN, MVIO_VDDIO2S, PORT_INVEN, PORT_ISC, PORT_PULLUPEN, RSTCTRL_PORF,
+    RTC_CTRLBUSY, RTC_PI, RTC_PITEN, SLPCTRL_SEN, TCB_CAPT, TCB_ENABLE, VREF_REFSEL_1V024,
+    VREF_REFSEL_2V048, VREF_REFSEL_2V500, WDT_LOCK, WDT_PERIOD, WDT_SYNCBUSY, WDT_WINDOW,
+    addr as reg,
 };
 
 const CCP_IOREG: u8 = regs::CPU_CCP_IOREG;
@@ -2214,8 +2214,6 @@ impl Chip {
             (ADC_MUXPOS_VDDDIV10, VREF_REFSEL_1V024) => Channel::Voltage,
             // §33.5.7 says no more, so the worst offset table 38-24 allows.
             (ADC_MUXPOS_GND, VREF_REFSEL_1V024) => Channel::Ground,
-            // What it reads with VDDIO2 missing isn't stated, so 0.
-            (ADC_MUXPOS_VDDIO2DIV10, VREF_REFSEL_1V024) => Channel::Vddio2,
             (ADC_MUXPOS_TEMPSENSE, VREF_REFSEL_2V048) => {
                 let need = |us: u32| (clk_adc * us).div_ceil(1_000_000);
                 if initdly < need(25) || samplen < need(28) {
@@ -2231,7 +2229,7 @@ impl Chip {
             _ => {
                 return Err(format!(
                     "converts MUXPOS {muxpos:#04x} against VREF.ADC0REF {reference:#04x}; the \
-                     simulator only models VDD / 10, VDDIO2 / 10 and ground against 1.024 V \
+                     simulator only models VDD / 10 and ground against 1.024 V \
                      and the temperature sensor against 2.048 V"
                 ));
             }
@@ -4153,12 +4151,12 @@ mod tests {
             (
                 reg::VREF_ADC0REF,
                 VREF_REFSEL_2V048,
-                "VDD / 10, VDDIO2 / 10 and ground against 1.024 V",
+                "VDD / 10 and ground against 1.024 V",
             ),
             (
                 reg::ADC0_MUXPOS,
                 regs::ADC_MUXPOS_AIN1,
-                "VDD / 10, VDDIO2 / 10 and ground against 1.024 V",
+                "VDD / 10 and ground against 1.024 V",
             ),
         ] {
             let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);
@@ -5217,11 +5215,11 @@ mod tests {
         let power_on = || Ok(ticking());
         let failed = "the library says power down, but the firmware idled";
         let err = run(&power_on, None, Landing::Watch).err().unwrap();
-        assert_eq!(err, format!("random switching: tick 4: {failed}"));
+        assert_eq!(err, format!("random switching: tick 2: {failed}"));
         let err = run(&power_on, None, Landing::Until(5)).err().unwrap();
         assert_eq!(
             err,
-            format!("with interrupts mid-pass: random switching: tick 4: {failed}")
+            format!("with interrupts mid-pass: random switching: tick 2: {failed}")
         );
 
         let example = &EXAMPLES[0];
