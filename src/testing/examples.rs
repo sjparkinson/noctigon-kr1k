@@ -2,8 +2,6 @@
 //! plays each on the library, and `cargo xtask hex` on the firmware too.
 
 use super::{Action, parse};
-use crate::ramp;
-use crate::ui::FLOOR;
 use Expect::{Level, Off};
 
 /// How the light should be on an example's last tick.
@@ -54,13 +52,9 @@ pub const EXAMPLES: &[Example] = &[
     ex("On: 1C", "1C 1C", Off),
     ex("On: 1C, after ramping", "1C 1H:3s 1C", Off),
     ex("On: 3C", "1C 3C 1C", Level(52)),
-    ex("On: 1H", "1C 1H:3s", Level(ramp::CEILING)),
-    ex("On: 1H again", "1C 1H:3s 1H:3s", Level(FLOOR)),
-    ex(
-        "On: 1H, a third time",
-        "1C 1H:3s 1H:3s 1H:3s",
-        Level(ramp::CEILING),
-    ),
+    ex("On: 1H", "1C 1H:3s", Level(150)),
+    ex("On: 1H again", "1C 1H:3s 1H:3s", Level(1)),
+    ex("On: 1H, a third time", "1C 1H:3s 1H:3s 1H:3s", Level(150)),
     ex(
         "On: 1H, after one that stopped partway",
         "1C 1H:1s 1H:500ms",
@@ -69,7 +63,7 @@ pub const EXAMPLES: &[Example] = &[
     ex(
         "On: 1H, after turning it off and on",
         "1C 1H:3s 1C 1C 1H:3s",
-        Level(ramp::CEILING),
+        Level(150),
     ),
     ex(
         "On: More clicks, or a hold after clicks",
@@ -150,12 +144,12 @@ pub const EXAMPLES: &[Example] = &[
     ex(
         "Hot, at a level under 50",
         "heat:80C 1C 1H:500ms 1H:3s wait:120s",
-        Level(FLOOR),
+        Level(1),
     ),
     ex(
         "Hot, then cool",
         "heat:80C 1C 1H:3s wait:120s heat:25C wait:120s",
-        Level(ramp::CEILING),
+        Level(150),
     ),
     ex("A failed check at power-on", "fault 1C", Off),
     ex(
