@@ -331,8 +331,6 @@ pub struct Scene {
     pub vddio2: bool,
     /// Raw reading for every channel, ground included.
     pub adc_stuck: Option<u16>,
-    /// Centivolts read through the ADC, `None` for tied to the cell. No script word sets it.
-    pub vddio2_level: Option<u16>,
 }
 
 impl Scene {
@@ -344,7 +342,6 @@ impl Scene {
         adc_dead: false,
         vddio2: true,
         adc_stuck: None,
-        vddio2_level: None,
     };
 
     pub const fn faults(&self) -> Faults {
@@ -361,10 +358,9 @@ impl Scene {
             return raw;
         }
         match channel {
-            Channel::Voltage => voltage_reading(self.cell),
             // A guess. DS40002413B §19.3.2.2 and §33.5.7 don't say what a missing VDDIO2 reads.
             Channel::Vddio2 if !self.vddio2 => 0,
-            Channel::Vddio2 => voltage_reading(self.vddio2_level.unwrap_or(self.cell)),
+            Channel::Voltage | Channel::Vddio2 => voltage_reading(self.cell),
             Channel::Temperature => temperature_reading(self.kelvin),
             Channel::Ground => GROUND_READING,
         }
@@ -893,7 +889,6 @@ mod tests {
             adc_dead: false,
             vddio2: true,
             adc_stuck: None,
-            vddio2_level: None,
         };
         let mut samples = samples(script).peekable();
         assert!(samples.peek().is_some());

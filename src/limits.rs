@@ -4,7 +4,7 @@
 use crate::battery::{self, Protection, Verdict};
 use crate::ramp::CEILING;
 use crate::selftest::Faults;
-use crate::sensors::{Convert, Ground, Reading, Schedule, Supplies};
+use crate::sensors::{Convert, Ground, Reading, Schedule};
 use crate::temp::Calibration;
 use crate::thermal::Thermal;
 
@@ -37,11 +37,6 @@ pub struct Limits {
     protection: Protection,
     thermal: Thermal,
     ground: Ground,
-    /// The last four-a-second voltage reading, raw.
-    last_voltage: u16,
-    last_unloaded: bool,
-    /// For the programmer to read. Nothing here acts on it.
-    supplies: Supplies,
     /// Whether the UI was on last tick.
     on: bool,
     /// As of the last tick.
@@ -63,9 +58,6 @@ impl Limits {
             protection: Protection::new(),
             thermal: Thermal::new(),
             ground: Ground::new(),
-            last_voltage: 0,
-            last_unloaded: false,
-            supplies: Supplies { cell: 0, vddio2: 0 },
             on: false,
             level: 0,
             lit_before: false,
@@ -81,10 +73,6 @@ impl Limits {
 
     pub const fn level(&self) -> u8 {
         self.level
-    }
-
-    pub const fn supplies(&self) -> Supplies {
-        self.supplies
     }
 
     /// The battery ceiling, then the thermal one.
@@ -157,8 +145,6 @@ impl Limits {
             Some(Reading::Voltage(raw) | Reading::Quick(raw)) => {
                 let centivolts = battery::centivolts(raw);
                 if matches!(reading, Some(Reading::Voltage(_))) {
-                    self.last_voltage = raw;
-                    self.last_unloaded = quiet;
                     if quiet {
                         unloaded = Some(centivolts);
                     }
@@ -178,12 +164,6 @@ impl Limits {
                 if self.ground.reading(raw) {
                     self.fault = true;
                 }
-            }
-            Some(Reading::Vddio2(raw)) if self.last_unloaded && quiet => {
-                self.supplies = Supplies {
-                    cell: self.last_voltage,
-                    vddio2: raw,
-                };
             }
             Some(Reading::Vddio2(_)) | None => {}
         }
@@ -982,52 +962,6 @@ mod tests {
                 adc.start(limits.convert());
                 let read = (due(tick) && tick >= out_at + 2).then_some(380);
                 assert_eq!(step.unloaded, read, "out at {out_at}: tick {tick}");
-            }
-        }
-    }
-
-    #[test]
-    fn the_supplies_kept_are_never_a_loaded_reading() {
-        let (rested, loaded) = (voltage_reading(380), voltage_reading(300));
-        let pair = Supplies {
-            cell: rested,
-            vddio2: rested,
-        };
-        for (lit_from, lit_to) in (64..80)
-            .map(|out| (0, out))
-            .chain((64..80).map(|on| (on, 200)))
-        {
-            let mut limits = Limits::new(CALIBRATION, Faults::NONE);
-            let mut adc = Adc::new();
-            let mut was_lit = false;
-            let mut kept_after = None;
-            for tick in 0..200 {
-                let ui = if (lit_from..lit_to).contains(&tick) {
-                    50
-                } else {
-                    0
-                };
-                limits.tick(ui, adc.result(), true);
-                let lit = limits.level() > 0;
-                adc.voltage = if lit || was_lit { loaded } else { rested };
-                adc.start(limits.convert());
-                was_lit = lit;
-                let kept = limits.supplies();
-                let case = (lit_from, lit_to, tick);
-                assert!(
-                    kept == pair || kept == Supplies::default(),
-                    "{case:?}: {kept:?}"
-                );
-                if kept == pair && tick >= lit_to {
-                    kept_after.get_or_insert(tick);
-                }
-            }
-            if lit_to < 200 {
-                let kept = kept_after.expect("never kept once the light was out");
-                assert!(
-                    kept <= lit_to + 2 * usize::from(CYCLE_TICKS),
-                    "{lit_to}: {kept}"
-                );
             }
         }
     }

@@ -30,34 +30,6 @@ pub enum Reading {
     Vddio2(u16),
 }
 
-/// A data-space address, for `cargo xtask peek` to read. link.x's `.supplies`
-/// section pins the firmware's static there.
-pub const SUPPLIES_AT: usize = crate::regs::mem::INTERNAL_SRAM_START;
-
-/// Raw readings of VDD / 10 and VDDIO2 / 10, taken with the light off. A
-/// measurement aid that nothing in the firmware acts on.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Supplies {
-    pub cell: u16,
-    pub vddio2: u16,
-}
-
-impl Supplies {
-    pub const fn to_bytes(self) -> [u8; 4] {
-        let [cell_lo, cell_hi] = self.cell.to_le_bytes();
-        let [io_lo, io_hi] = self.vddio2.to_le_bytes();
-        [cell_lo, cell_hi, io_lo, io_hi]
-    }
-
-    pub const fn from_bytes(bytes: [u8; 4]) -> Self {
-        let [cell_lo, cell_hi, io_lo, io_hi] = bytes;
-        Self {
-            cell: u16::from_le_bytes([cell_lo, cell_hi]),
-            vddio2: u16::from_le_bytes([io_lo, io_hi]),
-        }
-    }
-}
-
 /// Each channel reads four times a second, which `battery` and `thermal` expect.
 pub const CYCLE_TICKS: u8 = 16;
 const TEMPERATURE_AT: u8 = CYCLE_TICKS / 2;
@@ -502,18 +474,6 @@ mod tests {
                 assert_eq!(convert, None, "tick {tick}");
             }
         }
-    }
-
-    #[test]
-    fn supplies_go_to_bytes_low_byte_first_the_cell_first_and_back() {
-        let supplies = Supplies {
-            cell: 0x1234,
-            vddio2: 0x0ABC,
-        };
-        assert_eq!(supplies.to_bytes(), [0x34, 0x12, 0xBC, 0x0A]);
-        assert_eq!(Supplies::from_bytes(supplies.to_bytes()), supplies);
-        assert_eq!(Supplies::default().to_bytes(), [0; 4]);
-        assert_eq!(SUPPLIES_AT, 0x7000);
     }
 
     #[test]

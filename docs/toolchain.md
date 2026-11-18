@@ -13,7 +13,7 @@ The first `cargo xtask hex` downloads the pinned nightly with `rust-src`, and th
 
 AVR ELF files put data space at 0x800000, so in `link.x` SRAM is 0x807000 and the mapped flash 0x808000. Read-only data is linked at its flash address plus 0x808000 and read with ordinary loads through that window, so there's no `lpm`. All 32 KB of flash fits the window, so nothing needs `FLMAP`.
 
-In SRAM, `link.x` puts a 4-byte `.supplies` section first, at 0x7000, then `.data`, then `.bss`, with the stack growing down from the top. `.supplies` is NOLOAD and outside `.bss`, so startup doesn't zero it, and `cargo xtask peek` reads it at that fixed address.
+In SRAM, `link.x` puts `.data` first, at 0x7000, then `.bss`, with the stack growing down from the top.
 
 ## No 32-bit multiplication
 

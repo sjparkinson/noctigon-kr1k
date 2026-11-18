@@ -22,14 +22,6 @@ SECTIONS {
     *(.rodata .rodata.*)
   } > MAPPED
 
-  /*
-   * First in SRAM so `cargo xtask peek` finds it at kr1k::sensors::SUPPLIES_AT.
-   * NOLOAD and outside .bss, so rt.rs leaves it alone and `main` zeroes it.
-   */
-  .supplies (NOLOAD) : {
-    KEEP(*(.supplies))
-  } > RAM
-
   .data : AT(LOADADDR(.rodata) + SIZEOF(.rodata)) {
     __data_start = .;
     *(.data .data.*)

@@ -476,14 +476,6 @@ const BREAKAGES: &[Breakage] = &[
         expect: "but the library says",
     },
     Breakage {
-        name: "supplies-not-kept",
-        file: MAIN,
-        find: "        hw::record_supplies(torch.supplies().to_bytes());\n",
-        replace: "        hw::record_supplies([0; 4]);\n",
-        stage: Stage::Simulator,
-        expect: "keeping the supply readings",
-    },
-    Breakage {
         name: "aux-retried-after-a-nack",
         file: HW,
         find: "        if !twi_transfer(transfer, &mut polls) {\n",

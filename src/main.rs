@@ -41,8 +41,6 @@ extern "C" fn main() -> ! {
 
     // First, since PC1 floats from reset until it's an output.
     hw::hold_enable_low();
-    // The supply readings sit outside .bss, so startup doesn't zero them.
-    hw::record_supplies([0; 4]);
 
     let faults = Faults {
         hang: selftest::hung(hw::take_reset_flags()),
@@ -85,8 +83,6 @@ extern "C" fn main() -> ! {
         if let Some(convert) = torch.convert() {
             hw::adc_start(convert);
         }
-
-        hw::record_supplies(torch.supplies().to_bytes());
 
         // The aux before the output, so they go dark before the light comes
         // on. A step that fails is never retried.
