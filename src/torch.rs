@@ -4,6 +4,7 @@
 use crate::TICKS_PER_SECOND;
 use crate::battery;
 use crate::button::{Clicks, Event};
+use crate::gradual::Fade;
 use crate::limits::{Health, Limits};
 use crate::ramp::{self, Output};
 use crate::selftest::Faults;
@@ -44,6 +45,9 @@ pub struct Torch {
     /// Reading the cell with the switch up and the light off.
     checking: bool,
     cell_low: bool,
+    fade: Fade,
+    /// What the UI asked of `limits` on its last tick.
+    asked: u8,
 }
 
 impl Torch {
@@ -57,6 +61,8 @@ impl Torch {
             check_in: 0,
             checking: false,
             cell_low: false,
+            fade: Fade::new(),
+            asked: 0,
         }
     }
 
@@ -90,6 +96,7 @@ impl Torch {
         {
             self.checking = true;
         }
+        let mut gentle = false;
         if !self.resting() {
             let asked = if lit_window {
                 self.ui.output_level()
@@ -97,6 +104,9 @@ impl Torch {
                 0
             };
             let step = self.limits.tick(asked, adc, vddio2);
+            let (battery, thermal) = self.limits.ceilings();
+            gentle = asked == self.asked && thermal <= battery;
+            self.asked = asked;
             if step.off {
                 self.ui.off();
             }
@@ -121,6 +131,7 @@ impl Torch {
         } else {
             self.check_in = CHECK_TICKS;
         }
+        self.fade.tick(self.level(), gentle);
         event
     }
 
@@ -181,7 +192,7 @@ impl Torch {
         match self.level() {
             0 => Output::OFF,
             _ if !self.warm => Output::STARTING,
-            level => ramp::output(level),
+            _ => ramp::output_between(self.fade.position()),
         }
     }
 
@@ -1284,6 +1295,60 @@ mod tests {
     }
 
     #[test]
+    fn heat_moves_the_light_a_code_or_two_at_a_time() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.temperature = temperature_reading(thermal::LIMIT + 1);
+        let (mut last, mut between) = (torch.output(), 0_u32);
+        for _ in 0..30 * TICKS_PER_SECOND {
+            torch.tick(false);
+            let now = torch.output();
+            if (now.paths, now.vref) == (last.paths, last.vref) {
+                assert!(now.dac.abs_diff(last.dac) <= 2, "{last:?} → {now:?}");
+            }
+            between += u32::from(now != ramp::output(torch.level()));
+            last = now;
+        }
+        assert!(torch.level() < CEILING - 10, "level {}", torch.level());
+        assert!(between > 10 * u32::from(TICKS_PER_SECOND), "{between}");
+    }
+
+    #[test]
+    fn a_ramp_by_hand_while_hot_still_moves_a_level_a_tick() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.temperature = temperature_reading(thermal::LIMIT + 1);
+        run(&mut torch, false, 10 * TICKS_PER_SECOND);
+        let held = torch.level();
+        assert!(held < CEILING);
+        let mut moved = 0_u32;
+        for _ in 0..2 * TICKS_PER_SECOND {
+            let before = torch.level();
+            torch.tick(true);
+            if torch.ui.output_level() < CEILING {
+                assert_eq!(torch.output(), ramp::output(torch.level()));
+                moved += u32::from(torch.level() != before);
+            }
+        }
+        assert!(moved > u32::from(TICKS_PER_SECOND), "{moved}");
+    }
+
+    #[test]
+    fn a_low_cell_still_moves_the_light_a_level_at_a_time() {
+        let mut torch = Rig::default();
+        click(&mut torch);
+        torch.adc.voltage = voltage_reading(295);
+        let mut moved = 0_u32;
+        for _ in 0..20 * TICKS_PER_SECOND {
+            let before = torch.level();
+            torch.tick(false);
+            assert_eq!(torch.output(), ramp::output(torch.level()));
+            moved += u32::from(torch.level() != before);
+        }
+        assert!(moved > 10, "{moved}");
+    }
+
+    #[test]
     fn a_switch_held_from_power_on_stays_off() {
         let mut torch = Rig::default();
         for _ in 0..10 * 60 * u32::from(TICKS_PER_SECOND) {
@@ -1699,6 +1764,7 @@ mod tests {
         flat: u32,
         faulted: u32,
         fading_out: u32,
+        between_levels: u32,
         failed_at_power_on: u32,
         blue: u32,
         red: u32,
@@ -1766,6 +1832,7 @@ mod tests {
         let (mut converted, mut converted_before, mut converted_first) = (None, None, None);
         let mut lit_before_last = false;
         let mut gone_left = 0_u16;
+        let (mut asked_before, mut shown_before) = (0, Output::OFF);
         for t in 1..=ticks {
             if switch_left == 0 {
                 pressed = !pressed;
@@ -1902,7 +1969,19 @@ mod tests {
                 (0, _) => Output::STARTING,
                 _ => ramp::output(level),
             };
-            check!(t, rig.output() == expected, "level {level}");
+            let shown = rig.output();
+            let (battery, thermal) = rig.torch.limits.ceilings();
+            let lit = level > 0 && level_before > 0;
+            if lit && asked == asked_before && thermal <= battery {
+                let (from, to) = (shown_before.modelled(), expected.modelled());
+                let between = from.min(to)..=from.max(to);
+                check!(t, shown.enable, "{shown:?}");
+                check!(t, between.contains(&shown.modelled()), "level {level}");
+                seen.between_levels += u32::from(shown != expected);
+            } else {
+                check!(t, shown == expected, "level {level}");
+            }
+            (asked_before, shown_before) = (asked, shown);
             check!(t, level <= asked, "level {level} of {asked}");
             check!(t, (level > 0) == (model.mode == Mode::On), "level {level}");
             check!(t, !failed || level == 0, "lit after a failed check");
@@ -2133,6 +2212,7 @@ mod tests {
             ("flat", seen.flat),
             ("faulted", seen.faulted),
             ("fading out for a fault", seen.fading_out),
+            ("between two levels", seen.between_levels),
             ("failed at power-on", seen.failed_at_power_on),
             ("blue", seen.blue),
             ("red", seen.red),
