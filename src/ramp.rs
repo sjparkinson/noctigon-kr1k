@@ -5,8 +5,7 @@ use crate::board::{PATH1, PATH2, PATH3};
 
 pub const LEVELS: u8 = 150;
 
-/// Held under [`LEVELS`] until thermal regulation has been checked on a real light.
-pub const CEILING: u8 = 120;
+pub const CEILING: u8 = LEVELS;
 
 /// DAC0 is 10-bit (DS40002413B §34.3.2.3).
 pub const DAC_MAX: u16 = 1023;
@@ -329,11 +328,8 @@ mod tests {
     }
 
     #[test]
-    fn the_ceiling_is_about_half_the_stock_firmwares_top() {
-        let ceiling = output(CEILING);
-        assert_eq!(ceiling.paths, Paths::High);
-        let share = ceiling.modelled() * 100 / TOP.modelled();
-        assert!((45..=55).contains(&share), "{share} %");
+    fn the_ceiling_is_the_stock_firmwares_top() {
+        assert_eq!(output(CEILING), TOP);
     }
 
     #[test]

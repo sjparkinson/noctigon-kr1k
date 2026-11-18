@@ -60,7 +60,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** A lit light in still air, or with the head covered.
 
-**Cover.** `thermal::Thermal` steps the ceiling down past `thermal::LIMIT` at the MCU's sensor, and `ramp::CEILING` caps the light until a head has been measured.
+**Cover.** `thermal::Thermal` steps the ceiling down past `thermal::LIMIT` at the MCU's sensor. Nothing else holds the light under the stock firmware's top.
 
 **Unproven.** Simulator, with the reading scripted. What the MCU reads when the head is hot is unknown.
 

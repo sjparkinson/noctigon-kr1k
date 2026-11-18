@@ -2,6 +2,7 @@
 //! plays each on the library, and `cargo xtask hex` on the firmware too.
 
 use super::{Action, parse};
+use crate::ramp;
 use Expect::{Level, Off};
 
 /// How the light should be on an example's last tick.
@@ -50,7 +51,7 @@ pub const EXAMPLES: &[Example] = &[
     ex("Off: 4C or more", "5C 1C", Off),
     ex("Off: Anything else", "2C 1H:2s 2H:2s wait:1s", Off),
     ex("On: 1C", "1C 1C", Off),
-    ex("On: 1H", "1C 1H:3s", Level(120)),
+    ex("On: 1H", "1C 1H:3s", Level(ramp::CEILING)),
     ex("On: 1H again", "1C 1H:3s 1H:3s", Level(13)),
     ex(
         "On: 1H, after one that stopped partway",
@@ -60,7 +61,7 @@ pub const EXAMPLES: &[Example] = &[
     ex(
         "On: 1H, after turning it off and on",
         "1C 1H:3s 1C 1C 1H:3s",
-        Level(120),
+        Level(ramp::CEILING),
     ),
     ex(
         "On: More clicks, or a hold after clicks",
@@ -146,7 +147,7 @@ pub const EXAMPLES: &[Example] = &[
     ex(
         "Hot, then cool",
         "heat:80C 1C 1H:3s wait:120s heat:25C wait:120s",
-        Level(120),
+        Level(ramp::CEILING),
     ),
     ex("A failed check at power-on", "fault 1C", Off),
     ex(
