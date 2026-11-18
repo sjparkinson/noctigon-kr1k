@@ -371,21 +371,6 @@ pub fn adc_result() -> Option<u16> {
     Some(u16::from_le_bytes([lo, hi]))
 }
 
-/// For `cargo xtask peek` to read over UPDI. link.x puts it first in SRAM, at
-/// `kr1k::sensors::SUPPLIES_AT`, outside .bss, so startup doesn't zero it.
-#[unsafe(no_mangle)]
-#[unsafe(link_section = ".supplies")]
-static mut SUPPLIES: [u8; 4] = [0; 4];
-
-pub fn record_supplies(bytes: [u8; 4]) {
-    let to = (&raw mut SUPPLIES).cast::<u8>();
-    for (i, byte) in bytes.into_iter().enumerate() {
-        // SAFETY: a byte write inside the 4-byte static, through a raw
-        // pointer with no reference made. Only the main loop touches it.
-        unsafe { write_volatile(to.wrapping_add(i), byte) }
-    }
-}
-
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "addr is a signature row word in data space"

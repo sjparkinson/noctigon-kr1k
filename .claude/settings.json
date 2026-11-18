@@ -2,7 +2,6 @@
   "sandbox": {
     "excludedCommands": [
       "cargo xtask ping *",
-      "cargo xtask peek *",
       "cargo xtask backup *",
       "cargo xtask flash *",
       "cargo xtask restore *"

@@ -19,7 +19,7 @@ use kr1k::TICKS_PER_SECOND;
 use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
-use kr1k::sensors::{CYCLE_TICKS, Channel, SUPPLIES_AT, Supplies};
+use kr1k::sensors::{CYCLE_TICKS, Channel};
 use kr1k::testing::{self, Action, EXAMPLES, Example, Paced, PitPhase, Rig, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{
@@ -209,14 +209,6 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     let image = elf.flash_image();
     let signed = crc::sign(&image, &stamp::TEST)?;
     let reset = symbol(elf, "__reset")?;
-    let supplies = symbol(elf, "SUPPLIES")?;
-    if supplies != DATA_SPACE + SUPPLIES_AT as u32 {
-        return Err(format!(
-            "SUPPLIES is at {supplies:#08x}, not at {:#08x}, where `cargo xtask peek` reads it \
-             (kr1k::sensors::SUPPLIES_AT)",
-            DATA_SPACE + SUPPLIES_AT as u32
-        ));
-    }
 
     let power_on = || -> Result<Sim, String> {
         let mut sim = Sim::new(signed.clone(), linked.layout.bss.end, linked.ends)?;
@@ -245,12 +237,11 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     let examples = if examples { EXAMPLES } else { &[] };
     // Errors come back in this order. The late ones would report many a
     // mistake as a wrong output before the run that names it.
-    let faults: [(FaultCheck, &str); 7] = [
+    let faults: [(FaultCheck, &str); 6] = [
         (slow_ticks, "with the slowest ticks"),
         (oscillator_stops, "with the 32 kHz oscillator stopped"),
         (adc_never_answers, "with a dead ADC"),
         (adc_stuck, "with the ADC stuck on one reading"),
-        (supplies_kept, "keeping the supply readings"),
         (switch_stuck, "with the switch stuck down"),
         (vddio2_missing, "with VDDIO2 missing"),
     ];
@@ -566,76 +557,6 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
             "the light isn't out as a fault and staying so from 2 s after the ADC stuck \
              ({:?} at {out})",
             ticks.get(out)
-        ));
-    }
-    Ok(())
-}
-
-fn supplies_kept(mut sim: Sim, report: &mut Report) -> Result<(), String> {
-    let quiet = |ticks: u32, cell: u16, vddio2_level: Option<u16>| {
-        iter::repeat_n(
-            Sample {
-                pressed: false,
-                scene: Scene {
-                    cell,
-                    vddio2_level,
-                    ..Scene::NORMAL
-                },
-            },
-            ticks as usize,
-        )
-    };
-    let second = u32::from(TICKS_PER_SECOND);
-    let click = testing::samples([Action::Cell(360), Action::Clicks(1)]);
-    let samples = quiet(second, 400, Some(330))
-        .chain(quiet(301 * second, 360, None))
-        .chain(click)
-        .chain(quiet(second, 360, Some(200)));
-    let marks = [second as usize, 302 * second as usize];
-    let seen = std::cell::RefCell::new(Vec::new());
-    let mut shadow = Rig::default();
-    let samples = samples.enumerate().map(|(tick, sample)| {
-        shadow.tick_in(sample.pressed, &sample.scene);
-        if marks.contains(&(tick + 1)) {
-            seen.borrow_mut().push(shadow.supplies());
-        }
-        sample
-    });
-    let end = in_step(&mut sim, samples, report)?;
-    if end == Some(0) {
-        return Err("the click didn't light it".into());
-    }
-    let at = SUPPLIES_AT - usize::from(SRAM.start);
-    let kept = sim
-        .chip
-        .sram
-        .get(at..at + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .map(Supplies::from_bytes)
-        .ok_or("SUPPLIES_AT isn't in SRAM")?;
-    let reading = testing::voltage_reading;
-    let want = [
-        Supplies {
-            cell: reading(400),
-            vddio2: reading(330),
-        },
-        Supplies {
-            cell: reading(360),
-            vddio2: reading(360),
-        },
-    ];
-    let seen = seen.into_inner();
-    if seen != want {
-        return Err(format!(
-            "the library kept {seen:?} at the end of the first two parts, not {want:?}"
-        ));
-    }
-    if shadow.supplies() != want[1] || kept != want[1] {
-        return Err(format!(
-            "lit, the library has {:?} and the firmware's SRAM {kept:?}, where both should \
-             still be the last reading with the light off, {:?}",
-            shadow.supplies(),
-            want[1]
         ));
     }
     Ok(())

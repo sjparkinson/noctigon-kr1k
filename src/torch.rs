@@ -7,7 +7,7 @@ use crate::button::{Clicks, Event};
 use crate::limits::{Health, Limits};
 use crate::ramp::{self, Output};
 use crate::selftest::Faults;
-use crate::sensors::{Convert, Supplies};
+use crate::sensors::Convert;
 use crate::temp::Calibration;
 use crate::ui::{Aux, Mode, Ui};
 use crate::watchdog;
@@ -169,10 +169,6 @@ impl Torch {
 
     pub const fn health(&self) -> Health {
         self.limits.health()
-    }
-
-    pub const fn supplies(&self) -> Supplies {
-        self.limits.supplies()
     }
 
     pub const fn convert(&self) -> Option<Convert> {

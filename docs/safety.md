@@ -94,7 +94,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Cover.** `xtask/src/updi.rs` never writes fuses, the user row or a locked chip, and refuses the wrong signature. Only the plain 4.5 V kit goes on the pads, never a high-voltage programmer, recovery included (PF7 is rated to VDD + 0.3 V, table 38-1).
 
-**Unproven.** Seen, for `ping`, `backup`, `peek` and `flash`. `restore` has never run on this torch, and no test shows that no command writes a fuse.
+**Unproven.** Seen, for `ping`, `backup` and `flash`. `restore` has never run on this torch, and no test shows that no command writes a fuse.
 
 ### H12. The programmer feeding the cell rail
 

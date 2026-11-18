@@ -43,9 +43,6 @@ commands:
                           purpose in one way, and leave the checkout alone
   ping <port>           check the programmer can see the chip, writing nothing,
                           though expect it to reset as UPDI turns off
-  peek <port>             read the running chip's registers and SRAM, to see how
-                          far the firmware got; it writes nothing, and the same
-                          reset follows, so only the first run counts
   backup <port> <dir>     save the chip's flash, EEPROM, fuses, lock bits, user
                           row and serial number into <dir>
   flash <port> [file.hex] build and flash the firmware, or flash file.hex
@@ -73,7 +70,6 @@ fn main() -> ExitCode {
         ["hex", "--no-examples"] => hex(false),
         ["breakages", names @ ..] => breakages::run(&root(), names),
         ["ping", port] => ping(port),
-        ["peek", port] => peek(port),
         ["backup", port, dir] => backup(port, Path::new(dir)),
         ["flash", port] => build(true)
             .and_then(|(elf, _)| crc::sign(&elf.flash_image(), &stamp::current(&root())))
@@ -245,115 +241,6 @@ fn ping(port: &str) -> Result<(), String> {
     p.disconnect()?;
     println!("found {}", String::from_utf8_lossy(&sib).trim_end());
     Ok(())
-}
-
-/// Writes nothing, but turning UPDI off afterwards should reset the chip
-/// (DS40002413B §36.3.2.2.2), so only the first read sees what was left.
-fn peek(port: &str) -> Result<(), String> {
-    for line in peek_from(|| open(port))? {
-        println!("{line}");
-    }
-    Ok(())
-}
-
-fn peek_from<W: Wire>(open: impl FnOnce() -> Result<W, String>) -> Result<Vec<String>, String> {
-    use kr1k::regs::addr;
-    let registers = [
-        ("RSTCTRL.RSTFR", addr::RSTCTRL_RSTFR),
-        ("CLKCTRL.MCLKCTRLB", addr::CLKCTRL_MCLKCTRLB),
-        ("WDT.CTRLA", addr::WDT_CTRLA),
-        ("CPU.SPL", usize::from(avr::SPL)),
-        ("CPU.SPH", usize::from(avr::SPH)),
-        ("CPU.SREG", addr::CPU_SREG),
-        ("CLKCTRL.OSCHFCTRLA", addr::CLKCTRL_OSCHFCTRLA),
-        ("MVIO.STATUS", addr::MVIO_STATUS),
-        ("VPORTA.DIR", addr::VPORTA_DIR),
-        ("VPORTA.OUT", addr::VPORTA_OUT),
-        ("VPORTC.DIR", addr::VPORTC_DIR),
-        ("VPORTC.OUT", addr::VPORTC_OUT),
-        ("VPORTD.DIR", addr::VPORTD_DIR),
-        ("VPORTD.IN", addr::VPORTD_IN),
-        ("DAC0.CTRLA", addr::DAC0_CTRLA),
-        ("DAC0.DATAL", addr::DAC0_DATA),
-        ("DAC0.DATAH", addr::DAC0_DATA + 1),
-        ("VREF.DAC0REF", addr::VREF_DAC0REF),
-        ("TCB0.CTRLA", addr::TCB0_CTRLA),
-        ("TCB0.CCMPL", addr::TCB0_CCMP),
-        ("RTC.PITCTRLA", addr::RTC_PITCTRLA),
-    ];
-
-    let mut p = Programmer::connect(open()?)?;
-    let mut lines = Vec::new();
-    for (name, at) in registers {
-        lines.push(format!("{name:20} {:02X}", p.read(at as u16, 1)?[0]));
-    }
-    let sram = p.read(
-        elf::SRAM.start,
-        usize::from(elf::SRAM.end - elf::SRAM.start),
-    )?;
-    p.disconnect()?;
-
-    let at = kr1k::sensors::SUPPLIES_AT - usize::from(elf::SRAM.start);
-    let supplies: [u8; 4] = sram
-        .get(at..at + 4)
-        .and_then(|bytes| bytes.try_into().ok())
-        .ok_or("SUPPLIES_AT isn't in SRAM")?;
-    lines.extend(supply_lines(supplies));
-    lines.push("SRAM".into());
-    for line in runs(elf::SRAM.start, &sram) {
-        lines.push(format!("  {line}"));
-    }
-    Ok(lines)
-}
-
-/// Both readings go through `battery::centivolts`, whose slope is for VDD and
-/// is assumed for VDDIO2.
-fn supply_lines(bytes: [u8; 4]) -> Vec<String> {
-    use kr1k::battery::centivolts;
-    let supplies = kr1k::sensors::Supplies::from_bytes(bytes);
-    let mut lines = vec![format!(
-        "supplies at {:04X}, last read with the light off",
-        kr1k::sensors::SUPPLIES_AT
-    )];
-    if supplies == kr1k::sensors::Supplies::default() {
-        lines.push("  none read since the chip started".into());
-        return lines;
-    }
-    let volts = |cv: u16| format!("{}.{:02} V", cv / 100, cv % 100);
-    let (cell, vddio2) = (centivolts(supplies.cell), centivolts(supplies.vddio2));
-    lines.push(format!(
-        "  VDD     {:>8}  raw {:5}",
-        volts(cell),
-        supplies.cell
-    ));
-    lines.push(format!(
-        "  VDDIO2  {:>8}  raw {:5}",
-        volts(vddio2),
-        supplies.vddio2
-    ));
-    let (diff, raw) = (
-        i32::from(vddio2) - i32::from(cell),
-        i32::from(supplies.vddio2) - i32::from(supplies.cell),
-    );
-    let sign = if diff < 0 { "-" } else { "+" };
-    let diff = diff.unsigned_abs();
-    lines.push(format!(
-        "  VDDIO2 - VDD  {sign}{}.{:02} V  raw {raw:+}",
-        diff / 100,
-        diff % 100
-    ));
-    lines
-}
-
-fn runs(start: u16, bytes: &[u8]) -> Vec<String> {
-    bytes
-        .chunk_by(|a, b| a == b)
-        .scan(start, |at, run| {
-            let line = format!("{at:04X} {:02X} x{}", run[0], run.len());
-            *at += run.len() as u16;
-            Some(line)
-        })
-        .collect()
 }
 
 /// An image has no model in it, so the name is all there is to check, and a
@@ -616,63 +503,9 @@ mod tests {
     use super::updi::tests::fake::Dd20;
     use super::updi::{Programmer, SerialNumber};
     use super::{
-        backup_from, commas, crc, ihex, peek_from, program, read_hex, restore_onto, row, runs,
-        signed, stamp, supply_lines, this_boards_hex, write,
+        backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, signed, stamp,
+        this_boards_hex, write,
     };
-    use kr1k::sensors::{SUPPLIES_AT, Supplies};
-    use kr1k::testing::voltage_reading;
-
-    fn kept(supplies: Supplies) -> Dd20 {
-        let mut dd = Dd20::new();
-        let at = SUPPLIES_AT - kr1k::regs::mem::INTERNAL_SRAM_START;
-        dd.sram[at..at + 4].copy_from_slice(&supplies.to_bytes());
-        dd
-    }
-
-    #[test]
-    fn peek_shows_the_supplies_the_firmware_kept_in_volts_and_raw() {
-        let mut dd = kept(Supplies {
-            cell: voltage_reading(380),
-            vddio2: voltage_reading(330),
-        });
-        let lines = peek_from(on(&mut dd)).unwrap();
-        let at = lines
-            .iter()
-            .position(|line| line.starts_with("supplies at 7000"))
-            .unwrap();
-        assert_eq!(
-            lines[at + 1..at + 4],
-            [
-                "  VDD       3.80 V  raw  6132",
-                "  VDDIO2    3.30 V  raw  5324",
-                "  VDDIO2 - VDD  -0.50 V  raw -808",
-            ]
-        );
-        assert_eq!(dd.stores_in, 0);
-        assert!(dd.updi_disabled);
-        assert!(lines.iter().any(|line| line == "SRAM"));
-        assert!(lines.iter().any(|line| line.starts_with("  7000 F4 x1")));
-    }
-
-    #[test]
-    fn peek_says_when_the_two_agree_and_when_nothing_has_been_read() {
-        let same = voltage_reading(445);
-        let lines = supply_lines(
-            Supplies {
-                cell: same,
-                vddio2: same,
-            }
-            .to_bytes(),
-        );
-        assert_eq!(lines[3], "  VDDIO2 - VDD  +0.00 V  raw +0");
-        let lines = peek_from(on(&mut Dd20::new())).unwrap();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line == "  none read since the chip started"),
-            "{lines:?}"
-        );
-    }
 
     struct Scratch(PathBuf);
 
@@ -859,14 +692,6 @@ mod tests {
     #[test]
     fn flash_still_takes_a_short_image_such_as_the_stock_firmware() {
         assert!(signed(&[0x12, 0x34, 0x56]).is_ok());
-    }
-
-    #[test]
-    fn runs_show_where_a_pattern_stops() {
-        assert_eq!(
-            runs(0x7000, &[0xAA, 0xAA, 0xAA, 0x55, 0x00, 0x00]),
-            ["7000 AA x3", "7003 55 x1", "7004 00 x2"]
-        );
     }
 
     #[test]
