@@ -454,8 +454,8 @@ const BREAKAGES: &[Breakage] = &[
     Breakage {
         name: "no-quick-readings",
         file: SENSORS,
-        find: "            && lit\n            && self.set_up == Some(Channel::Voltage)\n",
-        replace: "            && lit\n            && false\n",
+        find: "        if channel == Channel::Voltage && step >= READING_STEP && lit {\n",
+        replace: "        if channel == Channel::Voltage && step >= READING_STEP && lit && false {\n",
         stage: Stage::Simulator,
         expect: "A cell that collapses: expected Off",
     },

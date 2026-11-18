@@ -86,9 +86,6 @@ pub struct Schedule {
     phase: u8,
     temperature: bool,
     quick: bool,
-    /// The channel the ADC was last set up for. [`Schedule::rest`] clears it,
-    /// since the firmware turns the ADC off to power down.
-    set_up: Option<Channel>,
 }
 
 impl Schedule {
@@ -97,7 +94,6 @@ impl Schedule {
             phase: 0,
             temperature: false,
             quick: false,
-            set_up: None,
         }
     }
 
@@ -127,11 +123,7 @@ impl Schedule {
         }
         let convert = |setup| Some(Convert { channel, setup });
         let (reading, start) = match step {
-            0 => {
-                let setup = self.set_up != Some(channel);
-                self.set_up = Some(channel);
-                (None, convert(setup))
-            }
+            0 => (None, convert(true)),
             1 => (None, convert(false)),
             READING_STEP => {
                 let reading = match channel {
@@ -143,14 +135,7 @@ impl Schedule {
             }
             _ => (None, None),
         };
-        if channel == Channel::Voltage && step == READING_STEP && !lit {
-            self.set_up = None;
-        }
-        if channel == Channel::Voltage
-            && step >= READING_STEP
-            && lit
-            && self.set_up == Some(Channel::Voltage)
-        {
+        if channel == Channel::Voltage && step >= READING_STEP && lit {
             self.quick = true;
             return (reading.or(quick), convert(false));
         }
@@ -302,17 +287,24 @@ mod tests {
     }
 
     #[test]
-    fn a_light_that_comes_on_partway_through_the_round_starts_quick_readings_next_round() {
+    fn a_light_that_comes_on_starts_quick_readings_in_what_is_left_of_the_voltages_turn() {
         for on_at in 3..16 {
             let mut schedule = Schedule::new();
             run(&mut schedule, on_at, Some(7), false);
             let lit = run(&mut schedule, 16 - on_at, Some(7), true);
-            assert!(
-                lit.iter()
-                    .all(|(r, c)| !matches!(r, Some(Reading::Quick(_)))
-                        && c.is_none_or(|c| c.channel != Channel::Voltage)),
-                "on at {on_at}"
-            );
+            for (phase, (reading, start)) in (on_at..16).zip(&lit) {
+                let quick = (on_at + 1..=8).contains(&phase);
+                let voltage = (phase < 8).then_some(Channel::Voltage);
+                assert_eq!(
+                    (
+                        matches!(reading, Some(Reading::Quick(7))),
+                        start.map(|c| c.channel).filter(|&c| c == Channel::Voltage),
+                        start.is_some_and(|c| c.setup && c.channel == Channel::Voltage),
+                    ),
+                    (quick, voltage, false),
+                    "on at {on_at}, phase {phase}"
+                );
+            }
             let next = run(&mut schedule, 16, Some(9), true);
             assert_eq!(next[3].0, Some(Reading::Quick(9)), "on at {on_at}");
         }

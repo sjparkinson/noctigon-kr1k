@@ -536,13 +536,10 @@ mod tests {
             assert_eq!(run.limits.health(), Health::Flat, "on at {at}");
             took.push(lit);
         }
-        // The third and fourth ticks' conversions at best, and the next
-        // round's third reading at worst.
+        // The third and fourth ticks' conversions at best. At worst the
+        // voltage's turn ends before two have counted, and the next round's do.
         assert_eq!(took.iter().min(), Some(&4));
-        assert!(
-            *took.iter().max().unwrap() <= usize::from(CYCLE_TICKS) + 3,
-            "{took:?}"
-        );
+        assert_eq!(took.iter().max(), Some(&13), "{took:?}");
     }
 
     #[test]
