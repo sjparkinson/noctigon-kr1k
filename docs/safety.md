@@ -54,7 +54,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Cover.** A floor that narrows the window and doesn't close it. While lit, two cell readings running under `battery::COLLAPSE_BELOW` put the light out that tick.
 
-**Unproven.** Simulator, with the cell scripted. Nothing covers a brown-out itself. A trip can take 188 ms, or 300 ms as a light starts, and how this cell sags is unmeasured.
+**Unproven.** Simulator, with the cell scripted. Nothing covers a brown-out itself. A trip can take 188 ms, or 203 ms as a light starts, and how this cell sags is unmeasured.
 
 ### H7. Overheating
 
