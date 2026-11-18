@@ -27,10 +27,9 @@ If something needs a 32-bit product, split one operand into bytes so each partia
 
 ## Looking inside the ELF
 
-rustup's `llvm-tools` component has `llvm-objdump`, `llvm-nm` and `llvm-size` built from rustc's own LLVM. Nothing in the build needs it, so add it once, from the repo so rustup picks the pinned nightly.
+rustup's `llvm-tools` component has `llvm-objdump`, `llvm-nm` and `llvm-size` built from rustc's own LLVM. Nothing in the build needs it, and `rust-toolchain.toml` pins it so the tools are there to read an ELF with. If they're missing, `rustup component add llvm-tools` from the repo adds them to the pinned nightly.
 
 ```sh
-rustup component add llvm-tools
 LLVM="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
 ELF=target/avr-none/release/kr1k.elf
 ```

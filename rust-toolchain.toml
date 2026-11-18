@@ -4,5 +4,5 @@
 # tier 3 target and nightlies do break it.
 [toolchain]
 channel = "nightly-2026-11-17"
-components = ["rust-src", "rustfmt", "clippy", "rust-analyzer"]
+components = ["rust-src", "rustfmt", "clippy", "rust-analyzer", "llvm-tools"]
 profile = "minimal"
