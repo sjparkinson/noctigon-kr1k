@@ -1,5 +1,5 @@
-//! Sharing the one ADC between the cell's voltage, the temperature sensor,
-//! VDDIO2 and a ground check, in a round of 16 ticks.
+//! Sharing the one ADC between the cell's voltage, the temperature sensor and
+//! a ground check, in a round of 16 ticks.
 
 /// Every reading is four 12-bit conversions accumulated, the temperature's
 /// against 2.048 V, which its factory calibration is for (DS40002413B
@@ -9,7 +9,6 @@ pub enum Channel {
     Voltage,
     Temperature,
     Ground,
-    Vddio2,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -27,7 +26,6 @@ pub enum Reading {
     /// for `battery::Protection::quick` and nothing else.
     Quick(u16),
     Ground(u16),
-    Vddio2(u16),
 }
 
 /// Each channel reads four times a second, which `battery` and `thermal` expect.
@@ -88,7 +86,6 @@ pub struct Schedule {
     phase: u8,
     temperature: bool,
     quick: bool,
-    vddio2: bool,
     /// The channel the ADC was last set up for. [`Schedule::rest`] clears it,
     /// since the firmware turns the ADC off to power down.
     set_up: Option<Channel>,
@@ -100,7 +97,6 @@ impl Schedule {
             phase: 0,
             temperature: false,
             quick: false,
-            vddio2: false,
             set_up: None,
         }
     }
@@ -142,35 +138,13 @@ impl Schedule {
                     Channel::Voltage => Reading::Voltage(raw),
                     Channel::Temperature => Reading::Temperature(raw),
                     Channel::Ground => Reading::Ground(raw),
-                    Channel::Vddio2 => Reading::Vddio2(raw),
                 };
                 (Some(reading), None)
             }
             _ => (None, None),
         };
-        if channel == Channel::Voltage {
-            // VDDIO2's turn starts on the voltage's reading tick, not the one
-            // after, because the torch rests as soon as no conversion is running.
-            let vddio2 = |setup| {
-                Some(Convert {
-                    channel: Channel::Vddio2,
-                    setup,
-                })
-            };
-            if step == READING_STEP && !lit {
-                self.vddio2 = true;
-                self.set_up = Some(Channel::Vddio2);
-                return (reading.or(quick), vddio2(true));
-            }
-            if self.vddio2 {
-                return match step {
-                    3 => (quick, vddio2(false)),
-                    _ => {
-                        self.vddio2 = false;
-                        (Some(Reading::Vddio2(raw)), None)
-                    }
-                };
-            }
+        if channel == Channel::Voltage && step == READING_STEP && !lit {
+            self.set_up = None;
         }
         if channel == Channel::Voltage
             && step >= READING_STEP
@@ -208,9 +182,7 @@ mod tests {
         let mut expected = [(None, None); 16];
         expected[0].1 = convert(Channel::Voltage, true);
         expected[1].1 = convert(Channel::Voltage, false);
-        expected[2] = (Some(Reading::Voltage(7)), convert(Channel::Vddio2, true));
-        expected[3].1 = convert(Channel::Vddio2, false);
-        expected[4].0 = Some(Reading::Vddio2(7));
+        expected[2].0 = Some(Reading::Voltage(7));
         expected[11].1 = convert(Channel::Ground, true);
         expected[12].1 = convert(Channel::Ground, false);
         expected[13].0 = Some(Reading::Ground(7));
@@ -218,43 +190,19 @@ mod tests {
     }
 
     #[test]
-    fn dark_it_reads_the_voltage_then_vddio2_then_ground() {
+    fn dark_it_reads_the_voltage_then_ground() {
         let mut schedule = Schedule::new();
         assert_eq!(run(&mut schedule, 16, Some(7), false), dark_round());
     }
 
     #[test]
-    fn a_check_at_rest_reads_the_cell_and_vddio2_and_no_ground() {
+    fn a_check_at_rest_reads_the_cell_and_no_ground() {
         let mut schedule = Schedule::new();
         for _ in 0..10 {
-            let ticks = run(&mut schedule, 5, Some(7), false);
-            assert_eq!(ticks[..], dark_round()[..5]);
-            assert_eq!(ticks[4].1, None, "nothing running, so it rests");
+            let ticks = run(&mut schedule, 3, Some(7), false);
+            assert_eq!(ticks[..], dark_round()[..3]);
+            assert_eq!(ticks[2].1, None, "nothing running, so it rests");
             schedule.rest();
-        }
-    }
-
-    #[test]
-    fn vddio2_is_read_two_ticks_after_the_cell_and_never_while_lit() {
-        let mut schedule = Schedule::new();
-        let ticks = run(&mut schedule, 64, Some(7), false);
-        let started = |channel| {
-            ticks
-                .iter()
-                .enumerate()
-                .filter(|(_, (_, c))| c.is_some_and(|c| c.channel == channel))
-                .map(|(tick, _)| tick)
-                .collect::<Vec<_>>()
-        };
-        for round in 0..4 {
-            let at = 16 * round;
-            assert!(started(Channel::Voltage).contains(&(at + 1)));
-            assert!(started(Channel::Vddio2).contains(&(at + 3)));
-        }
-        let mut schedule = Schedule::new();
-        for (reading, convert) in run(&mut schedule, 160, Some(7), true) {
-            assert!(!matches!(reading, Some(Reading::Vddio2(_))));
-            assert!(convert.is_none_or(|c| c.channel != Channel::Vddio2));
         }
     }
 
@@ -349,9 +297,7 @@ mod tests {
                 "out at {out_at}"
             );
             let rest = run(&mut schedule, 15 - out_at, Some(7), false);
-            let mut expected = dark_round();
-            expected[4] = (None, None);
-            assert_eq!(rest[..], expected[out_at + 1..], "{out_at}");
+            assert_eq!(rest[..], dark_round()[out_at + 1..], "{out_at}");
         }
     }
 
@@ -367,9 +313,6 @@ mod tests {
                         && c.is_none_or(|c| c.channel != Channel::Voltage)),
                 "on at {on_at}"
             );
-            if on_at <= 4 {
-                assert_eq!(lit[4 - on_at].0, Some(Reading::Vddio2(7)), "on at {on_at}");
-            }
             let next = run(&mut schedule, 16, Some(9), true);
             assert_eq!(next[3].0, Some(Reading::Quick(9)), "on at {on_at}");
         }
@@ -426,7 +369,7 @@ mod tests {
                 .collect()
         };
         let off = run(&mut schedule, 64, Some(1), false);
-        let round = [Channel::Voltage, Channel::Vddio2, Channel::Ground];
+        let round = [Channel::Voltage, Channel::Ground];
         assert_eq!(setups(&off), round.repeat(4));
         let on = run(&mut schedule, 64, Some(1), true);
         let round = [Channel::Voltage, Channel::Temperature, Channel::Ground];
@@ -466,11 +409,10 @@ mod tests {
             let (reading, convert) = schedule.tick(Some(0x155), false);
             match tick % 16 {
                 2 => assert_eq!(reading, Some(Reading::Voltage(0x155))),
-                4 => assert_eq!(reading, Some(Reading::Vddio2(0x155))),
                 13 => assert_eq!(reading, Some(Reading::Ground(0x155))),
                 phase => assert_eq!(reading, None, "phase {phase}"),
             }
-            if (4..11).contains(&(tick % 16)) || tick % 16 >= 13 {
+            if (2..11).contains(&(tick % 16)) || tick % 16 >= 13 {
                 assert_eq!(convert, None, "tick {tick}");
             }
         }

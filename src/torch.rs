@@ -234,8 +234,8 @@ mod tests {
     use crate::ui::{self, Mode, ON_LEVEL};
     use std::vec::Vec;
 
-    /// The cell's two conversions and VDDIO2's two.
-    const CHECK_AWAKE: u16 = 4;
+    /// The cell's two conversions.
+    const CHECK_AWAKE: u16 = 2;
 
     fn dim() -> Output {
         ramp::output(ON_LEVEL)
@@ -598,8 +598,6 @@ mod tests {
         for (tick, started) in [
             convert(Channel::Voltage, true),
             convert(Channel::Voltage, false),
-            convert(Channel::Vddio2, true),
-            convert(Channel::Vddio2, false),
         ]
         .into_iter()
         .enumerate()
@@ -934,8 +932,7 @@ mod tests {
                 .convert()
                 .is_some_and(|c| c.channel == Channel::Voltage);
             assert_eq!(torch.tick(false), Some(Event::Release { clicks: 0 }));
-            // VDDIO2's turn may follow the voltage's.
-            for _ in 0..4 {
+            for _ in 0..2 {
                 if !torch.resting() {
                     torch.tick(false);
                 }
@@ -1813,7 +1810,7 @@ mod tests {
             let event = rig.torch.tick(pressed, result, vddio2, true);
             rig.adc
                 .start_with(rig.torch.convert(), |channel| match channel {
-                    Channel::Voltage | Channel::Vddio2 => cell.read(rng),
+                    Channel::Voltage => cell.read(rng),
                     Channel::Temperature => head.read(rng),
                     Channel::Ground => match cell {
                         Source::Garbage => cell.read(rng),
@@ -2030,7 +2027,7 @@ mod tests {
             if resting_before && pressed {
                 check!(t, rig.convert().is_some(), "a press that reads nothing");
             }
-            // A running conversion is seen through, and VDDIO2's can follow.
+            // A running conversion is seen through.
             if up > u32::from(RELEASE_TICKS + CHECK_AWAKE) && level == 0 && !checking {
                 check!(t, resting, "nothing to do and not resting");
             }

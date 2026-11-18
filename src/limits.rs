@@ -165,7 +165,7 @@ impl Limits {
                     self.fault = true;
                 }
             }
-            Some(Reading::Vddio2(_)) | None => {}
+            None => {}
         }
         let cut = !vddio2;
         if cut {
