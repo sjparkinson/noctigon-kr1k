@@ -3,10 +3,8 @@
 use crate::button::Event;
 use crate::ramp::CEILING;
 
-/// Inside the range where the DAC's linearity is specified (0x030 up,
-/// DS40002413B table 38-23). How bright it is, and whether the levels under
-/// it light steadily, is unmeasured.
-pub const FLOOR: u8 = 13;
+/// How bright it is, or how steady, is unmeasured.
+pub const FLOOR: u8 = 1;
 
 pub const ON_LEVEL: u8 = 52;
 
@@ -152,10 +150,8 @@ mod tests {
     }
 
     #[test]
-    fn the_floor_is_on_the_low_path_where_the_dacs_linearity_is_specified() {
-        let out = output(FLOOR);
-        assert_eq!(out.paths, Paths::Low);
-        assert!(out.dac >= 0x30, "{out:?}");
+    fn the_floor_is_the_ramps_lowest() {
+        assert_eq!(output(FLOOR), crate::ramp::FLOOR);
     }
 
     #[test]
