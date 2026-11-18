@@ -28,8 +28,9 @@ const _: () = assert!(FLOOR <= CEILING);
 const FRACTION: i16 = 16;
 /// Samples. The stock firmware's figure, unmeasured on this light.
 const HISTORY: usize = 8;
-/// Trend-lengths ahead. The stock firmware's figure, unmeasured on this light.
-const LOOKAHEAD: i16 = 4;
+/// Trend-lengths ahead. The stock firmware's is 4, which hunts at level 150 in
+/// the test head model. Unmeasured on this light.
+const LOOKAHEAD: i16 = 6;
 /// Under the limit. The stock firmware's figure, unmeasured on this light.
 const WINDOW: i16 = 2 * FRACTION;
 /// A trend at least this steep blocks stepping up. Unmeasured.
@@ -527,7 +528,7 @@ mod tests {
         run.hold(LIMIT + 3, CEILING, 20);
         assert!(run.output < CEILING);
         for kelvin in [LIMIT, LIMIT - 1] {
-            let held = run.hold(kelvin, CEILING, 20);
+            let held = run.hold(kelvin, CEILING, 40);
             assert_eq!(
                 run.hold(kelvin, CEILING, 4 * 60),
                 held,
@@ -903,7 +904,7 @@ mod tests {
         let mut thermal = Thermal::default();
         let start = fraction(LIMIT - 30);
         thermal.sample(start, CEILING);
-        for step in 1..=5 {
+        for step in 1..=4 {
             assert_eq!(thermal.ceiling.target(), CEILING);
             thermal.sample(start + step * fraction(6), CEILING);
         }
