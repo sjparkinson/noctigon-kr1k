@@ -85,6 +85,7 @@ const _: () = assert!(CLOCK_HZ == CLK_PER);
 const TIMER_PERIOD: u64 = TIMER_PERIOD_CLOCKS as u64;
 /// WDT clocks in a 64 Hz tick (§22.3.2).
 const WDT_CLOCKS_PER_TICK: u32 = 16;
+const _: () = assert!(WDT_CLOCKS_PER_TICK == kr1k::watchdog::CLOCKS_PER_TICK as u32);
 /// The scan starts three cycles after ENABLE (§30.3.1).
 const CRC_START_INSTRUCTIONS: u64 = 3;
 /// Reads of STATUS that show BUSY. A real chip may never show it, since the
@@ -4171,7 +4172,7 @@ mod tests {
     }
 
     fn clocks(n: u64) -> u64 {
-        n * TICK_CYCLES / 16
+        n * TICK_CYCLES / u64::from(WDT_CLOCKS_PER_TICK)
     }
 
     #[test]

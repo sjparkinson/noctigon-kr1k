@@ -11,7 +11,7 @@ use kr1k::regs::{
 use kr1k::ui::Aux;
 
 /// Main clocks a second.
-const CLK_PER: u64 = 4_000_000;
+const CLK_PER: u64 = kr1k::watchdog::CLOCK_HZ as u64;
 /// The AW2016's fastest SCL and shortest SCL low ("I2C Interface Timing").
 const SCL_MAX_HZ: u64 = 400_000;
 const T_LOW_MIN_NS: u64 = 1300;
