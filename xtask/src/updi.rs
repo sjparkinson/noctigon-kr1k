@@ -760,11 +760,9 @@ pub(crate) mod tests {
         assert_eq!(dd.nvm_operations(), 0, "an erase or write went in");
     }
 
-    fn assert_let_go(dd: &Dd20) {
+    fn assert_refused(dd: &Dd20) {
         assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
-        assert!(!dd.in_reset, "the chip was left in reset");
-        assert!(!dd.progmode, "the chip was left in programming mode");
-        assert!(dd.updi_disabled, "UPDI was left on");
+        dd.assert_let_go();
         assert_contents_kept(dd);
     }
 
@@ -773,7 +771,7 @@ pub(crate) mod tests {
         let Err(error) = Programmer::connect_for_programming(&mut dd) else {
             panic!("connected for programming");
         };
-        assert_let_go(&dd);
+        assert_refused(&dd);
         error
     }
 
@@ -782,7 +780,7 @@ pub(crate) mod tests {
         let Err(error) = Programmer::connect_for_restore(&mut dd, saved, Path::new(BACKUP)) else {
             panic!("connected for a restore");
         };
-        assert_let_go(&dd);
+        assert_refused(&dd);
         error
     }
 
@@ -928,7 +926,7 @@ pub(crate) mod tests {
 
     #[test]
     fn writes_and_verifies_flash_then_starts_the_firmware() {
-        let image: Vec<u8> = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (image, _) = images();
         let mut p = Programmer::connect(with_contents(Dd20::new())).unwrap();
         p.enter_progmode().unwrap();
         p.erase_and_write_flash(&image).unwrap();
@@ -972,7 +970,8 @@ pub(crate) mod tests {
 
     #[test]
     fn verify_catches_a_page_erase_that_did_not_take() {
-        let image: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
+        let (mut image, _) = images();
+        image.truncate(200);
         let mut dd = with_contents(Dd20::new());
         dd.ignores_erases = true;
 
@@ -1008,7 +1007,7 @@ pub(crate) mod tests {
 
     #[test]
     fn writes_every_eeprom_byte_over_eesave_contents_blank_ones_too() {
-        let mut eeprom: Vec<u8> = (0..=255).collect();
+        let (_, mut eeprom) = images();
         eeprom[128..].fill(0xFF);
         let mut dd = Dd20::new();
         dd.eesave = true;
@@ -1048,7 +1047,7 @@ pub(crate) mod tests {
 
     #[test]
     fn writes_eeprom_and_reads_fuses_lock_bits_and_user_row() {
-        let eeprom: Vec<u8> = (0..=255).collect();
+        let (_, eeprom) = images();
         let mut p = Programmer::connect_for_programming(Dd20::new()).unwrap();
         p.erase_and_write_flash(&[0x12]).unwrap();
         p.write_eeprom(&eeprom).unwrap();
@@ -1246,9 +1245,7 @@ pub(crate) mod tests {
         };
         assert_eq!(err, "the chip didn't accept the NVM programming key");
         assert_eq!(dd.resets, 1, "only the reset that leaves");
-        assert!(!dd.in_reset, "the chip was left in reset");
-        assert!(!dd.progmode, "the chip was left in programming mode");
-        assert!(dd.updi_disabled, "UPDI was left on");
+        dd.assert_let_go();
         assert_contents_kept(&dd);
     }
 
@@ -1303,7 +1300,7 @@ pub(crate) mod tests {
         assert_eq!(p.wire.resets, 1, "never sent the key and reset");
     }
 
-    fn images() -> (Vec<u8>, Vec<u8>) {
+    pub fn images() -> (Vec<u8>, Vec<u8>) {
         let flash = (0..1000u32).map(|i| (i * 7 + 3) as u8).collect();
         let eeprom = (0..=255).collect();
         (flash, eeprom)
@@ -1513,6 +1510,7 @@ pub(crate) mod tests {
     /// and not misreadings.
     pub(crate) mod fake {
         use super::super::*;
+        use crate::world::{FACTORY_FUSES, FUSE_BYTES};
         use kr1k::regs::{
             LOCK_KEY_RWLOCK, NVMCTRL_CMD_NOOP as NVM_NOOP,
             NVMCTRL_ERROR_ONGOINGPROG as NVM_ERROR_RESERVED,
@@ -1634,7 +1632,7 @@ pub(crate) mod tests {
         impl Dd20 {
             pub fn new() -> Self {
                 let mut fuses = [0xFF; map::FUSES_SIZE];
-                fuses[..9].copy_from_slice(&[0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x08, 0x00, 0x00]);
+                fuses[..FUSE_BYTES].copy_from_slice(&FACTORY_FUSES);
                 Self {
                     flash: vec![0xFF; map::FLASH_SIZE],
                     eeprom: vec![0xFF; map::EEPROM_SIZE],
@@ -1700,6 +1698,12 @@ pub(crate) mod tests {
 
             pub fn nvm_operations(&self) -> usize {
                 self.chip_erases + self.page_erases + self.word_writes + self.eeprom_writes
+            }
+
+            pub fn assert_let_go(&self) {
+                assert!(!self.in_reset, "the chip was left in reset");
+                assert!(!self.progmode, "the chip was left in programming mode");
+                assert!(self.updi_disabled, "UPDI was left on");
             }
 
             pub fn clear_error(&mut self) {

@@ -509,6 +509,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::updi::tests::fake::Dd20;
+    use super::updi::tests::images;
     use super::updi::{Programmer, SerialNumber};
     use super::{
         TempDir, backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, signed,
@@ -529,12 +530,9 @@ mod tests {
 
     fn chip() -> Dd20 {
         let mut dd = Dd20::new();
-        for (i, byte) in dd.flash.iter_mut().take(1000).enumerate() {
-            *byte = (i * 7 + 3) as u8;
-        }
-        for (i, byte) in dd.eeprom.iter_mut().enumerate() {
-            *byte = i as u8;
-        }
+        let (flash, eeprom) = images();
+        dd.flash[..flash.len()].copy_from_slice(&flash);
+        dd.eeprom.copy_from_slice(&eeprom);
         dd
     }
 
@@ -572,8 +570,7 @@ mod tests {
         restore_onto(on(&mut dd), &dir).unwrap();
         assert!(dd.flash == flash, "flash isn't the backup's");
         assert!(dd.eeprom == eeprom, "EEPROM isn't the backup's");
-        assert!(dd.updi_disabled, "UPDI was left on");
-        assert!(!dd.progmode, "the chip was left in programming mode");
+        dd.assert_let_go();
     }
 
     #[test]
@@ -595,9 +592,7 @@ mod tests {
         assert!(torch.flash.iter().all(|&b| b == 0x42), "flash changed");
         assert!(torch.eeprom.iter().all(|&b| b == 0x24), "EEPROM changed");
         assert_eq!(torch.nvm_operations(), 0);
-        assert!(torch.updi_disabled, "UPDI was left on");
-        assert!(!torch.progmode, "the chip was left in programming mode");
-        assert!(!torch.in_reset, "the chip was left in reset");
+        torch.assert_let_go();
     }
 
     #[test]
@@ -797,13 +792,6 @@ mod tests {
         }
     }
 
-    fn assert_let_go(dd: &Dd20) {
-        assert!(dd.updi_disabled, "UPDI was left on");
-        assert!(!dd.progmode, "the chip was left in programming mode");
-        assert!(!dd.in_reset, "the chip was left in reset");
-        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
-    }
-
     #[test]
     fn a_locked_chip_is_refused_and_keeps_what_it_holds() {
         let mut dd = chip();
@@ -822,7 +810,8 @@ mod tests {
         assert!(dd.flash == flash, "flash changed");
         assert!(dd.eeprom == eeprom, "EEPROM changed");
         assert_eq!(dd.nvm_operations(), 0);
-        assert_let_go(&dd);
+        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
+        dd.assert_let_go();
     }
 
     #[test]
@@ -841,7 +830,8 @@ mod tests {
         assert_eq!(dd.page_erases, 1);
         assert_eq!(dd.word_writes, 99);
         assert_eq!(dd.eeprom_writes, 0);
-        assert_let_go(&dd);
+        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
+        dd.assert_let_go();
     }
 
     #[test]
@@ -859,6 +849,7 @@ mod tests {
         assert_eq!(err, "timed out waiting for the NVM controller");
         assert_eq!(dd.page_erases + dd.word_writes, 0);
         assert_eq!(dd.lost_while_busy, 0);
-        assert_let_go(&dd);
+        assert_eq!(dd.resets, 2, "one reset to enter and one to leave");
+        dd.assert_let_go();
     }
 }
