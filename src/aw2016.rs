@@ -500,12 +500,10 @@ mod tests {
     #[test]
     fn through_every_example_the_aux_are_dark_while_lit_and_catch_up() {
         for example in EXAMPLES {
-            let mut rig = Rig::default();
             let mut aw = Aw2016::new();
             let mut chip = Chip::new();
             let mut behind = 0;
-            for sample in crate::testing::samples(example.actions()) {
-                rig.tick_in(sample.pressed, &sample.scene);
+            Rig::play_with(example.actions(), |rig, _| {
                 let want = rig.torch.aux();
                 if let Some(update) = aw.step(want) {
                     chip.send(update);
@@ -523,7 +521,7 @@ mod tests {
                     behind += 1;
                     assert!(behind <= 2, "{}: {want:?} never shows", example.name);
                 }
-            }
+            });
         }
     }
 }
