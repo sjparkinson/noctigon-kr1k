@@ -108,6 +108,7 @@ The factory defaults, which this torch has, leave the BOD off, UPDI on PF7, dual
 - 2026-11-17. Left off overnight with the cell in, then lit at once, so the watchdog didn't bite at rest.
 - 2026-11-17. `bb9ee76` flashed. No flash of light as the cell went in, ramping both ways, lockout and unlock all worked.
 - 2026-11-17. Main flashed, with the 1 Hz tick at rest, and reported in good working order. What was checked isn't recorded.
+- 2026-11-18. Lit at the floor, a 1C pressed on the edge of the button turned the light off and it came back brighter a moment later, likely at `ui::ON_LEVEL`. Likely more than once that night, and not reproduced the next day.
 
 Not measured on this torch yet are tail current, anything thermal, the low-voltage steps and the top of the ramp.
 
