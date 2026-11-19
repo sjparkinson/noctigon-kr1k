@@ -3,7 +3,7 @@
 
 use crate::TICKS_PER_SECOND;
 use crate::battery;
-use crate::button::{Clicks, Event};
+use crate::button::{Clicks, Debounce, Event};
 use crate::gradual::Fade;
 use crate::limits::{Health, Limits};
 use crate::ramp::{self, Output};
@@ -33,6 +33,7 @@ const _: () = assert!(AUX_DARK_BELOW < AUX_LIT_FROM);
 
 #[derive(Clone, Debug)]
 pub struct Torch {
+    switch: Debounce,
     clicks: Clicks,
     ui: Ui,
     limits: Limits,
@@ -53,6 +54,7 @@ pub struct Torch {
 impl Torch {
     pub const fn new(calibration: Calibration, faults: Faults) -> Self {
         Self {
+            switch: Debounce::new(),
             clicks: Clicks::new(),
             ui: Ui::new(),
             limits: Limits::new(calibration, faults),
@@ -76,7 +78,8 @@ impl Torch {
     ) -> Option<Event> {
         self.warm = self.level() > 0;
         self.showing = self.showing.saturating_sub(1);
-        let event = self.clicks.tick_up_to(pressed, self.ui.most_clicks());
+        let down = self.switch.sample(pressed);
+        let event = self.clicks.tick_up_to(down, self.ui.most_clicks());
         if let Some(event) = event {
             let press = matches!(event, Event::Click(_) | Event::Hold { ticks: 0, .. });
             if self.limits.health() == Health::Good || self.level() > 0 {
@@ -136,7 +139,10 @@ impl Torch {
     }
 
     const fn quiet(&self) -> bool {
-        self.clicks.idle() && self.ui.output_level() == 0 && self.limits.level() == 0
+        self.switch.settled()
+            && self.clicks.idle()
+            && self.ui.output_level() == 0
+            && self.limits.level() == 0
     }
 
     /// The firmware powers down between ticks while this holds.
@@ -356,6 +362,42 @@ mod tests {
     }
 
     #[test]
+    fn a_press_that_wakes_it_counts_once_a_tick_sees_it_too() {
+        use crate::testing::{Paced, PitPhase, Scene};
+        for (phase, shortest) in [
+            (PitPhase::Aligned, 2),
+            (PitPhase::Early, 2),
+            (PitPhase::Late, 3),
+        ] {
+            for (samples, lights) in [(shortest - 1, false), (shortest, true)] {
+                let mut paced = Paced::new(Faults::NONE, 0);
+                paced.phase = phase;
+                let mut asleep = 0;
+                for _ in 0..10 * TICKS_PER_SECOND {
+                    let pass = paced.sample(false, &Scene::NORMAL);
+                    let slept = pass.is_none() && paced.end.switch_wakes;
+                    asleep = if slept { asleep + 1 } else { 0 };
+                    if asleep == 5 {
+                        break;
+                    }
+                }
+                assert_eq!(asleep, 5, "{phase:?}: never slept");
+                for _ in 0..samples {
+                    paced.sample(true, &Scene::NORMAL);
+                }
+                for _ in 0..TICKS_PER_SECOND {
+                    paced.sample(false, &Scene::NORMAL);
+                }
+                assert_eq!(
+                    paced.level() > 0,
+                    lights,
+                    "{phase:?}: down for {samples} samples"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn resting_for_a_while_is_resting_tick_by_tick() {
         let mut rng = Rng::new(9);
         let mut torch = Rig::default();
@@ -443,7 +485,7 @@ mod tests {
     fn a_click_turns_it_on_once_the_click_counts() {
         let mut torch = Rig::default();
         run(&mut torch, true, 4);
-        run(&mut torch, false, RELEASE_TICKS);
+        run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.output(), Output::OFF);
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.output(), Output::STARTING);
@@ -456,14 +498,14 @@ mod tests {
         let mut torch = Rig::default();
         for _ in 0..3 {
             run(&mut torch, true, 4);
-            run(&mut torch, false, RELEASE_TICKS);
+            run(&mut torch, false, RELEASE_TICKS + 1);
             torch.tick(false);
             assert_eq!(torch.level(), ON_LEVEL);
             assert_eq!(torch.output(), Output::STARTING);
             torch.tick(false);
             assert_eq!(torch.output(), dim());
             run(&mut torch, true, 4);
-            run(&mut torch, false, RELEASE_TICKS);
+            run(&mut torch, false, RELEASE_TICKS + 1);
             torch.tick(false);
             assert_eq!(torch.output(), Output::OFF);
         }
@@ -540,12 +582,47 @@ mod tests {
         let mut torch = Rig::default();
         click(&mut torch);
         run(&mut torch, true, 4);
+        torch.tick(false);
         assert_eq!(torch.tick(false), Some(Event::Click(1)), "off, from on");
         assert_eq!(torch.level(), 0);
         clicks(&mut torch, 2);
         run(&mut torch, true, 4);
+        torch.tick(false);
         assert_eq!(torch.tick(false), Some(Event::Click(3)), "3C, from off");
         assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
+    }
+
+    #[test]
+    fn one_sample_of_the_switch_changes_nothing() {
+        let mut torch = Rig::default();
+        run(&mut torch, false, CHECK_AWAKE + 1);
+        assert!(torch.resting());
+        assert_eq!(torch.tick(true), None);
+        assert!(!torch.resting(), "awake to look again");
+        run(&mut torch, false, TICKS_PER_SECOND);
+        assert!(torch.resting());
+        assert_eq!(torch.level(), 0);
+
+        click(&mut torch);
+        torch.tick(true);
+        run(&mut torch, false, TICKS_PER_SECOND);
+        assert_eq!(torch.level(), ON_LEVEL, "one sample down while lit");
+
+        run(&mut torch, true, 4);
+        torch.tick(false);
+        run(&mut torch, true, 4);
+        run(&mut torch, false, TICKS_PER_SECOND);
+        assert_eq!(torch.level(), 0, "one sample up in a click is one click");
+
+        click(&mut torch);
+        run(&mut torch, true, 40);
+        torch.tick(false);
+        run(&mut torch, true, 40);
+        assert_eq!(
+            u16::from(torch.level()),
+            u16::from(ON_LEVEL) + 80 - HOLD_TICKS,
+            "one sample up in a hold is one hold"
+        );
     }
 
     #[test]
@@ -584,7 +661,7 @@ mod tests {
         tap(&mut torch, 3, Event::Click(3));
         run(&mut torch, false, LOCKED_TICKS);
         assert_eq!(torch.aux(), Aux::Off);
-        run(&mut torch, true, HOLD_TICKS + 1);
+        run(&mut torch, true, HOLD_TICKS + 2);
         assert_eq!(torch.aux(), Aux::Red, "from the start of the hold");
         run(&mut torch, true, LOCKED_TICKS);
         assert_eq!(torch.aux(), Aux::Off, "still held");
@@ -936,10 +1013,10 @@ mod tests {
             run(&mut torch, false, CHECK_AWAKE + 1);
             torch.adc.voltage = voltage_reading(320);
             clicks(&mut torch, 1);
-            run(&mut torch, true, down - 1);
+            run(&mut torch, true, down);
             assert_eq!(torch.aux(), Aux::Off, "{down}");
             torch.adc.voltage = voltage_reading(380);
-            torch.tick(true);
+            torch.tick(false);
             let running = torch
                 .convert()
                 .is_some_and(|c| c.channel == Channel::Voltage);
@@ -1201,6 +1278,7 @@ mod tests {
             torch.tick(false);
         }
         run(&mut torch, true, 4);
+        torch.tick(false);
         assert!(torch.level() > 0, "still fading when the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)), "as it's let go");
         assert_eq!(torch.level(), 0);
@@ -1226,7 +1304,7 @@ mod tests {
         run(&mut torch, false, 20 * TICKS_PER_SECOND);
         assert_eq!(torch.aux(), Aux::Off);
         run(&mut torch, true, 4);
-        run(&mut torch, false, RELEASE_TICKS);
+        run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.aux(), Aux::Off, "not before the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.aux(), Aux::Yellow);
@@ -1272,6 +1350,7 @@ mod tests {
         }
         run(&mut torch, false, TICKS_PER_SECOND);
         run(&mut torch, true, 4);
+        torch.tick(false);
         assert!(torch.level() > 0, "still fading when the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.level(), 0);
@@ -1384,7 +1463,7 @@ mod tests {
         let mut torch = Rig::default();
         for tick in 0..10 * 60 * u32::from(TICKS_PER_SECOND) {
             torch.tick(true);
-            let lit = tick >= u32::from(HOLD_TICKS);
+            let lit = tick > u32::from(HOLD_TICKS);
             assert_eq!(torch.level(), if lit { ui::FLOOR } else { 0 }, "{tick}");
         }
     }
@@ -1485,7 +1564,7 @@ mod tests {
         }
         let mut torch = Rig::default();
         run(&mut torch, true, 4);
-        run(&mut torch, false, RELEASE_TICKS);
+        run(&mut torch, false, RELEASE_TICKS + 1);
         torch.tick(false);
         assert_eq!(torch.output(), Output::STARTING);
         torch.vddio2 = false;
@@ -1498,7 +1577,7 @@ mod tests {
     fn a_click_on_the_tick_vddio2_reads_missing_lights_nothing() {
         let mut torch = Rig::default();
         run(&mut torch, true, 4);
-        run(&mut torch, false, RELEASE_TICKS);
+        run(&mut torch, false, RELEASE_TICKS + 1);
         torch.vddio2 = false;
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.output(), Output::OFF);
