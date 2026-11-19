@@ -3,9 +3,7 @@
 
 use crate::board::{PATH1, PATH2, PATH3};
 
-pub const LEVELS: u8 = 150;
-
-pub const CEILING: u8 = LEVELS;
+pub const CEILING: u8 = 150;
 
 /// DAC0 is 10-bit (DS40002413B §34.3.2.3).
 pub const DAC_MAX: u16 = 1023;
@@ -141,13 +139,13 @@ const GEARS: [(Paths, Vref); 6] = [
     clippy::as_conversions,
     reason = "widening u8 to usize for an array length, where From can't be called"
 )]
-static TABLE: [u16; LEVELS as usize] = table();
+static TABLE: [u16; CEILING as usize] = table();
 
 const VREF_BIT: u16 = 1 << 10;
 const PATHS_SHIFT: u8 = 11;
 
 const _: () = assert!(DAC_MAX < VREF_BIT);
-const _: () = assert!(CEILING > 0 && CEILING <= LEVELS);
+const _: () = assert!(CEILING > 0);
 
 pub fn output(level: u8) -> Output {
     let Some(index) = level.min(CEILING).checked_sub(1) else {
@@ -224,13 +222,13 @@ const fn bridge_between(low: Output, high: Output) -> Option<u16> {
     clippy::cast_possible_truncation,
     clippy::as_conversions,
     reason = "only ever run to build BRIDGES, where an overflow or a bad index fails the build, \
-              and a level is LEVELS at most, which is a u8"
+              and a level is CEILING at most, which is a u8"
 )]
 const fn bridges() -> [Option<(u8, u16)>; GEARS.len() - 1] {
     let table = table();
     let mut bridges = [None; GEARS.len() - 1];
     let (mut found, mut level) = (0, 1);
-    while level < LEVELS as usize {
+    while level < CEILING as usize {
         if let Some(code) = bridge_between(unpack(table[level - 1]), unpack(table[level])) {
             bridges[found] = Some((level as u8, code));
             found += 1;
@@ -309,14 +307,14 @@ const fn choose(target: u64, up: bool) -> Output {
     reason = "only ever run to build TABLE, where an overflow or a bad index fails the build, \
               and From can't be called in a const fn"
 )]
-const fn table() -> [u16; LEVELS as usize] {
-    let mut table = [0; LEVELS as usize];
+const fn table() -> [u16; CEILING as usize] {
+    let mut table = [0; CEILING as usize];
     let floor = FLOOR.modelled();
     let span = TOP.modelled() - floor;
-    let last = LEVELS as u64 - 1;
+    let last = CEILING as u64 - 1;
     let mut previous = 0;
     let mut i = 0;
-    while i < LEVELS as usize {
+    while i < CEILING as usize {
         let step = i as u64;
         let target = floor + span * step * step * step / (last * last * last);
         let mut level = choose(target, false);
@@ -346,7 +344,7 @@ mod tests {
     #[test]
     fn the_table_runs_from_the_floor_to_the_top() {
         assert_eq!(unpack(TABLE[0]), FLOOR);
-        assert_eq!(unpack(TABLE[usize::from(LEVELS) - 1]), TOP);
+        assert_eq!(unpack(TABLE[usize::from(CEILING) - 1]), TOP);
     }
 
     #[test]
@@ -366,7 +364,7 @@ mod tests {
 
     #[test]
     fn every_level_turns_the_driver_on_with_a_code_and_a_path() {
-        for level in 1..=LEVELS {
+        for level in 1..=CEILING {
             let out = output(level);
             assert!(out.enable && out.dac > 0 && out.dac <= DAC_MAX);
             assert_ne!(out.paths, Paths::None);
@@ -404,7 +402,6 @@ mod tests {
 
     #[test]
     fn nothing_runs_above_the_ceiling() {
-        assert_eq!(output(LEVELS), output(CEILING));
         assert_eq!(output(u8::MAX), output(CEILING));
     }
 
@@ -414,7 +411,7 @@ mod tests {
 
     #[test]
     fn a_whole_level_between_is_the_level() {
-        for level in 0..=LEVELS {
+        for level in 0..=CEILING {
             assert_eq!(output_between(u16::from(level) * FRACTION), output(level));
         }
     }

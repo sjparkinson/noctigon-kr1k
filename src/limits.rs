@@ -226,7 +226,6 @@ mod tests {
 
     use super::*;
     use crate::TICKS_PER_SECOND;
-    use crate::ramp::LEVELS;
     use crate::sensors::{CYCLE_TICKS, FULL_SCALE, UNREAD_TICKS};
     use crate::testing::{Adc, CALIBRATION, CELL_READING, HUNG, celsius_reading, voltage_reading};
     use crate::thermal::FLOOR;
@@ -322,7 +321,7 @@ mod tests {
     #[test]
     fn nothing_runs_above_the_ramps_ceiling() {
         let mut run = Run::new();
-        run.ui = LEVELS;
+        run.ui = u8::MAX;
         assert_eq!(run.secs(60), CEILING);
         assert!(run.levels.iter().all(|&l| l <= CEILING));
     }
@@ -1037,7 +1036,7 @@ mod tests {
         let mut run = Run::with(HUNG);
         assert_eq!(run.limits.health(), Health::Fault);
         assert_eq!(run.secs(10), 0);
-        for ui in [1, 30, CEILING, LEVELS] {
+        for ui in [1, 30, CEILING, u8::MAX] {
             run.ui = ui;
             assert_eq!(run.secs(10), 0, "{ui}");
         }
