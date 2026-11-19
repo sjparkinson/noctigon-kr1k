@@ -325,7 +325,7 @@ mod tests {
             let mut paced = Paced::new(Faults::NONE, 0);
             paced.phase = phase;
             let (mut slow, mut passes, mut lit) = (0u32, 0u32, 0u32);
-            for _ in 0..400 {
+            for _ in 0..800 {
                 let (pressed, ticks) = match rng.next_u16() % 4 {
                     0 => (true, 2 + rng.next_u16() % 6),
                     1 => (true, 20 + rng.next_u16() % 100),
@@ -935,6 +935,7 @@ mod tests {
             let mut torch = Rig::default();
             run(&mut torch, false, CHECK_AWAKE + 1);
             torch.adc.voltage = voltage_reading(320);
+            clicks(&mut torch, 1);
             run(&mut torch, true, down - 1);
             assert_eq!(torch.aux(), Aux::Off, "{down}");
             torch.adc.voltage = voltage_reading(380);
@@ -942,7 +943,7 @@ mod tests {
             let running = torch
                 .convert()
                 .is_some_and(|c| c.channel == Channel::Voltage);
-            assert_eq!(torch.tick(false), Some(Event::Release { clicks: 0 }));
+            assert_eq!(torch.tick(false), Some(Event::Release { clicks: 1 }));
             for _ in 0..2 {
                 if !torch.resting() {
                     torch.tick(false);
@@ -1379,11 +1380,12 @@ mod tests {
     }
 
     #[test]
-    fn a_switch_held_from_power_on_stays_off() {
+    fn a_switch_held_from_power_on_lights_the_floor_and_stays_there() {
         let mut torch = Rig::default();
-        for _ in 0..10 * 60 * u32::from(TICKS_PER_SECOND) {
+        for tick in 0..10 * 60 * u32::from(TICKS_PER_SECOND) {
             torch.tick(true);
-            assert_eq!(torch.level(), 0);
+            let lit = tick >= u32::from(HOLD_TICKS);
+            assert_eq!(torch.level(), if lit { ui::FLOOR } else { 0 }, "{tick}");
         }
     }
 
@@ -1766,6 +1768,17 @@ mod tests {
                     self.asked = ON_LEVEL;
                     self.up = false;
                 }
+                (
+                    Mode::Off,
+                    Event::Hold {
+                        clicks: 0,
+                        ticks: 0,
+                    },
+                ) => {
+                    self.mode = Mode::On;
+                    self.asked = ui::FLOOR;
+                    self.up = false;
+                }
                 (Mode::Off, Event::Click(3)) => self.mode = Mode::Lockout,
                 (Mode::Lockout, Event::Click(3)) | (Mode::On, Event::Click(1)) => {
                     self.mode = Mode::Off;
@@ -1802,6 +1815,7 @@ mod tests {
         white: u32,
         results_lost: u32,
         turned_on: u32,
+        lit_by_a_hold: u32,
         went_flat: u32,
         collapsed: u32,
         collapsed_mid_fade: u32,
@@ -2017,13 +2031,20 @@ mod tests {
             check!(t, !failed || level == 0, "lit after a failed check");
             let moved = level.abs_diff(level_before);
             let click = event == Some(Event::Click(1));
+            let held = event
+                == Some(Event::Hold {
+                    clicks: 0,
+                    ticks: 0,
+                });
             if level_before == 0 && level > 0 {
-                check!(t, click, "on without a click: {event:?}");
+                check!(t, click || held, "on without a click or a hold: {event:?}");
                 check!(t, health_before == Health::Good, "{health_before:?}");
                 check!(t, health == Health::Good, "{health:?}");
                 check!(t, vddio2, "lit with VDDIO2 missing");
-                check!(t, level <= ON_LEVEL, "on at {level}");
+                let most = if held { ui::FLOOR } else { ON_LEVEL };
+                check!(t, level <= most, "on at {level}");
                 seen.turned_on += 1;
+                seen.lit_by_a_hold += u32::from(held);
             } else if level_before > 0 && level == 0 {
                 check!(
                     t,
@@ -2250,6 +2271,7 @@ mod tests {
             ("white", seen.white),
             ("missing a result", seen.results_lost),
             ("turned on", seen.turned_on),
+            ("lit by a hold", seen.lit_by_a_hold),
             ("gone flat", seen.went_flat),
             ("collapsed", seen.collapsed),
             ("collapsed in a fault's fade", seen.collapsed_mid_fade),

@@ -140,9 +140,9 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** Dirt, a pressed-in tail cap or a jammed button.
 
-**Cover.** `ui::Ui` bounds every hold. Off or locked, a hold does nothing. Lit, 1H stops at `ramp::CEILING` or `ui::FLOOR`.
+**Cover.** `ui::Ui` bounds every hold. Locked, a hold does nothing. Off, 1H lights `ui::FLOOR` and the rest of that hold moves nothing. Lit, 1H stops at `ramp::CEILING` or `ui::FLOOR`.
 
-**Unproven.** Seen, for ordinary holds. A stuck switch is simulator only. It can leave the light on at the level it reached, and keeps the tick at 64 Hz.
+**Unproven.** Seen, for ordinary holds while lit. 1H from off and a stuck switch are simulator only. A stuck switch lights the floor from off or from power-on and stays there, can leave a lit light at the level it reached, and keeps the tick at 64 Hz. What the floor draws is unmeasured.
 
 ### H18. A wrong clock
 
