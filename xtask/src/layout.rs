@@ -259,9 +259,13 @@ mod tests {
     const RESET: u32 = 0x96;
     const HALT_AT: u32 = 0x98;
 
-    fn clear_r1_and_halt() -> [u16; 3] {
-        let [w0, w1] = jmp(HALT_AT);
+    fn clear_r1_and_jump(to: u32) -> [u16; 3] {
+        let [w0, w1] = jmp(to);
         [EOR_R1_R1, w0, w1]
+    }
+
+    fn clear_r1_and_halt() -> [u16; 3] {
+        clear_r1_and_jump(HALT_AT)
     }
 
     fn image_with(table: impl Fn(usize) -> [u16; 2], unhandled: [u16; 3]) -> Vec<u8> {
@@ -327,43 +331,27 @@ mod tests {
 
     #[test]
     fn rejects_a_halt_that_is_not_in_the_code_after_the_table() {
-        let to = |addr| {
-            let [w0, w1] = jmp(addr);
-            [EOR_R1_R1, w0, w1]
-        };
         for bad in [0x10, 0x8C, 0x9A, 0x1000] {
-            let img = image_with(standard, to(bad));
+            let img = image_with(standard, clear_r1_and_jump(bad));
             let err = vectors(&img, RESET, UNHANDLED, bad).unwrap_err();
             assert!(err.contains("hw::halt is at"), "{bad:#x}: {err}");
         }
-        let img = image_with(standard, to(0x90));
+        let img = image_with(standard, clear_r1_and_jump(0x90));
         assert_eq!(vectors(&img, RESET, UNHANDLED, 0x90), Ok(()));
-    }
-
-    #[test]
-    fn accepts_an_unhandled_interrupt_that_clears_r1_and_jumps_to_halt() {
-        let img = image_with(standard, clear_r1_and_halt());
-        assert_eq!(word(&img, UNHANDLED as usize), Some(EOR_R1_R1));
-        assert_eq!(jmp_target(&img, UNHANDLED as usize + 2), Some(HALT_AT));
-        assert_eq!(vectors(&img, RESET, UNHANDLED, HALT_AT), Ok(()));
     }
 
     #[test]
     fn rejects_an_unhandled_interrupt_that_doesnt_clear_r1_and_jump() {
         let [_, w0, w1] = clear_r1_and_halt();
-        let to = |addr| {
-            let [w0, w1] = jmp(addr);
-            [EOR_R1_R1, w0, w1]
-        };
         let cases = [
             ([RETI, NOP, NOP], "eor r1, r1"),
             ([NOP, w0, w1], "eor r1, r1"),
             ([0x2400, w0, w1], "eor r1, r1"), // eor r0, r0
             ([EOR_R1_R1, RETI, NOP], "doesn't `jmp`"),
             ([EOR_R1_R1, 0x940E, w1], "doesn't `jmp`"), // call, not jmp
-            (to(RESET), "hw::halt is at"),
-            (to(0x10), "hw::halt is at"),
-            (to(0x1000), "hw::halt is at"),
+            (clear_r1_and_jump(RESET), "hw::halt is at"),
+            (clear_r1_and_jump(0x10), "hw::halt is at"),
+            (clear_r1_and_jump(0x1000), "hw::halt is at"),
         ];
         for (unhandled, expected) in cases {
             let img = image_with(standard, unhandled);
