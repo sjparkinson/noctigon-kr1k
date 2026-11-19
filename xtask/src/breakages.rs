@@ -487,7 +487,8 @@ const BREAKAGES: &[Breakage] = &[
 ];
 
 pub fn run(root: &Path, names: &[&str]) -> Result<(), String> {
-    let chosen = choose(names)?;
+    let mut chosen = choose(names)?;
+    chosen.sort_by_key(|b| in_library(b.file));
     let copy = Scratch::of(root)?;
     let started = Instant::now();
 
@@ -548,6 +549,10 @@ fn choose(names: &[&str]) -> Result<Vec<&'static Breakage>, String> {
         .iter()
         .filter(|b| names.is_empty() || names.contains(&b.name))
         .collect())
+}
+
+fn in_library(file: &str) -> bool {
+    file != MAIN && file != HW
 }
 
 fn substitute(source: &str, find: &str, replace: &str) -> Result<String, String> {
