@@ -44,33 +44,41 @@ impl Debounce {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Gesture {
+    #[default]
+    Idle,
+    Down {
+        clicks: u8,
+        ticks: u16,
+    },
+    Up {
+        clicks: u8,
+        ticks: u16,
+    },
+    Spent {
+        up: u16,
+    },
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Clicks {
-    pressed: bool,
-    spent: bool,
-    count: u8,
-    ticks: u16,
+    gesture: Gesture,
 }
 
 impl Clicks {
     pub const fn new() -> Self {
         Self {
-            pressed: false,
-            spent: false,
-            count: 0,
-            ticks: 0,
+            gesture: Gesture::Idle,
         }
     }
 
     pub const fn idle(&self) -> bool {
-        !self.pressed && self.count == 0
+        matches!(self.gesture, Gesture::Idle)
     }
 
-    /// Only for when it's [idle](Self::idle), where the count of ticks is all
-    /// a released sample changes, bar ending a spent gesture.
-    pub const fn wait(&mut self, ticks: u16) {
-        self.ticks = self.ticks.saturating_add(ticks);
-        self.spent &= self.ticks < RELEASE_TICKS;
+    pub const fn counting(&self) -> bool {
+        matches!(self.gesture, Gesture::Down { .. } | Gesture::Up { .. })
     }
 
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
@@ -80,44 +88,60 @@ impl Clicks {
     /// With `Some(most)`, the click that makes it `most` counts as it's let go,
     /// and nothing after it counts until the switch has been up for `RELEASE_TICKS`.
     pub fn tick_up_to(&mut self, pressed: bool, most: Option<u8>) -> Option<Event> {
-        self.ticks = self.ticks.saturating_add(1);
-
-        match (self.pressed, pressed) {
-            (false, true) => {
-                self.pressed = true;
-                self.ticks = 0;
+        match (&mut self.gesture, pressed) {
+            (Gesture::Idle, false) => None,
+            (Gesture::Idle, true) => {
+                self.gesture = Gesture::Down {
+                    clicks: 0,
+                    ticks: 0,
+                };
                 None
             }
-            (true, true) if self.spent => None,
-            (true, true) => self.ticks.checked_sub(HOLD_TICKS).map(|ticks| Event::Hold {
-                clicks: self.count,
-                ticks,
-            }),
-            (true, false) => {
-                let held = self.ticks > HOLD_TICKS;
-                self.pressed = false;
-                self.ticks = 0;
-                if self.spent {
-                    None
-                } else if held {
-                    Some(Event::Release {
-                        clicks: core::mem::take(&mut self.count),
-                    })
+            (Gesture::Down { clicks, ticks }, true) => {
+                *ticks = ticks.saturating_add(1);
+                let clicks = *clicks;
+                ticks
+                    .checked_sub(HOLD_TICKS)
+                    .map(|ticks| Event::Hold { clicks, ticks })
+            }
+            (&mut Gesture::Down { clicks, ticks }, false) if ticks >= HOLD_TICKS => {
+                self.gesture = Gesture::Idle;
+                Some(Event::Release { clicks })
+            }
+            (&mut Gesture::Down { clicks, .. }, false) => {
+                let clicks = clicks.saturating_add(1);
+                if most.is_some_and(|most| clicks >= most) {
+                    self.gesture = Gesture::Spent { up: 1 };
+                    Some(Event::Click(clicks))
                 } else {
-                    self.count = self.count.saturating_add(1);
-                    self.spent = most.is_some_and(|most| self.count >= most);
-                    self.spent
-                        .then(|| Event::Click(core::mem::take(&mut self.count)))
+                    self.gesture = Gesture::Up { clicks, ticks: 1 };
+                    None
                 }
             }
-            (false, false) if self.spent => {
-                self.spent = self.ticks < RELEASE_TICKS;
+            (&mut Gesture::Up { clicks, .. }, true) => {
+                self.gesture = Gesture::Down { clicks, ticks: 0 };
                 None
             }
-            (false, false) if self.count > 0 && self.ticks >= RELEASE_TICKS => {
-                Some(Event::Click(core::mem::take(&mut self.count)))
+            (&mut Gesture::Up { clicks, ticks }, false) if ticks >= RELEASE_TICKS => {
+                self.gesture = Gesture::Idle;
+                Some(Event::Click(clicks))
             }
-            (false, false) => None,
+            (Gesture::Up { ticks, .. }, false) => {
+                *ticks = ticks.saturating_add(1);
+                None
+            }
+            (Gesture::Spent { up }, true) => {
+                *up = 0;
+                None
+            }
+            (&mut Gesture::Spent { up }, false) if up >= RELEASE_TICKS => {
+                self.gesture = Gesture::Idle;
+                None
+            }
+            (Gesture::Spent { up }, false) => {
+                *up = up.saturating_add(1);
+                None
+            }
         }
     }
 }
@@ -298,10 +322,11 @@ mod tests {
                 clicks.tick_up_to(false, Some(most)),
                 Some(Event::Click(most))
             );
-            assert!(clicks.idle());
+            assert!(!clicks.idle() && !clicks.counting());
             for _ in 0..2 * RELEASE_TICKS {
                 assert_eq!(clicks.tick_up_to(false, Some(most)), None);
             }
+            assert!(clicks.idle());
         }
     }
 
@@ -365,17 +390,6 @@ mod tests {
                 "{up} samples up"
             );
         }
-    }
-
-    #[test]
-    fn a_wait_ends_what_is_left_of_the_gesture() {
-        let mut clicks = Clicks::new();
-        clicks.tick_up_to(true, Some(1));
-        clicks.tick_up_to(false, Some(1));
-        assert!(clicks.idle());
-        clicks.wait(RELEASE_TICKS);
-        clicks.tick_up_to(true, Some(1));
-        assert_eq!(clicks.tick_up_to(false, Some(1)), Some(Event::Click(1)));
     }
 
     #[test]
@@ -455,14 +469,15 @@ mod tests {
 
     /// The decoder worked out from whole runs of the switch being down or up
     /// rather than a sample at a time. The runs must alternate.
-    fn model(runs: &[(bool, u16)]) -> Vec<Expected> {
+    fn model(runs: &[(bool, u16)], most: Option<u8>) -> Vec<Expected> {
         let mut expected = Vec::new();
         let mut waiting = 0u8;
         let mut after_hold = false;
+        let mut spent = false;
         for (index, &(pressed, len)) in runs.iter().enumerate() {
             if pressed {
                 for sample in 0..len {
-                    let event = (sample >= HOLD_TICKS).then(|| Event::Hold {
+                    let event = (!spent && sample >= HOLD_TICKS).then(|| Event::Hold {
                         clicks: waiting,
                         ticks: sample - HOLD_TICKS,
                     });
@@ -472,13 +487,15 @@ mod tests {
                 continue;
             }
             let mut event_at = None;
-            if index > 0 && len > 0 {
+            if index > 0 && len > 0 && !spent {
                 if after_hold {
                     event_at = Some((0, Event::Release { clicks: waiting }));
                     waiting = 0;
                 } else {
                     waiting = waiting.saturating_add(1);
-                    event_at = Some((RELEASE_TICKS, Event::Click(waiting)));
+                    spent = most.is_some_and(|most| waiting >= most);
+                    let at = if spent { 0 } else { RELEASE_TICKS };
+                    event_at = Some((at, Event::Click(waiting)));
                 }
             }
             for sample in 0..len {
@@ -488,14 +505,17 @@ mod tests {
                 if matches!(event, Some(Event::Click(_))) {
                     waiting = 0;
                 }
-                expected.push((event, waiting == 0));
+                spent &= sample < RELEASE_TICKS;
+                expected.push((event, waiting == 0 && !spent));
             }
         }
         expected
     }
 
-    fn check(runs: &[(bool, u16)]) -> usize {
-        let expected = model(runs);
+    const MOSTS: [Option<u8>; 4] = [None, Some(1), Some(2), Some(3)];
+
+    fn check(runs: &[(bool, u16)], most: Option<u8>) -> usize {
+        let expected = model(runs, most);
         let samples = runs
             .iter()
             .flat_map(|&(pressed, len)| (0..len).map(move |_| pressed));
@@ -503,8 +523,16 @@ mod tests {
         assert!(clicks.idle());
         let mut ticks = 0;
         for (tick, (pressed, &(event, idle))) in samples.zip(&expected).enumerate() {
-            assert_eq!(clicks.tick(pressed), event, "tick {tick} of {runs:?}");
-            assert_eq!(clicks.idle(), idle, "idle after tick {tick} of {runs:?}");
+            assert_eq!(
+                clicks.tick_up_to(pressed, most),
+                event,
+                "tick {tick} of {runs:?} up to {most:?}"
+            );
+            assert_eq!(
+                clicks.idle(),
+                idle,
+                "idle after tick {tick} of {runs:?} up to {most:?}"
+            );
             ticks = tick + 1;
         }
         assert_eq!(ticks, expected.len(), "{runs:?}");
@@ -513,16 +541,33 @@ mod tests {
 
     #[test]
     fn the_model_agrees_with_the_examples() {
+        let spent = model(
+            &[
+                (true, 2),
+                (false, 3),
+                (true, HOLD_TICKS + 2),
+                (false, RELEASE_TICKS + 2),
+            ],
+            Some(1),
+        );
+        let mut expected = std::vec![(None, false); spent.len()];
+        expected[2].0 = Some(Event::Click(1));
+        expected[spent.len() - 2..].fill((None, true));
+        assert_eq!(spent, expected);
+
         let hold = |clicks, ticks| Some(Event::Hold { clicks, ticks });
-        let expected = model(&[
-            (false, 2),
-            (true, 1),
-            (false, 2),
-            (true, HOLD_TICKS + 2),
-            (false, 3),
-            (true, 2),
-            (false, RELEASE_TICKS + 2),
-        ]);
+        let expected = model(
+            &[
+                (false, 2),
+                (true, 1),
+                (false, 2),
+                (true, HOLD_TICKS + 2),
+                (false, 3),
+                (true, 2),
+                (false, RELEASE_TICKS + 2),
+            ],
+            None,
+        );
         let events: Vec<(usize, Event, bool)> = expected
             .iter()
             .enumerate()
@@ -579,7 +624,9 @@ mod tests {
                     *run = (pressed, lengths[digits % 6]);
                     digits /= 6;
                 }
-                check(&runs);
+                for most in MOSTS {
+                    check(&runs, most);
+                }
                 scripts += 1;
             }
         }
@@ -598,7 +645,9 @@ mod tests {
                     _ => runs.push((pressed, 1)),
                 }
             }
-            assert_eq!(check(&runs), usize::from(SAMPLES));
+            for most in MOSTS {
+                assert_eq!(check(&runs, most), usize::from(SAMPLES));
+            }
         }
     }
 
@@ -607,12 +656,17 @@ mod tests {
         for first in 1..=HOLD_TICKS + 6 {
             for gap in 1..=RELEASE_TICKS + 6 {
                 for second in 1..=HOLD_TICKS + 6 {
-                    check(&[
-                        (true, first),
-                        (false, gap),
-                        (true, second),
-                        (false, RELEASE_TICKS + 2),
-                    ]);
+                    for most in MOSTS {
+                        check(
+                            &[
+                                (true, first),
+                                (false, gap),
+                                (true, second),
+                                (false, RELEASE_TICKS + 2),
+                            ],
+                            most,
+                        );
+                    }
                 }
             }
         }
