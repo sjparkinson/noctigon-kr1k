@@ -47,6 +47,7 @@ impl Debounce {
 #[derive(Clone, Debug, Default)]
 pub struct Clicks {
     pressed: bool,
+    spent: bool,
     count: u8,
     ticks: u16,
 }
@@ -55,6 +56,7 @@ impl Clicks {
     pub const fn new() -> Self {
         Self {
             pressed: false,
+            spent: false,
             count: 0,
             ticks: 0,
         }
@@ -65,16 +67,18 @@ impl Clicks {
     }
 
     /// Only for when it's [idle](Self::idle), where the count of ticks is all
-    /// a released sample changes.
+    /// a released sample changes, bar ending a spent gesture.
     pub const fn wait(&mut self, ticks: u16) {
         self.ticks = self.ticks.saturating_add(ticks);
+        self.spent &= self.ticks < RELEASE_TICKS;
     }
 
     pub fn tick(&mut self, pressed: bool) -> Option<Event> {
         self.tick_up_to(pressed, None)
     }
 
-    /// With `Some(most)`, the click that makes it `most` counts as it's let go.
+    /// With `Some(most)`, the click that makes it `most` counts as it's let go,
+    /// and nothing after it counts until the switch has been up for `RELEASE_TICKS`.
     pub fn tick_up_to(&mut self, pressed: bool, most: Option<u8>) -> Option<Event> {
         self.ticks = self.ticks.saturating_add(1);
 
@@ -84,6 +88,7 @@ impl Clicks {
                 self.ticks = 0;
                 None
             }
+            (true, true) if self.spent => None,
             (true, true) => self.ticks.checked_sub(HOLD_TICKS).map(|ticks| Event::Hold {
                 clicks: self.count,
                 ticks,
@@ -92,15 +97,22 @@ impl Clicks {
                 let held = self.ticks > HOLD_TICKS;
                 self.pressed = false;
                 self.ticks = 0;
-                if held {
+                if self.spent {
+                    None
+                } else if held {
                     Some(Event::Release {
                         clicks: core::mem::take(&mut self.count),
                     })
                 } else {
                     self.count = self.count.saturating_add(1);
-                    let enough = most.is_some_and(|most| self.count >= most);
-                    enough.then(|| Event::Click(core::mem::take(&mut self.count)))
+                    self.spent = most.is_some_and(|most| self.count >= most);
+                    self.spent
+                        .then(|| Event::Click(core::mem::take(&mut self.count)))
                 }
+            }
+            (false, false) if self.spent => {
+                self.spent = self.ticks < RELEASE_TICKS;
+                None
             }
             (false, false) if self.count > 0 && self.ticks >= RELEASE_TICKS => {
                 Some(Event::Click(core::mem::take(&mut self.count)))
@@ -303,6 +315,79 @@ mod tests {
                 assert_eq!(clicks.tick_up_to(false, Some(most)), None);
             }
         }
+    }
+
+    #[test]
+    fn nothing_counts_after_the_click_that_reached_most_until_the_switch_is_left_alone() {
+        for pattern in 0..=u16::MAX {
+            let mut clicks = Clicks::new();
+            clicks.tick_up_to(true, Some(1));
+            assert_eq!(clicks.tick_up_to(false, Some(1)), Some(Event::Click(1)));
+            let mut up = 1;
+            for bit in 0..16 {
+                if up > RELEASE_TICKS {
+                    break;
+                }
+                let pressed = pattern >> bit & 1 == 1;
+                assert_eq!(
+                    clicks.tick_up_to(pressed, Some(1)),
+                    None,
+                    "sample {bit} of {pattern:#018b}"
+                );
+                up = if pressed { 0 } else { up + 1 };
+            }
+        }
+    }
+
+    #[test]
+    fn a_hold_straight_after_the_click_that_reached_most_does_nothing() {
+        let mut clicks = Clicks::new();
+        clicks.tick_up_to(true, Some(1));
+        assert_eq!(clicks.tick_up_to(false, Some(1)), Some(Event::Click(1)));
+        for _ in 0..3 * HOLD_TICKS {
+            assert_eq!(clicks.tick_up_to(true, Some(3)), None);
+        }
+        for _ in 0..=RELEASE_TICKS {
+            assert_eq!(clicks.tick_up_to(false, Some(3)), None);
+        }
+        for _ in 0..HOLD_TICKS {
+            assert_eq!(clicks.tick_up_to(true, Some(3)), None);
+        }
+        assert_eq!(
+            clicks.tick_up_to(true, Some(3)),
+            Some(Event::Hold {
+                clicks: 0,
+                ticks: 0
+            })
+        );
+    }
+
+    #[test]
+    fn a_click_counts_again_once_the_switch_has_been_up_for_the_release_timeout() {
+        for (up, counts) in [(RELEASE_TICKS, false), (RELEASE_TICKS + 1, true)] {
+            let mut clicks = Clicks::new();
+            clicks.tick_up_to(true, Some(1));
+            for _ in 0..up {
+                clicks.tick_up_to(false, Some(1));
+            }
+            clicks.tick_up_to(true, Some(1));
+            assert_eq!(
+                clicks.tick_up_to(false, Some(1)),
+                counts.then_some(Event::Click(1)),
+                "{up} samples up"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wait_ends_what_is_left_of_the_gesture() {
+        let mut clicks = Clicks::new();
+        clicks.tick_up_to(true, Some(1));
+        clicks.tick_up_to(false, Some(1));
+        assert!(clicks.idle());
+        clicks.wait(RELEASE_TICKS);
+        clicks.tick_up_to(true, Some(1));
+        assert_eq!(clicks.tick_up_to(false, Some(1)), Some(Event::Click(1)));
     }
 
     #[test]

@@ -67,7 +67,7 @@ impl Ui {
     }
 
     /// Lockout has no limit on purpose, so a fourth press in a pocket makes a
-    /// 4C, which does nothing, rather than 3C to unlock and 1C to light.
+    /// 4C, which does nothing, rather than a 3C that unlocks it.
     pub const fn most_clicks(&self) -> Option<u8> {
         match self.mode {
             Mode::On => Some(1),
