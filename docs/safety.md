@@ -142,7 +142,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Cover.** `ui::Ui` bounds every hold. Locked, a hold does nothing. Off, 1H lights `ui::FLOOR` and the rest of that hold moves nothing. Lit, 1H stops at `ramp::CEILING` or `ui::FLOOR`.
 
-**Unproven.** Seen, for ordinary holds while lit. 1H from off and a stuck switch are simulator only. A stuck switch lights the floor from off or from power-on and stays there, can leave a lit light at the level it reached, and keeps the tick at 64 Hz. What the floor draws is unmeasured.
+**Unproven.** Seen, for ordinary holds while lit. 1H from off and a stuck switch are simulator only. A stuck switch lights the floor from off or from power-on and stays there, does nothing if it sticks within `button::RELEASE_TICKS` of a click that acted, can leave a lit light at the level it reached, and keeps the tick at 64 Hz. What the floor draws is unmeasured.
 
 ### H18. A wrong clock
 
@@ -160,6 +160,14 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Unproven.** Seen with a working bus only. A dead bus is simulator only, and this board's pull-ups are unmeasured.
 
+### H20. A press read as more than one
+
+**Hazard.** A switch that chatters, or that actuates twice on one press. Lit, a 1C then reads as off and on again, at `ui::ON_LEVEL` whatever the level was.
+
+**Cover.** `button::Debounce` counts a change of the switch once two samples in a row show it. After a click that acts as it's let go, `button::Clicks` ignores the switch until it has been up for `button::RELEASE_TICKS`.
+
+**Unproven.** Simulator only. Seen without the cover, at `ui::FLOOR` on 2026-11-18, and not reproduced since, so which of the two it was is unknown. How long this switch bounces is unmeasured, and chatter longer than a sample can still end a hold or split a click from off into two. The first two samples after a switch wake can be less than a tick apart, so a short glitch at rest can still count as a press.
+
 ## What's left
 
 - Nobody knows what holds PC1 low through reset and in programming mode (H1, H12).
@@ -168,3 +176,4 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 - No fault, watchdog reset or tick deadline has been seen on the chip (H4, H9, H14, H15).
 - `restore` has never run on this torch (H11).
 - Nothing limits how long a lit light stays lit (H8, H17).
+- The switch's bounce is unmeasured, and the misread press hasn't been reproduced (H20).
