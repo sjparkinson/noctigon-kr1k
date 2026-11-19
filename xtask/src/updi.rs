@@ -81,6 +81,16 @@ pub fn fits_flash(data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+pub fn fits_eeprom(data: &[u8]) -> Result<()> {
+    if data.len() > map::EEPROM_SIZE {
+        return Err(format!(
+            "the EEPROM image is bigger than {} bytes",
+            map::EEPROM_SIZE
+        ));
+    }
+    Ok(())
+}
+
 const SYNC: u8 = 0x55;
 const ACK: u8 = 0x40;
 
@@ -352,13 +362,7 @@ impl<W: Wire> Programmer<W> {
 
     /// A word only lands on a page this call erased (DS §11.3.2.3.1).
     pub fn erase_and_write_flash(&mut self, data: &[u8]) -> Result<()> {
-        if data.len() > map::FLASH_SIZE {
-            return Err(format!(
-                "the image is {} bytes; the AVR32DD20 has {}",
-                data.len(),
-                map::FLASH_SIZE
-            ));
-        }
+        fits_flash(data)?;
         self.chip_erase()?;
         for (i, chunk) in data.chunks(map::FLASH_PAGE).enumerate() {
             if chunk.iter().all(|&b| b == 0xFF) {
@@ -405,12 +409,7 @@ impl<W: Wire> Programmer<W> {
     /// Fuse programming "is identical to the EEPROM programming" (DS
     /// §11.3.2.2), so this must only ever store inside EEPROM.
     pub fn write_eeprom(&mut self, data: &[u8]) -> Result<()> {
-        if data.len() > map::EEPROM_SIZE {
-            return Err(format!(
-                "the EEPROM image is bigger than {} bytes",
-                map::EEPROM_SIZE
-            ));
-        }
+        fits_eeprom(data)?;
         self.wait_nvm()?;
         self.nvm_command(NVM_EEPROM_ERASE_WRITE)?;
         let written = data.iter().enumerate().try_for_each(|(i, &byte)| {
