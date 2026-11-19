@@ -1424,7 +1424,7 @@ impl Sim {
                     self.chip.forced = None;
                     self.forced = Some(vector);
                 }
-                self.chip.interrupted = self.chip.temps_in_use();
+                self.chip.interrupted = self.chip.temp.in_use();
                 self.handler_steps = 0;
                 self.landed_on = Some(Landed {
                     r: self.cpu.r,
@@ -1459,9 +1459,7 @@ impl Sim {
     const fn abandon(&mut self) {
         self.abandoned = true;
         self.chip.interrupted = 0;
-        self.chip.tcb.temp = None;
-        self.chip.dac.temp = None;
-        self.chip.adc.temp = None;
+        self.chip.temp.clear();
         self.landed_on = None;
     }
 
@@ -1659,13 +1657,11 @@ struct Adc {
     last_setup: Option<(u8, u8)>,
     result: u16,
     ready_at: Option<u64>,
-    temp: Option<u8>,
 }
 
 #[derive(Default)]
 struct Dac {
     code: u16,
-    temp: Option<u8>,
     /// Meaningless while `code` isn't 0.
     zero_since: u64,
 }
@@ -1674,7 +1670,6 @@ struct Dac {
 struct Tcb {
     ccmp: u16,
     cnt: u16,
-    temp: Option<(usize, u8)>,
     capt: bool,
     capt_up_at: u64,
     next_capt: u64,
@@ -1687,10 +1682,58 @@ impl Tcb {
     }
 }
 
-/// Bits of `Chip::interrupted`.
-const TEMP_TCB0: u8 = 1 << 0;
-const TEMP_DAC0: u8 = 1 << 1;
-const TEMP_ADC0: u8 = 1 << 2;
+/// Bits of `Chip::interrupted`, by position.
+#[derive(Clone, Copy)]
+enum Wide {
+    Tcb0,
+    Dac0,
+    Adc0,
+}
+
+#[derive(Default)]
+struct Temp([Option<(usize, u8)>; 3]);
+
+impl Temp {
+    const fn latch(&mut self, wide: Wide, low: usize, byte: u8) {
+        self.0[wide as usize] = Some((low, byte));
+    }
+
+    fn low(&mut self, wide: Wide, a: usize, value: u8) -> Result<(), String> {
+        if let Some((waiting, _)) = self.0[wide as usize] {
+            return Err(format!(
+                "writes the low byte of {} while {}'s is still waiting for its high byte",
+                name(a),
+                name(waiting)
+            ));
+        }
+        self.latch(wide, a, value);
+        Ok(())
+    }
+
+    fn take(&mut self, wide: Wide, high: usize) -> Option<u8> {
+        let (low, byte) = self.0[wide as usize].take()?;
+        (low + 1 == high).then_some(byte)
+    }
+
+    fn high(&mut self, wide: Wide, a: usize, value: u8) -> Result<u16, String> {
+        let lo = self.take(wide, a).ok_or_else(|| {
+            format!(
+                "writes the high byte of {} without its low byte just before, so the chip \
+                 pairs it with whatever TEMP held",
+                name(a - 1)
+            )
+        })?;
+        Ok(u16::from_le_bytes([lo, value]))
+    }
+
+    fn in_use(&self) -> u8 {
+        (0..3).fold(0, |bits, n| bits | u8::from(self.0[n].is_some()) << n)
+    }
+
+    const fn clear(&mut self) {
+        self.0 = [None; 3];
+    }
+}
 
 struct Chip {
     flash: Vec<u8>,
@@ -1743,6 +1786,7 @@ struct Chip {
     enabled: u64,
     forced: Option<u8>,
     in_handler: bool,
+    temp: Temp,
     interrupted: u8,
     pc1_rose_at: u64,
     vref_changed_at: u64,
@@ -1804,6 +1848,7 @@ impl Chip {
             enabled: 0,
             forced: None,
             in_handler: false,
+            temp: Temp::default(),
             interrupted: 0,
             pc1_rose_at: 0,
             vref_changed_at: 0,
@@ -2300,22 +2345,6 @@ impl Chip {
         self.enabled = self.interrupts(true);
     }
 
-    const fn temps_in_use(&self) -> u8 {
-        (if self.tcb.temp.is_some() {
-            TEMP_TCB0
-        } else {
-            0
-        }) | (if self.dac.temp.is_some() {
-            TEMP_DAC0
-        } else {
-            0
-        }) | (if self.adc.temp.is_some() {
-            TEMP_ADC0
-        } else {
-            0
-        })
-    }
-
     fn ready_for_power_down(&self) -> Result<(), String> {
         if self.enabled_high() {
             return Err(
@@ -2672,12 +2701,12 @@ impl Chip {
 
     fn temp_undisturbed(&self, a: usize) -> Result<(), String> {
         let wide = [
-            (TEMP_TCB0, reg::TCB0_CNT..reg::TCB0_CCMP + 2, "TCB0"),
-            (TEMP_DAC0, reg::DAC0_DATA..reg::DAC0_DATA + 2, "DAC0"),
-            (TEMP_ADC0, reg::ADC0_RES..reg::ADC0_RES + 2, "ADC0"),
+            (Wide::Tcb0, reg::TCB0_CNT..reg::TCB0_CCMP + 2, "TCB0"),
+            (Wide::Dac0, reg::DAC0_DATA..reg::DAC0_DATA + 2, "DAC0"),
+            (Wide::Adc0, reg::ADC0_RES..reg::ADC0_RES + 2, "ADC0"),
         ];
-        for (bit, range, peripheral) in wide {
-            if self.interrupted & bit != 0 && range.contains(&a) {
+        for (wide, range, peripheral) in wide {
+            if self.interrupted & 1 << wide as u8 != 0 && range.contains(&a) {
                 return Err(format!(
                     "a handler touches {} with the main loop halfway through one of \
                      {peripheral}'s 16-bit registers, and they share its TEMP byte, so one \
@@ -2993,10 +3022,10 @@ impl Bus for Chip {
                 }
                 self.adc.ready_at = None;
                 let [lo, hi] = self.adc.result.to_le_bytes();
-                self.adc.temp = Some(hi);
+                self.temp.latch(Wide::Adc0, a, hi);
                 Ok(lo)
             }
-            _ if a == reg::ADC0_RES + 1 => self.adc.temp.take().ok_or_else(|| {
+            _ if a == reg::ADC0_RES + 1 => self.temp.take(Wide::Adc0, a).ok_or_else(|| {
                 "reads ADC0.RES's high byte without its low byte just before, so it gets \
                  whatever ADC0.TEMP held"
                     .into()
@@ -3115,19 +3144,13 @@ impl Bus for Chip {
                          (section 34.5.2) and get written 0 (section 8.10)"
                     ));
                 }
-                if self.dac.temp.is_some() {
-                    return Err(
-                        "writes DAC0.DATAL while the last DATAL is still waiting for DATAH".into(),
-                    );
-                }
-                self.dac.temp = Some(value);
+                self.temp.low(Wide::Dac0, a, value).map_err(
+                    |_| "writes DAC0.DATAL while the last DATAL is still waiting for DATAH",
+                )?;
             }
             _ if a == reg::DAC0_DATA + 1 => {
-                let lo = self.dac.temp.take().ok_or(
-                    "writes the high byte of DAC0.DATA without its low byte just before, so the \
-                     chip pairs it with whatever TEMP held",
-                )?;
-                self.set_dac(u16::from_le_bytes([lo, value]) >> DAC_SHIFT)?;
+                let data = self.temp.high(Wide::Dac0, a, value)?;
+                self.set_dac(data >> DAC_SHIFT)?;
             }
             reg::TCB0_CTRLA => self.write_tcb_ctrla(value)?,
             reg::TCB0_CTRLB => {
@@ -3164,28 +3187,11 @@ impl Bus for Chip {
                     self.tcb.capt = false;
                 }
             }
-            reg::TCB0_CNT | reg::TCB0_CCMP => {
-                if let Some((pending, _)) = self.tcb.temp {
-                    return Err(format!(
-                        "writes the low byte of {} while {}'s is still waiting for its high byte",
-                        name(a),
-                        name(pending)
-                    ));
-                }
-                self.tcb.temp = Some((a, value));
+            reg::TCB0_CNT | reg::TCB0_CCMP => self.temp.low(Wide::Tcb0, a, value)?,
+            _ if a == reg::TCB0_CNT + 1 || a == reg::TCB0_CCMP + 1 => {
+                let count = self.temp.high(Wide::Tcb0, a, value)?;
+                self.tcb_written(a - 1, count)?;
             }
-            _ if a == reg::TCB0_CNT + 1 || a == reg::TCB0_CCMP + 1 => match self.tcb.temp.take() {
-                Some((low, lo)) if low == a - 1 => {
-                    self.tcb_written(low, u16::from_le_bytes([lo, value]))?;
-                }
-                _ => {
-                    return Err(format!(
-                        "writes the high byte of {} without its low byte just before, so \
-                             the chip pairs it with whatever TEMP held",
-                        name(a - 1)
-                    ));
-                }
-            },
             reg::RTC_PITINTCTRL => {
                 self.io[a] = value;
                 self.update_enabled();
@@ -3450,7 +3456,7 @@ mod tests {
         let mut chip = dark();
         let err = dac(&mut chip, 1).unwrap_err();
         assert!(err.contains("with PC1 low"), "{err}");
-        chip.dac.temp = None;
+        chip.temp.clear();
         tcb_on(&mut chip);
         poke(&mut chip, reg::VPORTC_OUT, ENABLE).unwrap();
         wait(&mut chip, BOOST_START_CYCLES - 1);
@@ -3471,7 +3477,7 @@ mod tests {
         wait(&mut chip, VREF_SETTLE_CYCLES - 1);
         let err = dac(&mut chip, 5).unwrap_err();
         assert!(err.contains("after its reference changed"), "{err}");
-        chip.dac.temp = None;
+        chip.temp.clear();
         wait(&mut chip, 1);
         dac(&mut chip, 5).unwrap();
     }
@@ -4461,13 +4467,13 @@ mod tests {
     fn a_handler_cant_touch_a_peripheral_whose_temp_the_main_loop_is_using() {
         let mut chip = lit();
         poke(&mut chip, reg::DAC0_DATA, 0).unwrap();
-        chip.interrupted = chip.temps_in_use();
+        chip.interrupted = chip.temp.in_use();
         let err = refused(&mut chip, reg::DAC0_DATA, 0);
         assert!(err.contains("share its TEMP"), "{err}");
         poke(&mut chip, reg::TCB0_INTFLAGS, TCB_CAPT).unwrap();
         wide(&mut chip, reg::TCB0_CNT, 0).unwrap();
-        chip.tcb.temp = None;
-        chip.interrupted = TEMP_TCB0;
+        chip.temp.clear();
+        chip.interrupted = 1 << Wide::Tcb0 as u8;
         let err = refused(&mut chip, reg::TCB0_CNT, 0);
         assert!(err.contains("TCB0's 16-bit"), "{err}");
     }
@@ -4577,7 +4583,7 @@ mod tests {
     fn a_handler_in_halt_may_overwrite_temp_and_no_other_may() {
         let run = |halt: u32| {
             let mut sim = forced(halt);
-            sim.chip.dac.temp = Some(0x40);
+            sim.chip.temp.latch(Wide::Dac0, reg::DAC0_DATA, 0x40);
             sim.chip.force_interrupt(15);
             for _ in 0..3 {
                 sim.step()?;
@@ -4593,7 +4599,7 @@ mod tests {
         let sim = run(SLOT_15).unwrap();
         assert!(sim.abandoned);
         assert_eq!(sim.chip.dac.code, 0);
-        assert_eq!(sim.chip.dac.temp, None);
+        assert_eq!(sim.chip.temp.in_use(), 0);
     }
 
     fn statics() -> Layout {
