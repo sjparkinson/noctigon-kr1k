@@ -129,21 +129,19 @@ mod tests {
     use super::*;
     use std::vec::Vec;
 
-    fn run(script: &[(bool, u16)]) -> ([Option<Event>; 64], usize) {
+    fn run(script: &[(bool, u16)]) -> Vec<Event> {
         let mut clicks = Clicks::new();
-        let mut events = [None; 64];
-        let mut n = 0;
+        let mut events = Vec::new();
         for &(pressed, ticks) in script {
             for _ in 0..ticks {
-                if let Some(event) = clicks.tick(pressed) {
-                    if n < events.len() {
-                        events[n] = Some(event);
-                    }
-                    n += 1;
-                }
+                events.extend(clicks.tick(pressed));
             }
         }
-        (events, n)
+        events
+    }
+
+    const fn hold(clicks: u8, ticks: u16) -> Event {
+        Event::Hold { clicks, ticks }
     }
 
     #[test]
@@ -203,75 +201,65 @@ mod tests {
 
     #[test]
     fn single_click() {
-        let (events, n) = run(&[(true, 5), (false, RELEASE_TICKS + 5)]);
-        assert_eq!(n, 1);
-        assert_eq!(events[0], Some(Event::Click(1)));
+        assert_eq!(
+            run(&[(true, 5), (false, RELEASE_TICKS + 5)]),
+            [Event::Click(1)]
+        );
     }
 
     #[test]
     fn three_clicks() {
-        let (events, n) = run(&[
-            (true, 4),
-            (false, 6),
-            (true, 4),
-            (false, 6),
-            (true, 4),
-            (false, RELEASE_TICKS + 1),
-        ]);
-        assert_eq!(n, 1);
-        assert_eq!(events[0], Some(Event::Click(3)));
+        assert_eq!(
+            run(&[
+                (true, 4),
+                (false, 6),
+                (true, 4),
+                (false, 6),
+                (true, 4),
+                (false, RELEASE_TICKS + 1),
+            ]),
+            [Event::Click(3)]
+        );
     }
 
     #[test]
     fn nothing_until_the_release_timeout() {
-        let (_, n) = run(&[(true, 4), (false, RELEASE_TICKS - 1)]);
-        assert_eq!(n, 0);
+        assert_eq!(run(&[(true, 4), (false, RELEASE_TICKS - 1)]), []);
     }
 
     #[test]
     fn hold_then_release() {
-        let (events, n) = run(&[(true, HOLD_TICKS + 4), (false, RELEASE_TICKS + 1)]);
-        assert_eq!(n, 4 + 1);
         assert_eq!(
-            events[0],
-            Some(Event::Hold {
-                clicks: 0,
-                ticks: 0
-            })
+            run(&[(true, HOLD_TICKS + 4), (false, RELEASE_TICKS + 1)]),
+            [
+                hold(0, 0),
+                hold(0, 1),
+                hold(0, 2),
+                hold(0, 3),
+                Event::Release { clicks: 0 }
+            ]
         );
-        assert_eq!(
-            events[3],
-            Some(Event::Hold {
-                clicks: 0,
-                ticks: 3
-            })
-        );
-        assert_eq!(events[4], Some(Event::Release { clicks: 0 }));
     }
 
     #[test]
     fn click_then_hold() {
-        let (events, n) = run(&[(true, 4), (false, 6), (true, HOLD_TICKS + 2), (false, 1)]);
-        assert_eq!(n, 3);
         assert_eq!(
-            events[0],
-            Some(Event::Hold {
-                clicks: 1,
-                ticks: 0
-            })
+            run(&[(true, 4), (false, 6), (true, HOLD_TICKS + 2), (false, 1)]),
+            [hold(1, 0), hold(1, 1), Event::Release { clicks: 1 }]
         );
-        assert_eq!(events[2], Some(Event::Release { clicks: 1 }));
     }
 
     #[test]
     fn a_click_after_a_hold_starts_from_zero() {
-        let (events, n) = run(&[
-            (true, HOLD_TICKS + 1),
-            (false, 6),
-            (true, 4),
-            (false, RELEASE_TICKS + 1),
-        ]);
-        assert_eq!(events[n - 1], Some(Event::Click(1)));
+        assert_eq!(
+            run(&[
+                (true, HOLD_TICKS + 1),
+                (false, 6),
+                (true, 4),
+                (false, RELEASE_TICKS + 1),
+            ]),
+            [hold(0, 0), Event::Release { clicks: 0 }, Event::Click(1)]
+        );
     }
 
     #[test]
@@ -411,23 +399,18 @@ mod tests {
 
     #[test]
     fn a_press_let_go_just_before_it_becomes_a_hold_is_a_click() {
-        let (events, n) = run(&[(true, HOLD_TICKS), (false, RELEASE_TICKS + 1)]);
-        assert_eq!(n, 1);
-        assert_eq!(events[0], Some(Event::Click(1)));
+        assert_eq!(
+            run(&[(true, HOLD_TICKS), (false, RELEASE_TICKS + 1)]),
+            [Event::Click(1)]
+        );
     }
 
     #[test]
     fn a_press_let_go_just_after_it_becomes_a_hold_is_a_hold() {
-        let (events, n) = run(&[(true, HOLD_TICKS + 1), (false, RELEASE_TICKS + 1)]);
-        assert_eq!(n, 2);
         assert_eq!(
-            events[0],
-            Some(Event::Hold {
-                clicks: 0,
-                ticks: 0
-            })
+            run(&[(true, HOLD_TICKS + 1), (false, RELEASE_TICKS + 1)]),
+            [hold(0, 0), Event::Release { clicks: 0 }]
         );
-        assert_eq!(events[1], Some(Event::Release { clicks: 0 }));
     }
 
     #[test]
