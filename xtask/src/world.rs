@@ -11,11 +11,6 @@ pub use kr1k::testing::CALIBRATION;
 
 pub const FUSE_BYTES: usize = 9;
 
-/// By offset from FUSE.WDTCFG. An empty name is a reserved byte.
-pub const FUSE_NAMES: [&str; FUSE_BYTES] = [
-    "WDTCFG", "BODCFG", "OSCCFG", "", "", "SYSCFG0", "SYSCFG1", "CODESIZE", "BOOTSIZE",
-];
-
 /// The factory defaults (DS40002413B section 8.8.2).
 pub const FACTORY_FUSES: [u8; FUSE_BYTES] = [0x00, 0x00, 0x00, 0xFF, 0xFF, 0xD0, 0x08, 0x00, 0x00];
 
@@ -40,9 +35,7 @@ impl World {
     /// `None` for a reserved byte, since the datasheet doesn't say how one reads.
     pub fn fuse(&self, addr: usize) -> Option<u8> {
         let offset = addr.checked_sub(usize::from(map::FUSES))?;
-        if FUSE_NAMES.get(offset)?.is_empty() {
-            return None;
-        }
+        reg::NAMES.iter().find(|&&(a, _)| a == addr)?;
         self.fuses.get(offset).copied()
     }
 

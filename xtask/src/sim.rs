@@ -35,7 +35,7 @@ use crate::stamp;
 use crate::switching::RandomSwitching;
 use crate::twi::{Fault, Twi};
 use crate::updi::map;
-use crate::world::{CALIBRATION, FUSE_NAMES, World};
+use crate::world::{CALIBRATION, World};
 
 // Only what the ATDF names goes here, since anything hand-written in
 // src/regs.rs is the firmware's choice.
@@ -2758,14 +2758,10 @@ fn portf(addr: usize) -> bool {
 }
 
 fn vector_name(vector: u8) -> String {
-    match vector {
-        VECTOR_RTC_PIT => format!("RTC_PIT (vector {vector})"),
-        VECTOR_TCB0 => format!("TCB0_INT (vector {vector})"),
-        VECTOR_PORTA => format!("PORTA_PORT (vector {vector})"),
-        VECTOR_PORTC => format!("PORTC_PORT (vector {vector})"),
-        VECTOR_PORTD => format!("PORTD_PORT (vector {vector})"),
-        VECTOR_UNHANDLED => format!("TCB1_INT (vector {vector})"),
-        v => format!("vector {v}"),
+    let named = |&&(v, _): &&(usize, &str)| v == usize::from(vector);
+    match regs::VECTOR_NAMES.iter().find(named) {
+        Some((_, name)) => format!("{name} (vector {vector})"),
+        None => format!("vector {vector}"),
     }
 }
 
@@ -2788,83 +2784,7 @@ fn fuse_or_lock(addr: usize) -> bool {
 }
 
 fn name(addr: usize) -> String {
-    if let Some(fuse) = addr
-        .checked_sub(usize::from(map::FUSES))
-        .and_then(|offset| FUSE_NAMES.get(offset))
-        .filter(|name| !name.is_empty())
-    {
-        return format!("FUSE.{fuse}");
-    }
-    let pins = [
-        (reg::PORTA_PIN0CTRL, "PORTA"),
-        (reg::PORTC_PIN0CTRL, "PORTC"),
-        (reg::PORTD_PIN0CTRL, "PORTD"),
-    ];
-    if let Some((base, port)) = pins
-        .iter()
-        .find(|&&(base, _)| (base..base + 8).contains(&addr))
-    {
-        return format!("{port}.PIN{}CTRL", addr - base);
-    }
-    let known = [
-        (reg::RSTCTRL_RSTFR, "RSTCTRL.RSTFR"),
-        (reg::WDT_CTRLA, "WDT.CTRLA"),
-        (reg::WDT_STATUS, "WDT.STATUS"),
-        (reg::VREF_ADC0REF, "VREF.ADC0REF"),
-        (reg::VREF_DAC0REF, "VREF.DAC0REF"),
-        (reg::CRCSCAN_CTRLA, "CRCSCAN.CTRLA"),
-        (reg::CRCSCAN_CTRLB, "CRCSCAN.CTRLB"),
-        (reg::CRCSCAN_STATUS, "CRCSCAN.STATUS"),
-        (reg::ADC0_CTRLA, "ADC0.CTRLA"),
-        (reg::ADC0_CTRLB, "ADC0.CTRLB"),
-        (reg::ADC0_CTRLC, "ADC0.CTRLC"),
-        (reg::ADC0_CTRLD, "ADC0.CTRLD"),
-        (reg::ADC0_SAMPCTRL, "ADC0.SAMPCTRL"),
-        (reg::ADC0_MUXPOS, "ADC0.MUXPOS"),
-        (reg::ADC0_COMMAND, "ADC0.COMMAND"),
-        (reg::ADC0_INTFLAGS, "ADC0.INTFLAGS"),
-        (reg::ADC0_RES, "ADC0.RESL"),
-        (reg::ADC0_RES + 1, "ADC0.RESH"),
-        (reg::DAC0_CTRLA, "DAC0.CTRLA"),
-        (reg::DAC0_DATA, "DAC0.DATAL"),
-        (reg::DAC0_DATA + 1, "DAC0.DATAH"),
-        (reg::TCB0_CTRLA, "TCB0.CTRLA"),
-        (reg::TCB0_CTRLB, "TCB0.CTRLB"),
-        (reg::TCB0_INTCTRL, "TCB0.INTCTRL"),
-        (reg::TCB0_INTFLAGS, "TCB0.INTFLAGS"),
-        (reg::TCB0_CNT, "TCB0.CNT"),
-        (reg::TCB0_CCMP, "TCB0.CCMP"),
-        (reg::SIGROW_TEMPSENSE0, "SIGROW.TEMPSENSE0"),
-        (reg::SIGROW_TEMPSENSE1, "SIGROW.TEMPSENSE1"),
-        (reg::CPU_CCP, "CPU.CCP"),
-        (reg::GPR_GPR0, "GPR.GPR0"),
-        (reg::GPR_GPR1, "GPR.GPR1"),
-        (reg::VPORTA_DIR, "VPORTA.DIR"),
-        (reg::VPORTA_OUT, "VPORTA.OUT"),
-        (reg::VPORTA_IN, "VPORTA.IN"),
-        (reg::VPORTC_DIR, "VPORTC.DIR"),
-        (reg::VPORTC_OUT, "VPORTC.OUT"),
-        (reg::VPORTD_DIR, "VPORTD.DIR"),
-        (reg::VPORTD_OUT, "VPORTD.OUT"),
-        (reg::VPORTD_IN, "VPORTD.IN"),
-        (reg::VPORTD_INTFLAGS, "VPORTD.INTFLAGS"),
-        (reg::MVIO_STATUS, "MVIO.STATUS"),
-        (reg::SLPCTRL_CTRLA, "SLPCTRL.CTRLA"),
-        (reg::CLKCTRL_OSCHFCTRLA, "CLKCTRL.OSCHFCTRLA"),
-        (reg::CLKCTRL_MCLKCTRLB, "CLKCTRL.MCLKCTRLB"),
-        (reg::RTC_PITCTRLA, "RTC.PITCTRLA"),
-        (reg::RTC_PITSTATUS, "RTC.PITSTATUS"),
-        (reg::RTC_PITINTCTRL, "RTC.PITINTCTRL"),
-        (reg::RTC_PITINTFLAGS, "RTC.PITINTFLAGS"),
-        (reg::TWI0_CTRLA, "TWI0.CTRLA"),
-        (reg::TWI0_MCTRLA, "TWI0.MCTRLA"),
-        (reg::TWI0_MCTRLB, "TWI0.MCTRLB"),
-        (reg::TWI0_MSTATUS, "TWI0.MSTATUS"),
-        (reg::TWI0_MBAUD, "TWI0.MBAUD"),
-        (reg::TWI0_MADDR, "TWI0.MADDR"),
-        (reg::TWI0_MDATA, "TWI0.MDATA"),
-    ];
-    known
+    reg::NAMES
         .iter()
         .find(|&&(a, _)| a == addr)
         .map_or_else(|| format!("{addr:#06x}"), |(_, n)| (*n).to_string())
@@ -5081,5 +5001,15 @@ mod tests {
             err,
             "TCB1_INT (vector 15) has a handler now, so pick another vector to force"
         );
+    }
+
+    #[test]
+    fn an_address_or_a_vector_the_atdf_names_twice_takes_its_first_name() {
+        assert_eq!(name(reg::TCA0_LCNT), "TCA0.CNT");
+        assert_eq!(name(reg::TCA0_HCNT), "TCA0.CNT");
+        let shared = regs::VECTOR_TCA0_OVF as u8;
+        assert_eq!(vector_name(shared), "TCA0_LUNF (vector 9)");
+        assert_eq!(name(reg::FUSE_OSCCFG + 1), "0x1053");
+        assert_eq!(vector_name(30), "vector 30");
     }
 }

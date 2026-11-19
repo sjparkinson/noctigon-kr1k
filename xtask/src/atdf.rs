@@ -229,6 +229,17 @@ fn doc(path: String, element: &Element) -> String {
     }
 }
 
+fn names(name: &str, rows: &[(u32, String)]) -> String {
+    let rows: String = rows
+        .iter()
+        .map(|(value, name)| format!("    ({value:#04X}, \"{name}\"),\n"))
+        .collect();
+    format!(
+        "#[cfg(any(test, feature = \"testing\"))]\n\
+         pub const {name}: &[(usize, &str)] = &[\n{rows}];\n"
+    )
+}
+
 /// The ATDF's `initval`s stay out on purpose, because they disagree with the
 /// datasheet on ADC0.CALIB and the factory OSCCFG and SYSCFG0.
 pub fn generate(xml: &str) -> String {
@@ -237,6 +248,7 @@ pub fn generate(xml: &str) -> String {
     let device = file.child("devices").child("device");
 
     let mut addr = Consts::default();
+    let mut addr_names = Vec::new();
     for r in registers(&document) {
         let width = match r.size {
             1 => String::new(),
@@ -246,6 +258,9 @@ pub fn generate(xml: &str) -> String {
             format!("{}_{}", r.instance, r.name),
             r.address,
             doc(format!("{}.{}{width}", r.instance, r.name), r.element),
+        );
+        addr_names.extend(
+            (0..r.size).map(|byte| (r.address + byte, format!("{}.{}", r.instance, r.name))),
         );
     }
 
@@ -295,11 +310,13 @@ pub fn generate(xml: &str) -> String {
     }
 
     let mut vectors = Consts::default();
+    let mut vector_names = Vec::new();
     let mut count = 0;
     for interrupt in device.child("interrupts").all("interrupt") {
         let index = interrupt.num("index");
         let (instance, name) = (interrupt.get("module-instance"), interrupt.get("name"));
         count = count.max(index + 1);
+        vector_names.push((index, format!("{instance}_{name}")));
         let path = format!("{instance}.{name}'s vector");
         vectors.add(
             format!("VECTOR_{instance}_{name}"),
@@ -326,13 +343,14 @@ pub fn generate(xml: &str) -> String {
 
     format!(
         "/// Data-space addresses of every register.\n\
-         pub mod addr {{\n{}}}\n\n\
+         pub mod addr {{\n{}{}}}\n\n\
          /// Every memory segment. All of them are in data space but PROGMEM.\n\
          pub mod mem {{\n{}}}\n\n\
-         {}\n{}\n\
+         {}\n{}{}\n\
          /// The device signature.\n\
          pub const SIGNATURE: [u8; 3] = {signature:#04X?};\n",
         addr.render(|_| "usize"),
+        names("NAMES", &addr_names),
         // usize is 16 bits on the AVR, and the mapped-flash window ends at 0x10000.
         mem.render(|value| if value > 0xFFFF { "u32" } else { "usize" }),
         bits.render(|value| match value {
@@ -341,6 +359,7 @@ pub fn generate(xml: &str) -> String {
             _ => "u8",
         }),
         vectors.render(|_| "usize"),
+        names("VECTOR_NAMES", &vector_names),
     )
 }
 
@@ -403,6 +422,10 @@ mod tests {
             "pub const MAPPED_PROGMEM_END: u32 = 0x10000;",
             "pub const MAPPED_PROGMEM_SIZE: usize = 0x8000;",
             "pub const RTC_PI: u8 = 0x01;",
+            "#[cfg(any(test, feature = \"testing\"))]\npub const NAMES: &[(usize, &str)] = &[",
+            "#[cfg(any(test, feature = \"testing\"))]\npub const VECTOR_NAMES: &[(usize, &str)] = &[",
+            "    (0x610, \"ADC0.RES\"),\n    (0x611, \"ADC0.RES\"),",
+            "    (0x06, \"RTC_PIT\"),",
         ] {
             assert!(source.contains(line), "{line}");
         }
