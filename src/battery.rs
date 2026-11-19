@@ -1,10 +1,10 @@
 //! The cell's voltage, and what to do as it runs flat. VDD is the cell, read as
 //! VDD / 10 (MUXPOS `VDDDIV10`, DS40002413B section 33.5.7) against 1.024 V.
 
-use crate::TICKS_PER_SECOND;
 use crate::gradual::Ceiling;
 use crate::ramp::CEILING;
 use crate::sensors::{CYCLE_TICKS, FULL_SCALE};
+use crate::{TICKS_PER_SECOND, u16_from, u32_from};
 
 /// The voltage calibration, against a default of 1024, higher reading higher.
 /// The stock firmware's figure for this driver, unmeasured on this torch.
@@ -30,18 +30,10 @@ const HIGH: u16 = scaled(256 << 6);
 const LOW: u16 = scaled(1 << 12);
 
 const _: () = assert!(HIGH == SLOPE);
-#[expect(
-    clippy::as_conversions,
-    reason = "widening to u32 in a const, where From can't be called"
-)]
-const _: () = assert!(LOW as u32 * 0xFF <= u16::MAX as u32);
-#[expect(
-    clippy::as_conversions,
-    reason = "widening to u32 in a const, where From can't be called"
-)]
+const _: () = assert!(u32_from(LOW) * 0xFF <= u32_from(u16::MAX));
 const _: () = {
-    let top = (FULL_SCALE >> 8) as u32 * HIGH as u32 + ((0xFF * LOW as u32) >> 6) + 32;
-    assert!(top <= u16::MAX as u32);
+    let top = u32_from(FULL_SCALE >> 8) * u32_from(HIGH) + ((0xFF * u32_from(LOW)) >> 6) + 32;
+    assert!(top <= u32_from(u16::MAX));
 };
 
 /// Split into bytes because `reading × SLOPE` needs 24 bits, and the chip has
@@ -59,17 +51,9 @@ pub const fn centivolts(reading: u16) -> u16 {
     (hi * HIGH + ((lo * LOW) >> 6) + 32) >> 6
 }
 
-#[expect(
-    clippy::as_conversions,
-    reason = "widening u8 to u16 in a const, where From can't be called"
-)]
-pub const SAMPLES_PER_SECOND: u16 = TICKS_PER_SECOND / CYCLE_TICKS as u16;
+pub const SAMPLES_PER_SECOND: u16 = TICKS_PER_SECOND / u16_from(CYCLE_TICKS);
 
-#[expect(
-    clippy::as_conversions,
-    reason = "widening u8 to u16 in a const, where From can't be called"
-)]
-const _: () = assert!(TICKS_PER_SECOND.is_multiple_of(CYCLE_TICKS as u16));
+const _: () = assert!(TICKS_PER_SECOND.is_multiple_of(u16_from(CYCLE_TICKS)));
 
 /// Centivolts. Unmeasured.
 pub const STEP_DOWN_BELOW: u16 = 300;
@@ -130,11 +114,7 @@ pub fn plausible(centivolts: u16) -> bool {
 }
 
 /// The filter holds 16 times a plausible sample and adds twice another.
-#[expect(
-    clippy::as_conversions,
-    reason = "widening to u32 in a const, where From can't be called"
-)]
-const _: () = assert!(*PLAUSIBLE.end() as u32 * 18 <= u16::MAX as u32);
+const _: () = assert!(u32_from(*PLAUSIBLE.end()) * 18 <= u32_from(u16::MAX));
 
 /// Implausible samples in a row let go before [`Verdict::Blind`]. Unmeasured.
 pub const GLITCHES: u8 = 3;

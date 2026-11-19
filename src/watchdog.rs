@@ -1,7 +1,7 @@
 //! When to feed the watchdog, which runs in window mode while lit (AN2632 §3.2),
 //! and how the loop is paced. Nobody has seen this watchdog bite on a real chip.
 
-use crate::TICKS_PER_SECOND;
+use crate::{TICKS_PER_SECOND, u16_from, u32_from};
 
 /// Cycles of the WDT's 1.024 kHz clock in one tick.
 pub const CLOCKS_PER_TICK: u16 = 1024 / TICKS_PER_SECOND;
@@ -13,12 +13,8 @@ pub const FEED_TICKS: u8 = 3;
 
 // Window mode only starts with the first `wdr` (DS40002413B §22.3.3.2), so the
 // first feed likely has the open window alone, which the datasheet only implies.
-#[expect(
-    clippy::as_conversions,
-    reason = "widening u8 to u16 in a const, where From can't be called"
-)]
 const _: () = {
-    let gap = FEED_TICKS as u16 * CLOCKS_PER_TICK;
+    let gap = u16_from(FEED_TICKS) * CLOCKS_PER_TICK;
     assert!(gap > CLOSED_CLOCKS && gap < CLOSED_CLOCKS + OPEN_CLOCKS);
     assert!(CLOCKS_PER_TICK < OPEN_CLOCKS);
 };
@@ -32,22 +28,18 @@ pub const TIMER_PERIOD_CLOCKS: u16 = 4000;
 /// TCB0 periods `hw::wait_for_tick` waits for a tick, with the light on, before `main` halts.
 pub const TICK_DEADLINE_PERIODS: u16 = 104;
 
-#[expect(
-    clippy::as_conversions,
-    reason = "widening to u32 in a const, where From can't be called"
-)]
 const _: () = {
-    let period = TIMER_PERIOD_CLOCKS as u32;
-    let tick = CLOCK_HZ / TICKS_PER_SECOND as u32;
-    let shortest = (TICK_DEADLINE_PERIODS as u32 - 1) * period;
-    let longest = TICK_DEADLINE_PERIODS as u32 * period;
+    let period = u32_from(TIMER_PERIOD_CLOCKS);
+    let tick = CLOCK_HZ / u32_from(TICKS_PER_SECOND);
+    let shortest = (u32_from(TICK_DEADLINE_PERIODS) - 1) * period;
+    let longest = u32_from(TICK_DEADLINE_PERIODS) * period;
     assert!(shortest > 6 * tick && longest < 7 * tick);
     // The main oscillator at most 5 % fast (DS40002413B figure 38-2) and the
     // 32 kHz one 30 % slow, which is the ATtiny1616's figure (DS40002204A table
     // 36-13) and a guess for this chip.
     let slowest = tick * 105 / 70;
-    let bite = (3 + CLOSED_CLOCKS + OPEN_CLOCKS) as u32;
-    assert!(shortest * CLOCKS_PER_TICK as u32 > bite * slowest);
+    let bite = u32_from(3 + CLOSED_CLOCKS + OPEN_CLOCKS);
+    assert!(shortest * u32_from(CLOCKS_PER_TICK) > bite * slowest);
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,21 +112,17 @@ const SYNC_SPREAD: u16 = 1;
 /// Passes after the one that sees a press before the lit setting is back and fed.
 pub const EXIT_PASSES: u16 = 2;
 
-#[expect(
-    clippy::as_conversions,
-    reason = "widening u8 to u16 in a const, where From can't be called"
-)]
 const _: () = {
     use crate::button::{HOLD_TICKS, RELEASE_TICKS};
     assert!(RELEASE_TICKS + 1 > EXIT_PASSES && HOLD_TICKS > EXIT_PASSES);
     // A switch wake counts no ticks, so a spent gesture has to be over before the PIT slows.
-    assert!(SETTLE_TICKS as u16 > RELEASE_TICKS);
+    assert!(u16_from(SETTLE_TICKS) > RELEASE_TICKS);
     // The first PIT period after a change isn't stated (§26.5.2.2), so the
     // first slow one counts as up to two.
     let slow = SLOW_TICKS * CLOCKS_PER_TICK;
     let rest = CLOCKS_PER_TICK
         + 2 * slow
-        + (FEED_SLOW_TICKS as u16 - 1) * slow
+        + (u16_from(FEED_SLOW_TICKS) - 1) * slow
         + 2 * CLOCKS_PER_TICK
         + PASS_CLOCKS
         + SYNC_SPREAD;
