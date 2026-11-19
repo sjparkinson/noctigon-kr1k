@@ -380,6 +380,11 @@ fn ends_off(end: Option<u8>) -> Result<(), String> {
     Ok(())
 }
 
+fn script(words: &'static str) -> impl Iterator<Item = Sample> {
+    let actions = testing::parse(words.split_whitespace());
+    testing::samples(actions.map(|action| action.expect("every fault script parses")))
+}
+
 /// The slowest tick the oscillators allow, in main clocks, with the 32 kHz
 /// one 30% slow and the main one 5% fast (figure 38-2). Table 38-10 gives
 /// OSC32K no tolerance at all, so the 30% is a guess.
@@ -395,14 +400,8 @@ fn slow_ticks(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 
 fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
     let seconds = |s: usize| s * usize::from(TICKS_PER_SECOND);
-    let script = [
-        Action::Clicks(1),
-        Action::Wait(10 * TICKS_PER_SECOND),
-        Action::Clicks(1),
-        Action::Wait(2 * TICKS_PER_SECOND),
-    ];
     let mut levels = Vec::new();
-    let samples = testing::samples(script).map(|sample| Sample {
+    let samples = script("1C wait:10s 1C wait:2s").map(|sample| Sample {
         scene: Scene {
             adc_dead: true,
             ..sample.scene
@@ -509,17 +508,10 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 
 fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     let seconds = |s: usize| s * usize::from(TICKS_PER_SECOND);
-    let script = [
-        Action::Clicks(1),
-        Action::Wait(TICKS_PER_SECOND),
-        Action::AdcStuck,
-        Action::Wait(5 * TICKS_PER_SECOND),
-        Action::Clicks(1),
-        Action::Wait(2 * TICKS_PER_SECOND),
-    ];
     let mut ticks = Vec::new();
     let mut sim = sim;
-    let end = in_step_with(&mut sim, testing::samples(script), report, |sample, rig| {
+    let samples = script("1C wait:1s adc:stuck wait:5s 1C wait:2s");
+    let end = in_step_with(&mut sim, samples, report, |sample, rig| {
         let fault = rig.health() == kr1k::limits::Health::Fault;
         ticks.push((sample.scene.adc_stuck.is_some(), rig.level(), fault));
     })?;
@@ -561,18 +553,8 @@ fn switch_stuck(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 }
 
 fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
-    let script = [
-        Action::Vddio2(false),
-        Action::Wait(TICKS_PER_SECOND),
-        Action::Clicks(1),
-        Action::Wait(TICKS_PER_SECOND),
-        Action::Hold {
-            clicks: 0,
-            ticks: TICKS_PER_SECOND,
-        },
-        Action::Wait(TICKS_PER_SECOND),
-    ];
-    let end = in_step(&mut sim, testing::samples(script), report)?;
+    let samples = script("vddio2:lost wait:1s 1C wait:1s 1H wait:1s");
+    let end = in_step(&mut sim, samples, report)?;
     if sim.chip.vddio2_ok() {
         return Err("the fuses have single supply, so VDDIO2S reads 1 regardless".into());
     }
@@ -587,26 +569,8 @@ fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 /// pass can miss one whole and `Chip::vddio2_moved` would refuse what follows.
 fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.late_vddio2 = true;
-    let second = TICKS_PER_SECOND;
-    let script = [
-        Action::Clicks(1),
-        Action::Hold {
-            clicks: 0,
-            ticks: 3 * second,
-        },
-        Action::Vddio2(false),
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Hold {
-            clicks: 0,
-            ticks: second,
-        },
-        Action::Vddio2(true),
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Wait(second),
-    ];
-    let end = in_step(&mut sim, testing::samples(script), report)?;
+    let samples = script("1C 1H:3s vddio2:lost wait:1s 1C 1H vddio2:back wait:1s 1C wait:1s");
+    let end = in_step(&mut sim, samples, report)?;
     if !sim.chip.lost_lit {
         return Err("VDDIO2 never went with the light on, so this checked nothing".into());
     }
@@ -659,15 +623,8 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
 
 fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     sim.chip.edge_with_slow_tick = true;
-    let second = TICKS_PER_SECOND;
-    let script = [
-        Action::Wait(12 * second),
-        Action::Clicks(1),
-        Action::Wait(2 * second),
-        Action::Clicks(1),
-        Action::Wait(12 * second),
-    ];
-    let end = in_step(&mut sim, testing::samples(script), report)?;
+    let samples = script("wait:12s 1C wait:2s 1C wait:12s");
+    let end = in_step(&mut sim, samples, report)?;
     ends_off(end)?;
     if sim.chip.edges_with_ticks < 10 {
         return Err(format!(
@@ -680,28 +637,8 @@ fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 
 fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String> {
     sim.chip.twi.fault = fault;
-    let second = TICKS_PER_SECOND;
-    let script = [
-        Action::Clicks(1),
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Wait(second),
-        Action::Clicks(3),
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Wait(6 * second),
-        Action::Clicks(3),
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Hold {
-            clicks: 0,
-            ticks: second,
-        },
-        Action::Wait(second),
-        Action::Clicks(1),
-        Action::Wait(second),
-    ];
-    let end = in_step(&mut sim, testing::samples(script), report)?;
+    let words = "1C wait:1s 1C wait:1s 3C wait:1s 1C wait:6s 3C wait:1s 1C 1H wait:1s 1C wait:1s";
+    let end = in_step(&mut sim, script(words), report)?;
     ends_off(end)?;
     if sim.chip.pc1_rises < 2 {
         return Err("the light didn't come on twice, so this checked nothing".into());
