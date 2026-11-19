@@ -129,18 +129,6 @@ const fn enables(red: Level, green: Level, blue: Level) -> u8 {
     enable(red, AUX_RED) | enable(green, AUX_GREEN) | enable(blue, AUX_BLUE)
 }
 
-/// `==` for a `const fn`. A new colour needs an arm here.
-const fn same(a: Aux, b: Aux) -> bool {
-    matches!(
-        (a, b),
-        (Aux::Off, Aux::Off)
-            | (Aux::Blue, Aux::Blue)
-            | (Aux::Red, Aux::Red)
-            | (Aux::Yellow, Aux::Yellow)
-            | (Aux::White, Aux::White)
-    )
-}
-
 /// The enables go last, so nothing lights at a setting it isn't meant to have.
 macro_rules! show {
     ($red:expr, $green:expr, $blue:expr) => {{
@@ -207,11 +195,11 @@ impl Aw2016 {
 
     /// At most one step a tick. Send the transfers before the driver's output
     /// changes, so the aux go dark before the light comes on.
-    pub const fn step(&mut self, want: Aux) -> Option<Update> {
+    pub fn step(&mut self, want: Aux) -> Option<Update> {
         self.want = want;
         let (update, next) = match (self.state, want) {
-            (State::Failed(gave_up), _) if same(gave_up, want) => return None,
-            (State::Showing(shown), _) if same(shown, want) => return None,
+            (State::Failed(gave_up), _) if gave_up == want => return None,
+            (State::Showing(shown), _) if shown == want => return None,
             (State::Standby, Aux::Off) => return None,
             (State::Unknown | State::Failed(_), _) => (FROM_UNKNOWN, State::Standby),
             (State::Awake | State::Showing(_), Aux::Off) => (STANDBY, State::Standby),
@@ -224,10 +212,10 @@ impl Aw2016 {
 
     /// Whether [`Aw2016::step`] would send nothing for `want`. Written out
     /// rather than by calling `step`, which is bigger.
-    pub const fn settled(&self, want: Aux) -> bool {
+    pub fn settled(&self, want: Aux) -> bool {
         match self.state {
             State::Standby => matches!(want, Aux::Off),
-            State::Showing(colour) | State::Failed(colour) => same(colour, want),
+            State::Showing(colour) | State::Failed(colour) => colour == want,
             State::Unknown | State::Awake => false,
         }
     }
