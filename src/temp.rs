@@ -43,17 +43,12 @@ pub fn sixteenths(sum: u16, offset: u16, slope: u16) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{CALIBRATION, ROOM_READING};
 
     fn reference(sum: u16, offset: u16, slope: u16) -> u16 {
         let d = (4 * i64::from(offset) - i64::from(sum)).clamp(0, i64::from(u16::MAX));
         ((d * i64::from(slope) + 512) >> 10).min(i64::from(u16::MAX)) as u16
     }
-
-    /// Read off this torch's signature row.
-    const BACKUP: Calibration = Calibration {
-        offset: 0x0D24,
-        slope: 0x03EE,
-    };
 
     #[test]
     fn multiply_is_exact() {
@@ -69,8 +64,8 @@ mod tests {
     #[test]
     fn matches_the_sum_for_every_accumulated_reading_and_a_spread_of_calibrations() {
         for sum in 0..=crate::sensors::FULL_SCALE {
-            for offset in (0..=u16::MAX).step_by(4099).chain([BACKUP.offset]) {
-                for slope in (0..=u16::MAX).step_by(4111).chain([BACKUP.slope]) {
+            for offset in (0..=u16::MAX).step_by(4099).chain([CALIBRATION.offset]) {
+                for slope in (0..=u16::MAX).step_by(4111).chain([CALIBRATION.slope]) {
                     assert_eq!(
                         sixteenths(sum, offset, slope),
                         reference(sum, offset, slope),
@@ -84,10 +79,10 @@ mod tests {
     #[test]
     fn four_conversions_land_within_half_a_kelvin_of_the_datasheet() {
         for reading in 0..4096_i64 {
-            let offset = i64::from(BACKUP.offset);
-            let slope = i64::from(BACKUP.slope);
+            let offset = i64::from(CALIBRATION.offset);
+            let slope = i64::from(CALIBRATION.slope);
             let datasheet = (((offset - reading) * slope + 2048) >> 12).max(0);
-            let ours = i64::from(BACKUP.sixteenths(4 * reading as u16));
+            let ours = i64::from(CALIBRATION.sixteenths(4 * reading as u16));
             assert!((ours - 16 * datasheet).abs() <= 8, "reading {reading}");
         }
     }
@@ -95,14 +90,14 @@ mod tests {
     #[test]
     fn the_backups_calibration_reads_room_temperature_about_where_it_should() {
         // 298 K is 25 °C, where four conversions sum to about 8603.
-        assert_eq!(BACKUP.sixteenths(8603) / 16, 298);
-        let step = BACKUP.sixteenths(8603) - BACKUP.sixteenths(8604);
+        assert_eq!(CALIBRATION.sixteenths(ROOM_READING) / 16, 298);
+        let step = CALIBRATION.sixteenths(ROOM_READING) - CALIBRATION.sixteenths(ROOM_READING + 1);
         assert!(step <= 1, "{step}");
     }
 
     #[test]
     fn a_warmer_die_reads_lower() {
-        assert!(BACKUP.sixteenths(8000) > BACKUP.sixteenths(9000));
+        assert!(CALIBRATION.sixteenths(8000) > CALIBRATION.sixteenths(9000));
     }
 
     #[test]
@@ -113,7 +108,7 @@ mod tests {
 
     #[test]
     fn a_sum_nothing_could_produce_stays_far_from_plausible() {
-        assert!(BACKUP.sixteenths(0) > 423 * 16);
+        assert!(CALIBRATION.sixteenths(0) > 423 * 16);
         assert_eq!(sixteenths(0, u16::MAX, u16::MAX), u16::MAX);
     }
 }

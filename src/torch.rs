@@ -245,7 +245,8 @@ mod tests {
     use crate::ramp::CEILING;
     use crate::sensors::{Channel, FULL_SCALE};
     use crate::testing::{
-        EXAMPLES, GROUND_READING, Rig, Rng, example, temperature_reading, voltage_reading,
+        CELL_READING, EACH_FAULT, EXAMPLES, GROUND_READING, HUNG, ROOM_READING, Rig, Rng,
+        celsius_reading, example, temperature_reading, voltage_reading,
     };
     use crate::thermal;
     use crate::ui::{self, Mode, ON_LEVEL};
@@ -461,10 +462,7 @@ mod tests {
         assert_eq!(torch.quiet_for(), None, "red's showing");
         run(&mut torch, false, LOCKED_TICKS);
         assert!(torch.can_slow());
-        let mut faulty = Rig::new(crate::selftest::Faults {
-            hang: true,
-            ..Faults::NONE
-        });
+        let mut faulty = Rig::new(HUNG);
         run(&mut faulty, false, SHOW_TICKS + 4);
         assert_eq!(
             faulty.quiet_for(),
@@ -1000,10 +998,7 @@ mod tests {
 
     #[test]
     fn a_fault_skips_the_checks() {
-        let mut torch = Rig::new(Faults {
-            hang: true,
-            ..Faults::NONE
-        });
+        let mut torch = Rig::new(HUNG);
         for tick in 0..2 * u32::from(CHECK_TICKS) {
             torch.tick(false);
             assert!(torch.resting(), "tick {tick}");
@@ -1305,10 +1300,7 @@ mod tests {
     fn the_aux_says_why_for_three_seconds_to_the_tick() {
         const THREE_SECONDS: u16 = 3 * 64;
         assert_eq!(TICKS_PER_SECOND, 64);
-        let mut torch = Rig::new(Faults {
-            hang: true,
-            ..Faults::NONE
-        });
+        let mut torch = Rig::new(HUNG);
         for tick in 1..THREE_SECONDS {
             torch.tick(false);
             assert_eq!(torch.aux(), Aux::White, "tick {tick}");
@@ -1384,7 +1376,7 @@ mod tests {
     fn heat_lowers_the_light_and_leaves_the_ui_where_it_was() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
-        torch.adc.temperature = temperature_reading(thermal::celsius(80));
+        torch.adc.temperature = celsius_reading(80);
         run(&mut torch, false, 120 * TICKS_PER_SECOND);
         assert_eq!(torch.level(), thermal::FLOOR);
         assert_eq!(torch.output(), ramp::output(torch.level()));
@@ -1491,7 +1483,7 @@ mod tests {
         click(&mut torch);
         run(&mut torch, true, 10 * TICKS_PER_SECOND);
         assert_eq!(torch.level(), CEILING);
-        torch.adc.temperature = temperature_reading(thermal::celsius(80));
+        torch.adc.temperature = celsius_reading(80);
         assert!(thermal::celsius(80) > thermal::LIMIT);
         for _ in 0..120 * TICKS_PER_SECOND {
             torch.tick(true);
@@ -1502,24 +1494,7 @@ mod tests {
 
     #[test]
     fn a_fault_never_lights_and_shows_white_after_power_on_and_a_press() {
-        for faults in [
-            Faults {
-                flash: true,
-                ..Faults::NONE
-            },
-            Faults {
-                fuses: true,
-                ..Faults::NONE
-            },
-            Faults {
-                hang: true,
-                ..Faults::NONE
-            },
-            Faults {
-                supply: true,
-                ..Faults::NONE
-            },
-        ] {
+        for faults in EACH_FAULT {
             let mut torch = Rig::new(faults);
             assert_eq!(torch.aux(), Aux::White, "{faults:?}");
             run(&mut torch, false, SHOW_TICKS);
@@ -1727,10 +1702,6 @@ mod tests {
         assert_eq!(torch.output(), Output::OFF);
     }
 
-    fn between(rng: &mut Rng, low: u16, high: u16) -> u16 {
-        low + rng.next_u16() % (high - low + 1)
-    }
-
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Pace {
         /// Rests and changes of cell of half a minute at most.
@@ -1743,17 +1714,17 @@ mod tests {
         let roll = rng.next_u16() % 16;
         if pressed {
             match roll {
-                0..=8 => between(rng, 1, 8),
-                9..=10 => between(rng, HOLD_TICKS - 3, HOLD_TICKS + 3),
-                _ => between(rng, HOLD_TICKS, 4 * TICKS_PER_SECOND),
+                0..=8 => rng.between(1, 8),
+                9..=10 => rng.between(HOLD_TICKS - 3, HOLD_TICKS + 3),
+                _ => rng.between(HOLD_TICKS, 4 * TICKS_PER_SECOND),
             }
         } else {
             match roll {
-                12..=15 if pace == Pace::Slow => between(rng, CHECK_TICKS / 4, 3 * CHECK_TICKS),
-                0..=6 => between(rng, 1, 8),
-                7..=8 => between(rng, RELEASE_TICKS - 3, RELEASE_TICKS + 3),
-                9..=13 => between(rng, RELEASE_TICKS + 1, TICKS_PER_SECOND),
-                _ => between(rng, TICKS_PER_SECOND, 30 * TICKS_PER_SECOND),
+                12..=15 if pace == Pace::Slow => rng.between(CHECK_TICKS / 4, 3 * CHECK_TICKS),
+                0..=6 => rng.between(1, 8),
+                7..=8 => rng.between(RELEASE_TICKS - 3, RELEASE_TICKS + 3),
+                9..=13 => rng.between(RELEASE_TICKS + 1, TICKS_PER_SECOND),
+                _ => rng.between(TICKS_PER_SECOND, 30 * TICKS_PER_SECOND),
             }
         }
     }
@@ -1781,27 +1752,26 @@ mod tests {
 
         fn cell(rng: &mut Rng) -> Self {
             match rng.next_u16() % 16 {
-                0..=5 => Self::Steady(voltage_reading(between(rng, 340, 420))),
-                6..=7 => Self::Steady(voltage_reading(between(rng, 300, 339))),
-                8..=9 => Self::Steady(voltage_reading(between(rng, 291, 299))),
-                10 => Self::Steady(voltage_reading(between(rng, 280, 289))),
-                11 => Self::Steady(voltage_reading(between(rng, 150, 279))),
+                0..=5 => Self::Steady(voltage_reading(rng.between(340, 420))),
+                6..=7 => Self::Steady(voltage_reading(rng.between(300, 339))),
+                8..=9 => Self::Steady(voltage_reading(rng.between(291, 299))),
+                10 => Self::Steady(voltage_reading(rng.between(280, 289))),
+                11 => Self::Steady(voltage_reading(rng.between(150, 279))),
                 12 => Self::Steady(match rng.next_u16() % 3 {
                     0 => 0,
                     1 => voltage_reading(60),
                     _ => FULL_SCALE,
                 }),
-                13..=14 => Self::Glitchy(voltage_reading(between(rng, 300, 420))),
+                13..=14 => Self::Glitchy(voltage_reading(rng.between(300, 420))),
                 _ => Self::Garbage,
             }
         }
 
         fn head(rng: &mut Rng) -> Self {
-            let celsius = |degrees: u16| temperature_reading(thermal::celsius(degrees as u8));
             match rng.next_u16() % 8 {
-                0..=3 => Self::Steady(celsius(between(rng, 0, 45))),
-                4..=5 => Self::Steady(celsius(between(rng, 55, 95))),
-                6 => Self::Glitchy(celsius(between(rng, 20, 95))),
+                0..=3 => Self::Steady(celsius_reading(rng.between(0, 45) as u8)),
+                4..=5 => Self::Steady(celsius_reading(rng.between(55, 95) as u8)),
+                6 => Self::Glitchy(celsius_reading(rng.between(20, 95) as u8)),
                 _ => Self::Garbage,
             }
         }
@@ -1963,7 +1933,7 @@ mod tests {
         };
         let start_up = pace == Pace::Slow && rng.next_u16().is_multiple_of(2);
         let (mut pressed, mut switch_left) = (start_up, 0);
-        let (mut cell, mut head) = (Source::Steady(6140), Source::Steady(8603));
+        let (mut cell, mut head) = (Source::Steady(CELL_READING), Source::Steady(ROOM_READING));
         // One result in `lose` never arrives, and `0` is none of them.
         let (mut lose, mut world_left) = (0, 0);
         let (mut up, mut faulted_for) = (0_u32, 0_u32);
@@ -1989,16 +1959,16 @@ mod tests {
                 };
                 world_left = match pace {
                     Pace::Slow if rng.next_u16().is_multiple_of(2) => {
-                        between(rng, 60 * TICKS_PER_SECOND, 3 * CHECK_TICKS)
+                        rng.between(60 * TICKS_PER_SECOND, 3 * CHECK_TICKS)
                     }
-                    _ => between(rng, 1, 30 * TICKS_PER_SECOND),
+                    _ => rng.between(1, 30 * TICKS_PER_SECOND),
                 };
                 if supply.next_u16().is_multiple_of(32) {
                     gone_left = match pace {
                         Pace::Slow if supply.next_u16().is_multiple_of(2) => {
-                            between(supply, CHECK_TICKS / 2, 2 * CHECK_TICKS)
+                            supply.between(CHECK_TICKS / 2, 2 * CHECK_TICKS)
                         }
-                        _ => between(supply, 1, 3 * TICKS_PER_SECOND),
+                        _ => supply.between(1, 3 * TICKS_PER_SECOND),
                     };
                 }
             }
@@ -2299,13 +2269,10 @@ mod tests {
         let (mut life, mut run) = (0, 0);
         while run < ticks {
             let faults = match rng.next_u16() % 8 {
-                0 => Faults {
-                    hang: true,
-                    ..Faults::NONE
-                },
+                0 => HUNG,
                 _ => Faults::NONE,
             };
-            let mut length = u32::from(between(&mut rng, 1000, 20_000));
+            let mut length = u32::from(rng.between(1000, 20_000));
             if pace == Pace::Slow {
                 length *= 10;
             }

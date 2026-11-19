@@ -150,6 +150,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use crate::testing::CELL_READING;
     use std::vec::Vec;
 
     fn run(
@@ -425,8 +426,7 @@ mod tests {
     #[test]
     fn two_ground_readings_in_a_row_well_off_zero_are_a_stuck_adc() {
         assert_eq!((GROUND_MAX, GROUND_MISSES), (64, 2));
-        // 6140 is a cell's own reading.
-        for raw in [GROUND_MAX + 1, 6140, FULL_SCALE, u16::MAX] {
+        for raw in [GROUND_MAX + 1, CELL_READING, FULL_SCALE, u16::MAX] {
             let mut ground = Ground::new();
             assert!(!ground.reading(raw), "{raw}: one");
             assert!(ground.reading(raw), "{raw}: two");
@@ -437,14 +437,14 @@ mod tests {
     fn a_good_ground_reading_or_a_rest_starts_the_count_again() {
         let mut ground = Ground::new();
         for _ in 0..100 {
-            assert!(!ground.reading(6140));
+            assert!(!ground.reading(CELL_READING));
             assert!(!ground.reading(GROUND_MAX));
         }
         for _ in 0..100 {
-            assert!(!ground.reading(6140));
+            assert!(!ground.reading(CELL_READING));
             ground.rest();
         }
-        assert!(!ground.reading(6140));
+        assert!(!ground.reading(CELL_READING));
         assert!(!ground.reading(0));
     }
 
