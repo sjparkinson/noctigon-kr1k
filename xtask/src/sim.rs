@@ -201,7 +201,7 @@ impl Linked {
     }
 }
 
-pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
+pub fn check(elf: &Elf) -> Result<Report, String> {
     let linked = Linked::of(elf)?;
     let image = elf.flash_image();
     let signed = crc::sign(&image, &stamp::TEST)?;
@@ -221,7 +221,6 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     boot_order(linked.boot(signed.clone())?).map_err(|e| format!("start-up order: {e}"))?;
     unhandled_interrupt(power_on()?)
         .map_err(|e| format!("with an interrupt that has no handler: {e}"))?;
-    let examples = if examples { EXAMPLES } else { &[] };
     // Errors come back in this order. The late ones would report many a
     // mistake as a wrong output before the run that names it.
     let faults: [(FaultCheck, &str); 6] = [
@@ -272,7 +271,7 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
         };
         let faults = faults.map(spawn);
         // Spawning every run before joining any is what runs them in parallel.
-        let runs: Vec<_> = examples
+        let runs: Vec<_> = EXAMPLES
             .iter()
             .map(Some)
             .chain([None])
