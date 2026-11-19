@@ -37,8 +37,6 @@ commands:
   hex                     build the firmware, run it on the simulator, write
                           target/noctigon-kr1k.hex and print flash, RAM,
                           stack, loop and handler use
-  hex --no-examples       the same, leaving the UI examples out of the
-                          simulator run, for a test build they'd fail
   breakages [name...]     check hex refuses copies of the firmware, each broken on
                           purpose in one way, and leave the checkout alone
   ping <port>           check the programmer can see the chip, writing nothing,
@@ -66,12 +64,11 @@ fn main() -> ExitCode {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
 
     let result = match args.as_slice() {
-        ["hex"] => hex(true),
-        ["hex", "--no-examples"] => hex(false),
+        ["hex"] => hex(),
         ["breakages", names @ ..] => breakages::run(&root(), names),
         ["ping", port] => ping(port),
         ["backup", port, dir] => backup(port, Path::new(dir)),
-        ["flash", port] => build(true)
+        ["flash", port] => build()
             .and_then(|(elf, _)| crc::sign(&elf.flash_image(), &stamp::current(&root())))
             .and_then(|image| flash(port, &image)),
         ["flash", port, file] => this_boards_hex(Path::new(file))
@@ -107,7 +104,7 @@ fn cargo() -> String {
     env::var("CARGO").unwrap_or_else(|_| "cargo".into())
 }
 
-fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
+fn build() -> Result<(elf::Elf, sim::Report), String> {
     run(Command::new(cargo()).current_dir(root()).args([
         "build",
         "--package",
@@ -125,8 +122,7 @@ fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
     let path = root().join(ELF);
     let elf = load(&path)?;
     layout::check(&elf).map_err(at(&path))?;
-    let report =
-        sim::check(&elf, examples).map_err(|e| format!("{}: simulator: {e}", path.display()))?;
+    let report = sim::check(&elf).map_err(|e| format!("{}: simulator: {e}", path.display()))?;
 
     let probe = root().join(PROBE);
     let probe_elf = load(&probe)?;
@@ -158,8 +154,8 @@ fn probe_sections(elf: &elf::Elf) -> Result<(), String> {
     Ok(())
 }
 
-fn hex(examples: bool) -> Result<(), String> {
-    let (elf, sim) = build(examples)?;
+fn hex() -> Result<(), String> {
+    let (elf, sim) = build()?;
     let firmware = elf.flash_image();
     let image = crc::sign(&firmware, &stamp::current(&root()))?;
     write(&root().join(HEX), &ihex::encode(&image))?;
