@@ -599,8 +599,7 @@ mod tests {
     }
 
     fn any_plausible(rng: &mut crate::testing::Rng) -> u16 {
-        let (low, high) = (*PLAUSIBLE_SIXTEENTHS.start(), *PLAUSIBLE_SIXTEENTHS.end());
-        low + rng.next_u16() % (high - low + 1)
+        rng.between(*PLAUSIBLE_SIXTEENTHS.start(), *PLAUSIBLE_SIXTEENTHS.end())
     }
 
     fn assert_in_range(smoothed: &Smoothed, context: &str) {

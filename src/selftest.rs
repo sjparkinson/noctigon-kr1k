@@ -162,22 +162,6 @@ mod tests {
     #[test]
     fn only_a_fault_counts() {
         assert!(!Faults::NONE.any());
-        let flash = Faults {
-            flash: true,
-            ..Faults::NONE
-        };
-        let fuses = Faults {
-            fuses: true,
-            ..Faults::NONE
-        };
-        let hang = Faults {
-            hang: true,
-            ..Faults::NONE
-        };
-        let supply = Faults {
-            supply: true,
-            ..Faults::NONE
-        };
-        assert!(flash.any() && fuses.any() && hang.any() && supply.any());
+        assert!(crate::testing::EACH_FAULT.into_iter().all(Faults::any));
     }
 }

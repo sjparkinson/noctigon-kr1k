@@ -206,14 +206,9 @@ mod tests {
     use crate::TICKS_PER_SECOND;
     use crate::ramp::LEVELS;
     use crate::sensors::{CYCLE_TICKS, FULL_SCALE, UNREAD_TICKS};
-    use crate::testing::{Adc, CALIBRATION, temperature_reading, voltage_reading};
-    use crate::thermal::{self, FLOOR};
+    use crate::testing::{Adc, CALIBRATION, CELL_READING, HUNG, celsius_reading, voltage_reading};
+    use crate::thermal::FLOOR;
     use std::vec::Vec;
-
-    const FAILED: Faults = Faults {
-        hang: true,
-        ..Faults::NONE
-    };
 
     struct Run {
         limits: Limits,
@@ -275,11 +270,6 @@ mod tests {
         }
     }
 
-    /// The raw reading for `degrees` Celsius.
-    fn celsius(degrees: u8) -> u16 {
-        temperature_reading(thermal::celsius(degrees))
-    }
-
     #[test]
     fn a_good_cell_and_a_cool_head_leave_the_ui_alone() {
         let mut run = Run::new();
@@ -306,7 +296,7 @@ mod tests {
         let mut run = Run::new();
         run.ui = CEILING;
         run.secs(2);
-        run.adc.temperature = celsius(70);
+        run.adc.temperature = celsius_reading(70);
         let level = run.secs(2);
         assert!(level < CEILING && level > FLOOR, "{level}");
         assert_eq!(run.secs(120), FLOOR);
@@ -318,10 +308,10 @@ mod tests {
     fn a_hot_head_never_goes_under_the_floor_and_comes_back_up_as_it_cools() {
         let mut run = Run::new();
         run.ui = CEILING;
-        run.adc.temperature = celsius(80);
+        run.adc.temperature = celsius_reading(80);
         assert_eq!(run.secs(120), FLOOR);
         assert!(run.levels.iter().all(|&l| l == 0 || l >= FLOOR));
-        run.adc.temperature = celsius(25);
+        run.adc.temperature = celsius_reading(25);
         let level = run.secs(5);
         assert!(level > FLOOR && level < CEILING, "{level}");
         assert_eq!(run.secs(120), CEILING);
@@ -333,7 +323,7 @@ mod tests {
     fn heat_leaves_a_level_under_the_floor_alone() {
         let mut run = Run::new();
         run.ui = FLOOR - 10;
-        run.adc.temperature = celsius(80);
+        run.adc.temperature = celsius_reading(80);
         assert_eq!(run.secs(120), FLOOR - 10);
     }
 
@@ -776,7 +766,7 @@ mod tests {
         let mut run = Run::new();
         run.ui = 100;
         for _ in 0..60 {
-            run.adc.ground = 6140;
+            run.adc.ground = CELL_READING;
             run.ticks(u32::from(CYCLE_TICKS));
             run.adc.ground = crate::testing::GROUND_READING;
             run.ticks(u32::from(CYCLE_TICKS));
@@ -814,7 +804,7 @@ mod tests {
     #[test]
     fn a_plausible_temperature_that_never_changes_never_steps_down() {
         let mut run = Run::new();
-        assert_eq!(run.adc.temperature, celsius(25));
+        assert_eq!(run.adc.temperature, celsius_reading(25));
         run.ui = CEILING;
         run.secs(1);
         for minute in 0..60 {
@@ -867,11 +857,11 @@ mod tests {
     fn turning_on_resets_thermal_regulation() {
         let mut run = Run::new();
         run.ui = CEILING;
-        run.adc.temperature = celsius(70);
+        run.adc.temperature = celsius_reading(70);
         run.secs(60);
         assert_eq!(run.limits.ceilings().1, FLOOR);
         run.ui = 0;
-        run.adc.temperature = celsius(25);
+        run.adc.temperature = celsius_reading(25);
         run.secs(1);
         run.ui = CEILING;
         assert_eq!(run.ticks(1), CEILING);
@@ -891,13 +881,13 @@ mod tests {
     fn heat_doesnt_carry_over_a_rest() {
         let mut run = Run::new();
         run.ui = CEILING;
-        run.adc.temperature = celsius(70);
+        run.adc.temperature = celsius_reading(70);
         run.secs(120);
         assert_eq!(run.limits.ceilings().1, FLOOR);
         run.ui = 0;
         run.ticks(1);
         run.limits.rest();
-        run.adc.temperature = celsius(25);
+        run.adc.temperature = celsius_reading(25);
         run.ui = CEILING;
         assert_eq!(run.ticks(1), CEILING);
     }
@@ -923,7 +913,7 @@ mod tests {
 
     #[test]
     fn a_rest_keeps_a_fault_and_a_flat_cell() {
-        let mut run = Run::with(FAILED);
+        let mut run = Run::with(HUNG);
         run.limits.rest();
         assert_eq!(run.limits.health(), Health::Fault);
         let mut run = Run::new();
@@ -1013,7 +1003,7 @@ mod tests {
 
     #[test]
     fn a_failed_self_test_never_lights() {
-        let mut run = Run::with(FAILED);
+        let mut run = Run::with(HUNG);
         assert_eq!(run.limits.health(), Health::Fault);
         assert_eq!(run.secs(10), 0);
         for ui in [1, 30, CEILING, LEVELS] {
@@ -1153,7 +1143,7 @@ mod tests {
 
     #[test]
     fn random_readings_never_light_a_failed_self_test() {
-        throw_noise_at(Limits::new(CALIBRATION, FAILED), 0, 0x5EED_0002, None);
+        throw_noise_at(Limits::new(CALIBRATION, HUNG), 0, 0x5EED_0002, None);
     }
 
     #[test]

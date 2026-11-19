@@ -38,8 +38,31 @@ pub const CALIBRATION: Calibration = Calibration {
     slope: 0x03EE,
 };
 
+pub const HUNG: Faults = Faults {
+    hang: true,
+    ..Faults::NONE
+};
+
+pub const EACH_FAULT: [Faults; 4] = [
+    Faults {
+        flash: true,
+        ..Faults::NONE
+    },
+    Faults {
+        fuses: true,
+        ..Faults::NONE
+    },
+    HUNG,
+    Faults {
+        supply: true,
+        ..Faults::NONE
+    },
+];
+
 /// Worst in-spec offset error, 5 LSb a conversion over four (DS40002413B table 38-24).
 pub const GROUND_READING: u16 = 4 * 5;
+pub const CELL_READING: u16 = 6140;
+pub const ROOM_READING: u16 = 8603;
 
 pub fn voltage_reading(cell: u16) -> u16 {
     closest(cell, battery::centivolts)
@@ -48,6 +71,10 @@ pub fn voltage_reading(cell: u16) -> u16 {
 pub fn temperature_reading(kelvin: u16) -> u16 {
     let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE - raw);
     FULL_SCALE - closest(kelvin.saturating_mul(16), backwards)
+}
+
+pub fn celsius_reading(degrees: u8) -> u16 {
+    temperature_reading(thermal::celsius(degrees))
 }
 
 /// The smallest raw reading whose `read` is closest to `target`. `read` must
@@ -96,8 +123,8 @@ impl Adc {
     /// 3.8 V and 25 °C.
     pub const fn new() -> Self {
         Self {
-            voltage: 6140,
-            temperature: 8603,
+            voltage: CELL_READING,
+            temperature: ROOM_READING,
             ground: GROUND_READING,
             pending: None,
         }
@@ -636,12 +663,20 @@ impl Rng {
         Self(if seed == 0 { 1 } else { seed })
     }
 
-    /// The top bits, the better end of xorshift's state.
-    pub const fn next_u16(&mut self) -> u16 {
+    pub const fn next_u32(&mut self) -> u32 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 17;
         self.0 ^= self.0 << 5;
-        (self.0 >> 16) as u16
+        self.0
+    }
+
+    /// The top bits, the better end of xorshift's state.
+    pub const fn next_u16(&mut self) -> u16 {
+        (self.next_u32() >> 16) as u16
+    }
+
+    pub const fn between(&mut self, low: u16, high: u16) -> u16 {
+        low + self.next_u16() % (high - low + 1)
     }
 }
 

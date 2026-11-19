@@ -189,10 +189,9 @@ mod tests {
     #[test]
     fn never_moves_more_than_one_level_a_tick() {
         let mut gradual = Gradual::new(0, 1, 3);
-        let mut seed = 1u32;
+        let mut rng = crate::testing::Rng::new(1);
         for _ in 0..10_000 {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let target = (seed >> 16) as u8;
+            let target = rng.next_u16() as u8;
             let before = gradual.level();
             let after = gradual.tick(target);
             assert!(before.abs_diff(after) <= 1, "{before} → {after}");
@@ -282,11 +281,11 @@ mod tests {
     #[test]
     fn a_gentle_fade_closes_in_and_never_overshoots() {
         let mut fade = lit(100);
-        let mut seed = 1u32;
+        let mut rng = crate::testing::Rng::new(1);
         for _ in 0..10_000 {
-            seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-            let target = at(1 + (seed >> 16) as u8 % CEILING);
-            for _ in 0..=(seed >> 24) % 40 {
+            let seed = rng.next_u16();
+            let target = at(1 + seed as u8 % CEILING);
+            for _ in 0..=(seed >> 8) % 40 {
                 let before = fade.position();
                 let after = fade.tick((target / FRACTION) as u8, true);
                 assert!(
