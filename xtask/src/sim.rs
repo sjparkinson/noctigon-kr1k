@@ -61,6 +61,8 @@ const ISC_LEVEL: u8 = regs::PORT_ISC_LEVEL;
 const SLEEP_IDLE: u8 = regs::SLPCTRL_SMODE_IDLE;
 const SLEEP_POWER_DOWN: u8 = regs::SLPCTRL_SMODE_PDOWN;
 const TCB_RUNNING: u8 = regs::TCB_CLKSEL_DIV1 | TCB_ENABLE;
+const PIT_FAST: u8 = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
+const PIT_SLOW: u8 = regs::RTC_PERIOD_CYC32768 | RTC_PITEN;
 const ADC_ON: u8 = ADC_ENABLE | ADC_RESSEL_12BIT | regs::ADC_CONVMODE_SINGLEENDED;
 const DAC_DRIVING: u8 = DAC_ENABLE | DAC_OUTEN;
 /// How far DAC0's 10-bit code sits up DATA (§34.5.2).
@@ -231,13 +233,31 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
     ];
     let late_faults: [(FaultCheck, &str); 9] = [
         (cell_collapses, "with a collapsing cell"),
-        (aw2016_absent, "with the AW2016 never answering"),
-        (sda_held_low, "with SDA held low"),
-        (scl_held_low, "with SCL held low"),
+        (
+            |sim, report| bad_bus(sim, Fault::Absent, report),
+            "with the AW2016 never answering",
+        ),
+        (
+            |sim, report| bad_bus(sim, Fault::SdaLow, report),
+            "with SDA held low",
+        ),
+        (
+            |sim, report| bad_bus(sim, Fault::SclLow, report),
+            "with SCL held low",
+        ),
         (vddio2_drops, "with VDDIO2 going while lit"),
-        (resting_aligned, "resting, the PIT aligned"),
-        (resting_early, "resting, the PIT's first tick early"),
-        (resting_late, "resting, the PIT's first tick late"),
+        (
+            |sim, report| resting(sim, PitPhase::Aligned, report),
+            "resting, the PIT aligned",
+        ),
+        (
+            |sim, report| resting(sim, PitPhase::Early, report),
+            "resting, the PIT's first tick early",
+        ),
+        (
+            |sim, report| resting(sim, PitPhase::Late, report),
+            "resting, the PIT's first tick late",
+        ),
         (stale_edges, "resting, with an edge on every slow tick"),
     ];
     let power_on = &power_on;
@@ -352,6 +372,13 @@ fn lit(sim: &mut Sim, ticks: u16, report: &mut Report) -> Result<(), String> {
     Ok(())
 }
 
+fn ends_off(end: Option<u8>) -> Result<(), String> {
+    if end != Some(0) {
+        return Err(format!("ends at level {end:?}, not off"));
+    }
+    Ok(())
+}
+
 /// The slowest tick the oscillators allow, in main clocks, with the 32 kHz
 /// one 30% slow and the main one 5% fast (figure 38-2). Table 38-10 gives
 /// OSC32K no tolerance at all, so the 30% is a guess.
@@ -390,9 +417,7 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
     let mut sim = sim;
     let end = in_step(&mut sim, samples, report)?;
     let levels = levels.into_inner();
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     let lit = levels
         .iter()
         .position(|&level| level > 0)
@@ -437,9 +462,7 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     });
     let end = in_step(&mut sim, samples, report)?;
     let ticks = ticks.into_inner();
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     let good = |tick: &(u16, u8, Aux)| tick.0 >= COLLAPSE_BELOW;
     let mut slowest = 0;
     let mut falls = 0;
@@ -518,9 +541,7 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     let mut sim = sim;
     let end = in_step(&mut sim, samples, report)?;
     let ticks = ticks.into_inner();
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     let stuck = ticks
         .iter()
         .position(|tick| tick.0)
@@ -573,9 +594,7 @@ fn vddio2_missing(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     if sim.chip.vddio2_ok() {
         return Err("the fuses have single supply, so VDDIO2S reads 1 regardless".into());
     }
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     if sim.chip.pc1_rises != 0 {
         return Err("raised PC1 with VDDIO2 missing from power-on".into());
     }
@@ -609,9 +628,7 @@ fn vddio2_drops(mut sim: Sim, report: &mut Report) -> Result<(), String> {
     if !sim.chip.lost_lit {
         return Err("VDDIO2 never went with the light on, so this checked nothing".into());
     }
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     if sim.chip.pc1_rises != 1 {
         return Err(format!(
             "PC1 rose {} times, not just the once before VDDIO2 went",
@@ -645,9 +662,7 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
         Action::Wait(second),
     ];
     let end = in_step(&mut sim, testing::samples(script), report)?;
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     if sim.chip.slow_ticks < 40 {
         return Err(format!(
             "only {} slow ticks in over a minute of rests, so this checked little",
@@ -671,9 +686,7 @@ fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         Action::Wait(12 * second),
     ];
     let end = in_step(&mut sim, testing::samples(script), report)?;
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     if sim.chip.edges_with_ticks < 10 {
         return Err(format!(
             "only {} edges came with slow ticks, so this checked little",
@@ -681,30 +694,6 @@ fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-fn resting_aligned(sim: Sim, report: &mut Report) -> Result<(), String> {
-    resting(sim, PitPhase::Aligned, report)
-}
-
-fn resting_early(sim: Sim, report: &mut Report) -> Result<(), String> {
-    resting(sim, PitPhase::Early, report)
-}
-
-fn resting_late(sim: Sim, report: &mut Report) -> Result<(), String> {
-    resting(sim, PitPhase::Late, report)
-}
-
-fn aw2016_absent(sim: Sim, report: &mut Report) -> Result<(), String> {
-    bad_bus(sim, Fault::Absent, report)
-}
-
-fn sda_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
-    bad_bus(sim, Fault::SdaLow, report)
-}
-
-fn scl_held_low(sim: Sim, report: &mut Report) -> Result<(), String> {
-    bad_bus(sim, Fault::SclLow, report)
 }
 
 fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String> {
@@ -731,9 +720,7 @@ fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String
         Action::Wait(second),
     ];
     let end = in_step(&mut sim, testing::samples(script), report)?;
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
-    }
+    ends_off(end)?;
     if sim.chip.pc1_rises < 2 {
         return Err("the light didn't come on twice, so this checked nothing".into());
     }
@@ -1954,7 +1941,7 @@ impl Chip {
                 self.tcb.ccmp
             ));
         }
-        if self.io[reg::RTC_PITCTRLA] != regs::RTC_PERIOD_CYC512 | RTC_PITEN {
+        if self.io[reg::RTC_PITCTRLA] != PIT_FAST {
             return Err("the PIT isn't on at 512 cycles, 64 Hz".into());
         }
         Ok(())
@@ -2586,9 +2573,10 @@ impl Chip {
 
     fn write_dac_reference(&mut self, value: u8) -> Result<(), String> {
         if value != VREF_REFSEL_1V024 && value != VREF_REFSEL_2V500 {
-            return Err(format!(
-                "writes {value:#04x} to VREF.DAC0REF; the simulator only models 1.024 V and \
-                 2.5 V, with ALWAYSON clear"
+            return Err(only_models(
+                reg::VREF_DAC0REF,
+                value,
+                "1.024 V and 2.5 V, with ALWAYSON clear",
             ));
         }
         if value != self.dac_reference() {
@@ -2651,9 +2639,10 @@ impl Chip {
             }
             0 | TCB_RUNNING => {}
             _ => {
-                return Err(format!(
-                    "writes {value:#04x} to TCB0.CTRLA; the simulator only models it off, or \
-                     on and undivided"
+                return Err(only_models(
+                    reg::TCB0_CTRLA,
+                    value,
+                    "it off, or on and undivided",
                 ));
             }
         }
@@ -2887,6 +2876,13 @@ fn name(addr: usize) -> String {
         .iter()
         .find(|&&(a, _)| a == addr)
         .map_or_else(|| format!("{addr:#06x}"), |(_, n)| (*n).to_string())
+}
+
+fn only_models(a: usize, value: u8, what: &str) -> String {
+    format!(
+        "writes {value:#04x} to {}; the simulator only models {what}",
+        name(a)
+    )
 }
 
 impl Bus for Chip {
@@ -3197,10 +3193,7 @@ impl Bus for Chip {
                     self.io[a] = value;
                 }
                 _ => {
-                    return Err(format!(
-                        "writes {value:#04x} to DAC0.CTRLA; the simulator only models it off, \
-                         or on and driving PD6"
-                    ));
+                    return Err(only_models(a, value, "it off, or on and driving PD6"));
                 }
             },
             reg::DAC0_DATA => {
@@ -3227,18 +3220,17 @@ impl Bus for Chip {
             reg::TCB0_CTRLA => self.write_tcb_ctrla(value)?,
             reg::TCB0_CTRLB => {
                 if value != regs::TCB_CNTMODE_INT {
-                    return Err(format!(
-                        "writes {value:#04x} to TCB0.CTRLB; the simulator only models periodic \
-                         interrupt mode with no output"
+                    return Err(only_models(
+                        a,
+                        value,
+                        "periodic interrupt mode with no output",
                     ));
                 }
                 self.io[a] = value;
             }
             reg::TCB0_INTCTRL => {
                 if value & !TCB_CAPT != 0 {
-                    return Err(format!(
-                        "writes {value:#04x} to TCB0.INTCTRL; the simulator only models CAPT"
-                    ));
+                    return Err(only_models(a, value, "CAPT"));
                 }
                 // A flag left up from before fires at once (§24.3.5).
                 if value != 0
@@ -3294,15 +3286,14 @@ impl Bus for Chip {
                         name(a)
                     ));
                 }
-                let slow = regs::RTC_PERIOD_CYC32768 | RTC_PITEN;
-                if value != regs::RTC_PERIOD_CYC512 | RTC_PITEN && value != slow {
-                    return Err(format!(
-                        "writes {value:#04x} to {}; the simulator only models the PIT on at \
-                         512 cycles, 64 Hz, or 32,768, 1 Hz",
-                        name(a)
+                if value != PIT_FAST && value != PIT_SLOW {
+                    return Err(only_models(
+                        a,
+                        value,
+                        "the PIT on at 512 cycles, 64 Hz, or 32,768, 1 Hz",
                     ));
                 }
-                if value == slow && self.enabled_high() {
+                if value == PIT_SLOW && self.enabled_high() {
                     return Err(
                         "slows the PIT with PC1 high, so the light's protection runs once a \
                          second and the tick deadline's sums don't hold"
@@ -3372,9 +3363,10 @@ impl Bus for Chip {
             reg::RSTCTRL_RSTFR => self.rstfr &= !value,
             reg::CRCSCAN_CTRLA => {
                 if value != CRCSCAN_ENABLE {
-                    return Err(format!(
-                        "writes {value:#04x} to CRCSCAN.CTRLA; the simulator only models \
-                         ENABLE, with STATUS polled (NMIEN can't be undone without a reset)"
+                    return Err(only_models(
+                        a,
+                        value,
+                        "ENABLE, with STATUS polled (NMIEN can't be undone without a reset)",
                     ));
                 }
                 self.start_crc()?;
@@ -3383,11 +3375,7 @@ impl Bus for Chip {
             reg::ADC0_COMMAND => match value {
                 0 => {}
                 ADC_STCONV => self.start_conversion()?,
-                _ => {
-                    return Err(format!(
-                        "writes {value:#04x} to ADC0.COMMAND; the simulator only models STCONV"
-                    ));
-                }
+                _ => return Err(only_models(a, value, "STCONV")),
             },
             reg::ADC0_INTFLAGS => {
                 // A conversion still running sets the flag again.
@@ -3400,18 +3388,20 @@ impl Bus for Chip {
             }
             reg::VREF_ADC0REF => {
                 if value != VREF_REFSEL_1V024 && value != VREF_REFSEL_2V048 {
-                    return Err(format!(
-                        "writes {value:#04x} to VREF.ADC0REF; the simulator only models \
-                         1.024 V and 2.048 V, with ALWAYSON clear"
+                    return Err(only_models(
+                        a,
+                        value,
+                        "1.024 V and 2.048 V, with ALWAYSON clear",
                     ));
                 }
                 self.io[a] = value;
             }
             reg::ADC0_CTRLA => {
                 if value != 0 && value != ADC_ON {
-                    return Err(format!(
-                        "writes {value:#04x} to ADC0.CTRLA; the simulator only models it off, \
-                         or on for single 12-bit conversions"
+                    return Err(only_models(
+                        a,
+                        value,
+                        "it off, or on for single 12-bit conversions",
                     ));
                 }
                 if value & ADC_ENABLE == 0 {
@@ -4294,19 +4284,17 @@ mod tests {
     fn the_pit_ticks_slow_on_every_64th_edge_and_never_with_pc1_high() {
         let mut chip = Chip::new(Vec::new());
         chip.pit_busy = 0;
-        let fast = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
-        let slow = regs::RTC_PERIOD_CYC32768 | RTC_PITEN;
-        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
         chip.pit_busy = 0;
         ticks(&mut chip, 3).unwrap();
         assert_eq!(chip.ticks, 3);
-        poke(&mut chip, reg::RTC_PITCTRLA, slow).unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_SLOW).unwrap();
         chip.pit_busy = 0;
         ticks(&mut chip, 63).unwrap();
         assert_eq!((chip.ticks, chip.slow_ticks, chip.grid), (4, 1, 66));
         ticks(&mut chip, 64).unwrap();
         assert_eq!((chip.ticks, chip.slow_ticks), (5, 2));
-        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
         chip.pit_busy = 0;
         ticks(&mut chip, 1).unwrap();
         assert_eq!(chip.ticks, 6);
@@ -4314,7 +4302,7 @@ mod tests {
         assert!(err.contains("only models the PIT"), "{err}");
         let mut chip = lit();
         chip.pit_busy = 0;
-        let err = refused(&mut chip, reg::RTC_PITCTRLA, slow);
+        let err = refused(&mut chip, reg::RTC_PITCTRLA, PIT_SLOW);
         assert!(err.contains("slows the PIT with PC1 high"), "{err}");
     }
 
@@ -4391,13 +4379,12 @@ mod tests {
 
     #[test]
     fn the_pits_setup_waits_for_ctrlbusy() {
-        let fast = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
         let mut chip = Chip::new(Vec::new());
-        let err = refused(&mut chip, reg::RTC_PITCTRLA, fast);
+        let err = refused(&mut chip, reg::RTC_PITCTRLA, PIT_FAST);
         assert!(err.contains("CTRLBUSY is set"), "{err}");
         while chip.read(reg::RTC_PITSTATUS as u16).unwrap() != 0 {}
-        poke(&mut chip, reg::RTC_PITCTRLA, fast).unwrap();
-        assert!(poke(&mut chip, reg::RTC_PITCTRLA, fast).is_err());
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
+        assert!(poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).is_err());
     }
 
     #[test]
@@ -4509,7 +4496,7 @@ mod tests {
         let mut chip = dark();
         let err = chip.clocked_as_modelled().unwrap_err();
         assert!(err.contains("PIT isn't on"), "{err}");
-        chip.io[reg::RTC_PITCTRLA] = regs::RTC_PERIOD_CYC512 | RTC_PITEN;
+        chip.io[reg::RTC_PITCTRLA] = PIT_FAST;
         chip.clocked_as_modelled().unwrap();
         chip.io[reg::CLKCTRL_MCLKCTRLB] = regs::CLKCTRL_PEN;
         let err = chip.clocked_as_modelled().unwrap_err();
@@ -5047,12 +5034,7 @@ mod tests {
         poke(&mut chip, reg::RTC_PITINTCTRL, RTC_PI).unwrap();
         chip.pit_busy = 0;
         let pit = step(&mut chip);
-        poke(
-            &mut chip,
-            reg::RTC_PITCTRLA,
-            regs::RTC_PERIOD_CYC512 | RTC_PITEN,
-        )
-        .unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
         let watchdog = step(&mut chip);
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
 
@@ -5084,12 +5066,7 @@ mod tests {
         poke(&mut chip, SWITCH_CTRL, ISC_INTDISABLE).unwrap();
         poke(&mut chip, reg::RTC_PITINTCTRL, RTC_PI).unwrap();
         chip.pit_busy = 0;
-        poke(
-            &mut chip,
-            reg::RTC_PITCTRLA,
-            regs::RTC_PERIOD_CYC512 | RTC_PITEN,
-        )
-        .unwrap();
+        poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
         poke(&mut chip, reg::SLPCTRL_CTRLA, SLEEP_IDLE | SLPCTRL_SEN).unwrap();
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_PERIOD_MAX).unwrap();
         synced(&mut chip);
