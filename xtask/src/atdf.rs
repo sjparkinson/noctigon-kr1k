@@ -347,14 +347,13 @@ pub fn generate(xml: &str) -> String {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::Path;
 
     use kr1k::regs::{self, addr, mem};
 
     use super::*;
 
     fn atdf() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../vendor/AVR32DD20.atdf");
+        let path = crate::root().join("vendor/AVR32DD20.atdf");
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("can't read {}: {e}", path.display()))
     }
 
@@ -523,7 +522,7 @@ mod tests {
     }
 
     fn link_x() -> String {
-        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../link.x");
+        let path = crate::root().join("link.x");
         fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
     }
 

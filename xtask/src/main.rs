@@ -103,9 +103,12 @@ fn root() -> PathBuf {
         .to_path_buf()
 }
 
+fn cargo() -> String {
+    env::var("CARGO").unwrap_or_else(|_| "cargo".into())
+}
+
 fn build(examples: bool) -> Result<(elf::Elf, sim::Report), String> {
-    let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    run(Command::new(cargo).current_dir(root()).args([
+    run(Command::new(cargo()).current_dir(root()).args([
         "build",
         "--package",
         "kr1k",
@@ -483,6 +486,29 @@ fn at<E: Display>(path: &Path) -> impl Fn(E) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
 
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(name: &str) -> Result<Self, String> {
+        let dir = env::temp_dir().join(format!("kr1k-{name}-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).map_err(at(&dir))?;
+        }
+        fs::create_dir_all(&dir).map_err(at(&dir))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 fn run(command: &mut Command) -> Result<(), String> {
     let program = command.get_program().to_string_lossy().into_owned();
     let status = command
@@ -497,35 +523,25 @@ fn run(command: &mut Command) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use std::env;
     use std::fs;
     use std::path::{Path, PathBuf};
 
     use super::updi::tests::fake::Dd20;
     use super::updi::{Programmer, SerialNumber};
     use super::{
-        backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, signed, stamp,
-        this_boards_hex, write,
+        TempDir, backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, signed,
+        stamp, this_boards_hex, write,
     };
 
-    struct Scratch(PathBuf);
+    struct Scratch(TempDir);
 
     impl Scratch {
         fn new(test: &str) -> Self {
-            let dir = env::temp_dir().join(format!("kr1k-xtask-{}-{test}", std::process::id()));
-            let _ = fs::remove_dir_all(&dir);
-            fs::create_dir_all(&dir).unwrap();
-            Self(dir)
+            Self(TempDir::new(&format!("xtask-{test}")).unwrap())
         }
 
         fn backup(&self) -> PathBuf {
-            self.0.join("backup").join("torch")
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = fs::remove_dir_all(&self.0);
+            self.0.path().join("backup").join("torch")
         }
     }
 

@@ -1,11 +1,12 @@
 //! `cargo xtask breakages` breaks the firmware on purpose, one mistake at a
 //! time, and checks `cargo xtask hex` refuses each for the reason expected.
 
-use std::env;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
+
+use crate::{TempDir, at, cargo};
 
 const COPIED: [&str; 10] = [
     ".cargo",
@@ -490,7 +491,7 @@ pub fn run(root: &Path, names: &[&str]) -> Result<(), String> {
     let copy = Scratch::of(root)?;
     let started = Instant::now();
 
-    eprintln!("building an unbroken copy in {}", copy.dir.display());
+    eprintln!("building an unbroken copy in {}", copy.dir.path().display());
     let (passed, output) = copy.hex()?;
     if !passed {
         return Err(format!(
@@ -595,27 +596,25 @@ fn refused<'a>(output: &'a str, stage: Stage, expect: &str) -> Result<&'a str, S
 }
 
 struct Scratch {
-    dir: PathBuf,
+    dir: TempDir,
 }
 
 impl Scratch {
     fn of(root: &Path) -> Result<Self, String> {
-        let dir = env::temp_dir().join(format!("kr1k-breakages-{}", process::id()));
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(at(&dir))?;
-        }
         // Made before anything's copied, so a failed copy is cleared up too.
-        let copy = Self { dir };
+        let copy = Self {
+            dir: TempDir::new("breakages")?,
+        };
         for entry in COPIED {
-            copy_tree(&root.join(entry), &copy.dir.join(entry))?;
+            copy_tree(&root.join(entry), &copy.dir.path().join(entry))?;
         }
         Ok(copy)
     }
 
     fn hex(&self) -> Result<(bool, String), String> {
-        let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let cargo = cargo();
         let output = Command::new(&cargo)
-            .current_dir(&self.dir)
+            .current_dir(self.dir.path())
             .args(["xtask", "hex"])
             // The copy's xtask looks in the copy's own `target`.
             .env_remove("CARGO_TARGET_DIR")
@@ -632,12 +631,12 @@ impl Scratch {
         for other in BREAKAGES {
             let file = Path::new(other.file);
             let original = fs::read(root.join(file)).map_err(at(file))?;
-            let copy = self.dir.join(file);
+            let copy = self.dir.path().join(file);
             if fs::read(&copy).map_err(at(&copy))? != original {
                 fs::write(&copy, original).map_err(at(&copy))?;
             }
         }
-        let path = self.dir.join(breakage.file);
+        let path = self.dir.path().join(breakage.file);
         let source = fs::read_to_string(&path).map_err(at(&path))?;
         let broken = substitute(&source, breakage.find, breakage.replace)
             .map_err(|e| format!("{}: {e}", breakage.file))?;
@@ -648,12 +647,6 @@ impl Scratch {
             return Err("`cargo xtask hex` passed it".into());
         }
         refused(&output, breakage.stage, breakage.expect).map(str::to_string)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        _ = fs::remove_dir_all(&self.dir);
     }
 }
 
@@ -675,20 +668,10 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn at<E: std::fmt::Display>(path: &Path) -> impl Fn(E) -> String + '_ {
-    move |e| format!("{}: {e}", path.display())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .unwrap()
-            .to_path_buf()
-    }
+    use crate::root;
 
     #[test]
     fn a_substitution_wants_its_text_there_exactly_once() {
@@ -804,14 +787,17 @@ error: cargo failed (exit status: 101)
 
     #[test]
     fn a_copy_leaves_out_target_and_git_and_goes_when_its_dropped() {
-        let from = env::temp_dir().join(format!("kr1k-breakages-test-{}", process::id()));
-        let to = from.with_extension("copy");
+        let from = TempDir::new("breakages-test").unwrap();
+        let from = from.path();
         for dir in ["src/avr", "target", ".git", "src/target"] {
             fs::create_dir_all(from.join(dir)).unwrap();
             fs::write(from.join(dir).join("hw.rs"), "contents").unwrap();
         }
-        let copy = Scratch { dir: to.clone() };
-        copy_tree(&from, &to).unwrap();
+        let copy = Scratch {
+            dir: TempDir::new("breakages-test-copy").unwrap(),
+        };
+        let to = copy.dir.path().to_path_buf();
+        copy_tree(from, &to).unwrap();
         copy_tree(&from.join("src/avr/hw.rs"), &to.join("docs/hw.rs")).unwrap();
         let copied = fs::read_to_string(to.join("src/avr/hw.rs")).unwrap();
         assert_eq!(copied, "contents");
@@ -821,6 +807,5 @@ error: cargo failed (exit status: 101)
         }
         drop(copy);
         assert!(!to.exists());
-        fs::remove_dir_all(&from).unwrap();
     }
 }
