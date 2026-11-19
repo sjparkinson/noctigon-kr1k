@@ -1053,7 +1053,7 @@ mod tests {
         let limit = LIMIT * FRACTION as u16;
         let mut hot = 0;
         let mut cool = 0;
-        for sum in 0..=4 * 4095 {
+        for sum in 0..=crate::sensors::FULL_SCALE {
             let reading = crate::testing::CALIBRATION.sixteenths(sum);
             let too_hot = !plausible(reading) || reading > limit;
             let mut thermal = Thermal::new();

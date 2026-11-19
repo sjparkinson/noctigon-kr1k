@@ -68,7 +68,7 @@ mod tests {
 
     #[test]
     fn matches_the_sum_for_every_accumulated_reading_and_a_spread_of_calibrations() {
-        for sum in 0..=4 * 4095 {
+        for sum in 0..=crate::sensors::FULL_SCALE {
             for offset in (0..=u16::MAX).step_by(4099).chain([BACKUP.offset]) {
                 for slope in (0..=u16::MAX).step_by(4111).chain([BACKUP.slope]) {
                     assert_eq!(

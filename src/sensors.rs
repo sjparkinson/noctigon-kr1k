@@ -28,6 +28,8 @@ pub enum Reading {
     Ground(u16),
 }
 
+pub const FULL_SCALE: u16 = 4 * 4095;
+
 /// Each channel reads four times a second, which `battery` and `thermal` expect.
 pub const CYCLE_TICKS: u8 = 16;
 const TEMPERATURE_AT: u8 = CYCLE_TICKS / 2;
@@ -423,8 +425,8 @@ mod tests {
     #[test]
     fn two_ground_readings_in_a_row_well_off_zero_are_a_stuck_adc() {
         assert_eq!((GROUND_MAX, GROUND_MISSES), (64, 2));
-        // 6140 is a cell's own reading, and 4 × 4095 is full scale.
-        for raw in [GROUND_MAX + 1, 6140, 4 * 4095, u16::MAX] {
+        // 6140 is a cell's own reading.
+        for raw in [GROUND_MAX + 1, 6140, FULL_SCALE, u16::MAX] {
             let mut ground = Ground::new();
             assert!(!ground.reading(raw), "{raw}: one");
             assert!(ground.reading(raw), "{raw}: two");
@@ -448,7 +450,7 @@ mod tests {
 
     #[test]
     fn every_plausible_cell_reading_is_far_over_grounds_limit() {
-        let smallest = (0..=4 * 4095)
+        let smallest = (0..=FULL_SCALE)
             .find(|&raw| crate::battery::plausible(crate::battery::centivolts(raw)))
             .unwrap();
         assert!(smallest > 20 * GROUND_MAX, "{smallest}");

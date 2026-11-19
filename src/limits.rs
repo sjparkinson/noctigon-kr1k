@@ -205,7 +205,7 @@ mod tests {
     use super::*;
     use crate::TICKS_PER_SECOND;
     use crate::ramp::LEVELS;
-    use crate::sensors::{CYCLE_TICKS, UNREAD_TICKS};
+    use crate::sensors::{CYCLE_TICKS, FULL_SCALE, UNREAD_TICKS};
     use crate::testing::{Adc, CALIBRATION, temperature_reading, voltage_reading};
     use crate::thermal::{self, FLOOR};
     use std::vec::Vec;
@@ -647,7 +647,7 @@ mod tests {
 
     #[test]
     fn garbage_voltages_fade_it_out_and_latch_a_fault() {
-        for garbage in [0, 4 * 4095, 1] {
+        for garbage in [0, FULL_SCALE, 1] {
             let mut run = Run::new();
             run.ui = CEILING;
             run.secs(2);
@@ -939,7 +939,7 @@ mod tests {
     #[test]
     fn an_unloaded_reading_is_one_with_the_light_out_for_two_ticks_before_it() {
         let due = |tick: usize| tick % usize::from(CYCLE_TICKS) == 2;
-        for voltage in [voltage_reading(320), 0, 4 * 4095] {
+        for voltage in [voltage_reading(320), 0, FULL_SCALE] {
             let mut limits = Limits::new(CALIBRATION, Faults::NONE);
             let mut adc = Adc::new();
             adc.voltage = voltage;
@@ -993,8 +993,12 @@ mod tests {
     #[test]
     fn garbage_from_power_on_shows_nothing_from_off() {
         let (voltage, temperature) = (Adc::new().voltage, Adc::new().temperature);
-        for (voltage, temperature) in [(0, temperature), (voltage, 0), (0, 0), (4 * 4095, 4 * 4095)]
-        {
+        for (voltage, temperature) in [
+            (0, temperature),
+            (voltage, 0),
+            (0, 0),
+            (FULL_SCALE, FULL_SCALE),
+        ] {
             let mut run = Run::new();
             run.adc.voltage = voltage;
             run.adc.temperature = temperature;
@@ -1110,12 +1114,12 @@ mod tests {
             };
             let run = 1 + u32::from(rng.next_u16() % 4000);
             let mode = rng.next_u16() % 3;
-            let held = rng.next_u16() % (4 * 4095 + 1);
+            let held = rng.next_u16() % (FULL_SCALE + 1);
             for _ in 0..run {
                 let result = match (rng.next_u16() % 4, mode) {
                     (0, _) => None,
                     (_, 0) => Some(rng.next_u16()),
-                    (_, 1) => Some(rng.next_u16() % (4 * 4095 + 1)),
+                    (_, 1) => Some(rng.next_u16() % (FULL_SCALE + 1)),
                     _ => Some(held),
                 };
                 let gone = gone_at == Some(tick);
