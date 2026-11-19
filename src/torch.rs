@@ -3,7 +3,6 @@
 
 use crate::TICKS_PER_SECOND;
 use crate::button::{Clicks, Debounce, Event};
-use crate::gradual::Fade;
 use crate::limits::{Health, Limits};
 use crate::ramp::{self, Output};
 use crate::selftest::Faults;
@@ -44,9 +43,6 @@ pub struct Torch {
     /// Reading the cell with the switch up and the light off.
     checking: bool,
     cell_low: bool,
-    fade: Fade,
-    /// What the UI asked of `limits` on its last tick.
-    asked: u8,
 }
 
 impl Torch {
@@ -60,8 +56,6 @@ impl Torch {
             check_in: 0,
             checking: false,
             cell_low: false,
-            fade: Fade::new(),
-            asked: 0,
         }
     }
 
@@ -95,7 +89,6 @@ impl Torch {
         {
             self.checking = true;
         }
-        let mut gentle = false;
         if !self.resting() {
             let asked = if lit_window {
                 self.ui.output_level()
@@ -103,9 +96,6 @@ impl Torch {
                 0
             };
             let step = self.limits.tick(asked, adc, vddio2);
-            let (battery, thermal) = self.limits.ceilings();
-            gentle = asked == self.asked && thermal <= battery;
-            self.asked = asked;
             if step.off {
                 self.ui.off();
             }
@@ -129,7 +119,6 @@ impl Torch {
         } else {
             self.check_in = CHECK_TICKS;
         }
-        self.fade.tick(self.level(), gentle);
         event
     }
 
@@ -192,7 +181,7 @@ impl Torch {
         match self.level() {
             0 => Output::OFF,
             _ if self.limits.starting() => Output::STARTING,
-            _ => ramp::output_between(self.fade.position()),
+            _ => ramp::output_between(self.limits.position()),
         }
     }
 
