@@ -27,7 +27,7 @@ use kr1k::watchdog::{
     TIMER_PERIOD_CLOCKS,
 };
 
-use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_two_words, ldi};
+use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_call, is_two_words, ldi, ldi_operands};
 use crate::crc;
 use crate::elf::{DATA_SPACE, Elf, SRAM};
 use crate::layout::{self, jmp_target, word};
@@ -1199,12 +1199,11 @@ fn patch_startup(
     let mut at = reset;
     loop {
         let w = word(image, at).ok_or("no call to main after __reset")?;
-        if w & 0xFE0E == 0x940E {
+        if is_call(w) {
             break; // call main
         }
-        if w >> 12 == 0xE {
-            let k = ((w >> 4) & 0xF0 | w & 0x0F) as u8;
-            found.push((at, (16 + ((w >> 4) & 0x0F)) as u8, k));
+        if let Some((r, k)) = ldi_operands(w) {
+            found.push((at, r, k));
         }
         at += if is_two_words(w) { 4 } else { 2 };
     }
@@ -4572,33 +4571,14 @@ mod tests {
         assert!(err.contains("TCB0's 16-bit"), "{err}");
     }
 
-    const NOP: u16 = 0x0000;
-    const SEI: u16 = 0x9478;
+    use crate::avr::asm::{CLI, NOP, RETI, SEI, SLEEP, bytes as image, jmp, out, sts};
+
     const SEC: u16 = 0x9408;
-    const SLEEP: u16 = 0x9588;
-    const RETI: u16 = 0x9518;
     const PUSH_R0: u16 = 0x920F;
     /// `rjmp` to itself.
     const SPIN: u16 = 0xCFFF;
 
-    /// `to` is a byte address in the first 128 KB.
-    fn jmp(to: u32) -> [u16; 2] {
-        [0x940C, (to / 2) as u16]
-    }
-
-    fn sts_r16(a: usize) -> [u16; 2] {
-        [0x9300, a as u16]
-    }
-
-    fn out_r16(a: usize) -> u16 {
-        0xB800 | (a as u16 & 0x30) << 5 | 16 << 4 | a as u16 & 0x0F
-    }
-
     const ST_X_R16: u16 = 0x930C;
-
-    fn image(words: impl IntoIterator<Item = u16>) -> Vec<u8> {
-        words.into_iter().flat_map(u16::to_le_bytes).collect()
-    }
 
     fn sim(words: impl IntoIterator<Item = u16>) -> Sim {
         let ends = Ends {
@@ -4621,8 +4601,9 @@ mod tests {
     // Errata 2.2.3, GPR1 standing for anything under 64.
     #[test]
     fn a_store_under_64_straight_after_one_over_64_is_lost() {
-        let high = sts_r16(reg::RTC_PITINTFLAGS);
-        let low = sts_r16(reg::GPR_GPR1);
+        let high = sts(16, reg::RTC_PITINTFLAGS as u16);
+        let low = sts(16, reg::GPR_GPR1 as u16);
+        let sleep = sts(16, reg::SLPCTRL_CTRLA as u16);
         let lost = |words: Vec<u16>| stores(words).unwrap_err();
         let err = lost([high, low].concat());
         assert!(
@@ -4631,23 +4612,22 @@ mod tests {
         );
         let err = lost([&high[..], &[ST_X_R16]].concat());
         assert!(err.contains("GPR.GPR0 straight after"), "{err}");
-        let err = lost([high, sts_r16(reg::SLPCTRL_CTRLA)].concat());
+        let err = lost([high, sleep].concat());
         assert!(err.contains("SLPCTRL.CTRLA straight after"), "{err}");
         stores([&high[..], &[NOP], &low[..]].concat()).unwrap();
-        stores([&high[..], &[out_r16(reg::GPR_GPR1)]].concat()).unwrap();
-        stores([&high[..], &[NOP], &sts_r16(reg::SLPCTRL_CTRLA)[..]].concat()).unwrap();
-        stores([high, sts_r16(reg::RTC_PITINTFLAGS)].concat()).unwrap();
+        stores([&high[..], &[out(reg::GPR_GPR1 as u16, 16)]].concat()).unwrap();
+        stores([&high[..], &[NOP], &sleep[..]].concat()).unwrap();
+        stores([high, high].concat()).unwrap();
     }
 
     #[test]
     fn found_lit_wants_out_cleared_by_the_first_register_write() {
-        let out = |a: usize, r: u16| 0xB800 | (a as u16 & 0x30) << 5 | r << 4 | a as u16 & 0x0F;
         let run = |writes: [u16; 2]| {
             let image = image([ldi(16, ENABLE), ldi(17, 0)].into_iter().chain(writes));
             found_lit(Sim::new(image, SRAM.start, Ends::default())?)
         };
-        let dir = out(reg::VPORTC_DIR, 16);
-        let clear = out(reg::VPORTC_OUT, 17);
+        let dir = out(reg::VPORTC_DIR as u16, 16);
+        let clear = out(reg::VPORTC_OUT as u16, 17);
         assert_eq!(run([clear, dir]), Ok(()));
         let err = run([dir, clear]).unwrap_err();
         assert!(err.contains("leaves PC1 set"), "{err}");
@@ -4913,7 +4893,7 @@ mod tests {
 
     #[test]
     fn a_pass_that_stops_for_good_fails() {
-        let err = stop_for_good(0x94F8).unwrap_err();
+        let err = stop_for_good(CLI).unwrap_err();
         assert!(err.contains("stopped for good"), "{err}");
     }
 
@@ -5089,7 +5069,9 @@ mod tests {
 
     /// The least a firmware can be and still tick.
     fn ticking() -> Sim {
-        let handler = sts_r16(reg::RTC_PITINTFLAGS).into_iter().chain([RETI]);
+        let handler = sts(16, reg::RTC_PITINTFLAGS as u16)
+            .into_iter()
+            .chain([RETI]);
         let mut words = handled_by(VECTOR_RTC_PIT, &handler.collect::<Vec<_>>());
         // `lds r17, VPORTD.IN`, `sleep`, then back to the `lds`.
         words[1] = 0x9110;

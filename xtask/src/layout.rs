@@ -3,7 +3,7 @@
 
 use kr1k::regs::{VECTORS, addr};
 
-use crate::avr::is_two_words;
+use crate::avr::{io_address, is_two_words, long_target};
 use crate::elf::{DATA_SPACE, Elf, RAM, Segment};
 use crate::updi::map;
 
@@ -234,13 +234,12 @@ pub(crate) fn jmp_target(image: &[u8], at: usize) -> Option<u32> {
     if w0 & 0xFE0E != 0x940C {
         return None;
     }
-    let high = u32::from(w0 & 0x01F0) << 13 | u32::from(w0 & 1) << 16;
-    Some((high | u32::from(w1)) * 2)
+    Some(long_target(w0, w1) * 2)
 }
 
 /// `out A, Rr` is 1011 1AAr rrrr AAAA.
 fn out_address(w: u16) -> Option<u16> {
-    (w & 0xF800 == 0xB800).then_some((w >> 5) & 0x30 | w & 0x0F)
+    (w & 0xF800 == 0xB800).then_some(io_address(w))
 }
 
 /// `st Z, Rr` is 1000 001r rrrr 0000.
@@ -251,25 +250,14 @@ const fn is_st_z(w: u16) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::avr::asm::{NOP, RETI, bytes, jmp};
 
     const OUT_CCP_R24: u16 = 0xBF84;
     const ST_Z_R25: u16 = 0x8390;
-    const NOP: u16 = 0x0000;
-
-    fn bytes(words: &[u16]) -> Vec<u8> {
-        words.iter().flat_map(|w| w.to_le_bytes()).collect()
-    }
-
-    fn jmp(byte_addr: u32) -> [u16; 2] {
-        let k = byte_addr / 2;
-        let w0 = 0x940C | ((k >> 13) & 0x01F0) as u16 | ((k >> 16) & 1) as u16;
-        [w0, k as u16]
-    }
 
     const UNHANDLED: u32 = 0x90;
     const RESET: u32 = 0x96;
     const HALT_AT: u32 = 0x98;
-    const RETI: u16 = 0x9518;
 
     fn clear_r1_and_halt() -> [u16; 3] {
         let [w0, w1] = jmp(HALT_AT);
@@ -280,7 +268,7 @@ mod tests {
         let mut words: Vec<u16> = (0..VECTORS).flat_map(table).collect();
         words.extend(unhandled);
         words.extend([NOP, NOP]);
-        bytes(&words)
+        bytes(words)
     }
 
     fn image(table: impl Fn(usize) -> [u16; 2]) -> Vec<u8> {
@@ -294,9 +282,9 @@ mod tests {
     #[test]
     fn decodes_jmp_across_the_whole_address_range() {
         for addr in [0, 0x90, 0x7FFE, 0x2_0000, 0x7F_FFFE] {
-            assert_eq!(jmp_target(&bytes(&jmp(addr)), 0), Some(addr));
+            assert_eq!(jmp_target(&bytes(jmp(addr)), 0), Some(addr));
         }
-        assert_eq!(jmp_target(&bytes(&[0x940E, 0]), 0), None, "call, not jmp");
+        assert_eq!(jmp_target(&bytes([0x940E, 0]), 0), None, "call, not jmp");
     }
 
     #[test]
@@ -528,30 +516,30 @@ mod tests {
 
     #[test]
     fn accepts_an_unlock_followed_by_the_write() {
-        let text = bytes(&[NOP, OUT_CCP_R24, ST_Z_R25, NOP, OUT_CCP_R24, ST_Z_R25]);
+        let text = bytes([NOP, OUT_CCP_R24, ST_Z_R25, NOP, OUT_CCP_R24, ST_Z_R25]);
         assert_eq!(protected_writes(&text), Ok(2));
     }
 
     #[test]
     fn rejects_an_unlock_with_anything_in_between() {
-        let text = bytes(&[OUT_CCP_R24, NOP, ST_Z_R25]);
+        let text = bytes([OUT_CCP_R24, NOP, ST_Z_R25]);
         assert!(protected_writes(&text).unwrap_err().contains("0x0000"));
-        let text = bytes(&[NOP, OUT_CCP_R24]);
+        let text = bytes([NOP, OUT_CCP_R24]);
         assert!(protected_writes(&text).is_err(), "unlock at the very end");
     }
 
     #[test]
     fn skips_the_address_word_of_two_word_instructions() {
         // 0x9180 is `lds r24, k` and 0x940E is `call k`.
-        let text = bytes(&[0x9180, OUT_CCP_R24, NOP, OUT_CCP_R24, ST_Z_R25]);
+        let text = bytes([0x9180, OUT_CCP_R24, NOP, OUT_CCP_R24, ST_Z_R25]);
         assert_eq!(protected_writes(&text), Ok(1));
-        let text = bytes(&[0x940E, OUT_CCP_R24, OUT_CCP_R24, ST_Z_R25]);
+        let text = bytes([0x940E, OUT_CCP_R24, OUT_CCP_R24, ST_Z_R25]);
         assert_eq!(protected_writes(&text), Ok(1));
     }
 
     #[test]
     fn insists_on_at_least_one_protected_write() {
-        assert!(protected_writes(&bytes(&[NOP, ST_Z_R25])).is_err());
+        assert!(protected_writes(&bytes([NOP, ST_Z_R25])).is_err());
     }
 
     #[test]
