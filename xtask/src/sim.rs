@@ -571,8 +571,8 @@ fn switch_stuck(mut sim: Sim, report: &mut Report) -> Result<(), String> {
         20_000,
     );
     let end = in_step(&mut sim, samples, report)?;
-    if end != Some(0) {
-        return Err(format!("ends at level {end:?}, not off"));
+    if end != Some(kr1k::ui::FLOOR) {
+        return Err(format!("ends at level {end:?}, not the floor"));
     }
     Ok(())
 }
@@ -655,7 +655,7 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
         Action::Clicks(3),
         Action::Wait(9 * second + 40),
         Action::Hold {
-            clicks: 0,
+            clicks: 1,
             ticks: 2 * second,
         },
         Action::Wait(10 * second + 5),
