@@ -118,10 +118,10 @@ const TICK_CYCLES: u64 = CLK_PER as u64 / TICKS_PER_SECOND as u64;
 const _: () = assert!(TICK_CYCLES * TICKS_PER_SECOND as u64 == CLK_PER as u64);
 /// A load from mapped flash can take more than four clocks (instruction set
 /// manual, table 5-4 note 2) and how many isn't stated, so this is likely.
-const TICK_BUDGET: u64 = TICK_CYCLES / 4;
+pub const TICK_BUDGET: u64 = TICK_CYCLES / 4;
 /// §15.3.2.3, table 15-1.
 const INTERRUPT_CYCLES: u64 = 10;
-const HANDLER_BUDGET: u64 = (TIMER_PERIOD - INTERRUPT_CYCLES) / 4;
+pub const HANDLER_BUDGET: u64 = (TIMER_PERIOD - INTERRUPT_CYCLES) / 4;
 /// 10 µs (table 38-23). A floor, since how fast PD6 falls on this board is
 /// unknown.
 const DAC_SETTLE_CYCLES: u64 = CLK_PER as u64 / 100_000;
@@ -138,12 +138,9 @@ pub struct Report {
     /// Bytes.
     pub stack: u16,
     pub loop_instructions: u64,
-    pub loop_budget: u64,
     pub off_instructions: u64,
     pub handler_instructions: u64,
-    pub handler_budget: u64,
     pub landed: u32,
-    pub mid_access: u32,
     last_new: u32,
 }
 
@@ -154,14 +151,12 @@ impl Report {
         self.off_instructions = self.off_instructions.max(run.off_instructions);
         self.handler_instructions = self.handler_instructions.max(run.handler_instructions);
         self.landed += run.landed;
-        self.mid_access += run.mid_access;
     }
 
     fn take(&mut self, sim: &Sim) {
         self.stack = self.stack.max(sim.stack());
         self.handler_instructions = self.handler_instructions.max(sim.longest_handler);
         self.landed += sim.landed;
-        self.mid_access += sim.mid_access;
         self.last_new = self.last_new.max(sim.last_new);
     }
 }
@@ -282,11 +277,7 @@ pub fn check(elf: &Elf, examples: bool) -> Result<Report, String> {
             .collect()
     });
 
-    let mut report = Report {
-        loop_budget: TICK_BUDGET,
-        handler_budget: HANDLER_BUDGET,
-        ..Report::default()
-    };
+    let mut report = Report::default();
     for run in reports {
         report.merge(&run?);
     }
@@ -1300,8 +1291,6 @@ struct Sim {
     /// SP below this means a push landed in .bss.
     stack_floor: u16,
     lowest_sp: u16,
-    /// Unlike `Chip::now`, stops while asleep.
-    executed: u64,
     /// Leaves out handlers' instructions while `land` is landing interrupts.
     counted: u64,
     /// Word address.
@@ -1320,7 +1309,6 @@ struct Sim {
     tick_no: u32,
     last_new: u32,
     landed: u32,
-    mid_access: u32,
     /// Switch edges handled since the main loop last read it, with no tick
     /// since. Only those can end a slow sleep with no library pass to match.
     late_edges: u32,
@@ -1348,7 +1336,6 @@ impl Sim {
             handled,
             chip,
             stack_floor: bss_end - 1,
-            executed: 0,
             counted: 0,
             unhandled,
             halt: ends.halt / 2,
@@ -1362,7 +1349,6 @@ impl Sim {
             tick_no: 0,
             last_new: 0,
             landed: 0,
-            mid_access: 0,
             late_edges: 0,
         })
     }
@@ -1407,7 +1393,6 @@ impl Sim {
         let handling = self.cpu.handling;
         // `hw::halt` gets the main loop's rules, wherever it was reached from.
         self.chip.in_handler = handling.is_some() && !self.abandoned;
-        self.chip.interrupts_on = self.cpu.flag(I);
         self.cpu.step(&mut self.chip)?;
         // §13.3.1 and figure 15-1. Neither says the other's enough, so both.
         if self.chip.down && self.cpu.flag(I) {
@@ -1422,7 +1407,6 @@ impl Sim {
             self.abandon();
         }
         if awake {
-            self.executed += 1;
             let landing = matches!(self.landing, Landing::Until(_));
             if !landing || handling.is_none() || self.abandoned {
                 self.counted += 1;
@@ -1474,7 +1458,6 @@ impl Sim {
                     self.forced = Some(vector);
                 }
                 self.chip.interrupted = self.chip.temps_in_use();
-                self.mid_access += u32::from(self.chip.interrupted != 0);
                 self.handler_steps = 0;
                 self.landed_on = Some(Landed {
                     r: self.cpu.r,
@@ -1793,8 +1776,6 @@ struct Chip {
     enabled: u64,
     forced: Option<u8>,
     in_handler: bool,
-    /// As the running instruction started.
-    interrupts_on: bool,
     interrupted: u8,
     pc1_rose_at: u64,
     vref_changed_at: u64,
@@ -1856,7 +1837,6 @@ impl Chip {
             enabled: 0,
             forced: None,
             in_handler: false,
-            interrupts_on: false,
             interrupted: 0,
             pc1_rose_at: 0,
             vref_changed_at: 0,
