@@ -70,7 +70,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Cover.** 3C locks and unlocks. In lockout `ui::Ui` never lights, and four presses are a 4C, which does nothing.
 
-**Unproven.** Seen, for locking and unlocking. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
+**Unproven.** Seen, for locking and unlocking. Unlocked, a click lights it, and so does a press held past `button::HOLD_TICKS`, which lights `ui::FLOOR`. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
 
 ### H9. Corrupt or half-written flash
 
