@@ -188,6 +188,7 @@ impl Protection {
     }
 
     /// One tick with nothing measuring the cell.
+    #[cfg(test)]
     pub const fn rest(&mut self) {
         self.rest_for(1);
     }
