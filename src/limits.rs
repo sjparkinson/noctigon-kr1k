@@ -262,11 +262,25 @@ mod tests {
             for _ in 0..ticks {
                 self.tick();
             }
-            *self.levels.last().unwrap()
+            self.level()
         }
 
         fn secs(&mut self, seconds: u32) -> u8 {
             self.ticks(seconds * u32::from(TICKS_PER_SECOND))
+        }
+
+        fn until_fault(&mut self) {
+            while self.limits.health() == Health::Good {
+                self.tick();
+            }
+        }
+
+        fn lit(&self) -> Vec<u8> {
+            self.levels.iter().copied().filter(|&l| l > 0).collect()
+        }
+
+        fn level(&self) -> u8 {
+            *self.levels.last().unwrap()
         }
     }
 
@@ -340,7 +354,7 @@ mod tests {
         }
         run.secs(30);
         assert_eq!(run.offs, 1);
-        assert_eq!(*run.levels.last().unwrap(), 0);
+        assert_eq!(run.level(), 0);
         assert_eq!(run.limits.health(), Health::Flat);
     }
 
@@ -462,14 +476,14 @@ mod tests {
         assert_eq!(run.secs(2), CEILING, "not a collapse");
         run.secs(20);
         assert_eq!(run.offs, 1);
-        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        let lit = run.lit();
         assert_eq!(lit.last(), Some(&1));
         let mut run = Run::new();
         run.ui = CEILING;
         run.secs(2);
         run.adc.voltage = voltage_reading(battery::COLLAPSE_BELOW - 1);
         run.secs(2);
-        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        let lit = run.lit();
         assert_eq!(lit.last(), Some(&CEILING));
     }
 
@@ -522,7 +536,7 @@ mod tests {
             let on = run.levels.len();
             run.ticks(u32::from(CYCLE_TICKS) + COLLAPSE_TICKS as u32);
             let lit = run.levels[on..].iter().take_while(|&&l| l > 0).count();
-            assert_eq!(*run.levels.last().unwrap(), 0, "on at {at}");
+            assert_eq!(run.level(), 0, "on at {at}");
             assert_eq!(run.limits.health(), Health::Flat, "on at {at}");
             took.push(lit);
         }
@@ -538,14 +552,12 @@ mod tests {
         run.ui = CEILING;
         run.secs(2);
         run.adc.voltage = 0;
-        while run.limits.health() == Health::Good {
-            run.tick();
-        }
+        run.until_fault();
         run.adc.voltage = voltage_reading(270);
         run.ticks(COLLAPSE_TICKS as u32);
         assert_eq!(run.offs, 1);
-        assert_eq!(*run.levels.last().unwrap(), 0);
-        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        assert_eq!(run.level(), 0);
+        let lit = run.lit();
         let last = *lit.last().unwrap();
         assert!(
             last > CEILING - 20,
@@ -628,7 +640,7 @@ mod tests {
         run.adc.voltage = voltage_reading(295);
         run.secs(5);
         assert_eq!(run.offs, 1);
-        let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+        let lit = run.lit();
         for level in 1..CEILING {
             assert!(lit.contains(&level), "faded through {level}");
         }
@@ -648,7 +660,7 @@ mod tests {
             run.secs(3);
             assert_eq!(run.offs, 1, "{garbage}");
             assert_eq!(run.limits.health(), Health::Fault, "{garbage}");
-            let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+            let lit = run.lit();
             for level in 1..CEILING {
                 assert!(lit.contains(&level), "{garbage}: faded through {level}");
             }
@@ -668,9 +680,7 @@ mod tests {
         run.ui = CEILING;
         run.secs(2);
         run.adc.voltage = 0;
-        while run.limits.health() == Health::Good {
-            run.tick();
-        }
+        run.until_fault();
         let mut last = run.limits.level();
         assert_eq!(last, CEILING - 1, "the fade's first step");
         while last > 0 {
@@ -690,9 +700,7 @@ mod tests {
         run.ui = CEILING;
         run.secs(2);
         run.adc.voltage = 0;
-        while run.limits.health() == Health::Good {
-            run.tick();
-        }
+        run.until_fault();
         run.adc.voltage = voltage_reading(420);
         run.secs(30);
         assert_eq!(run.offs, 1);
@@ -723,7 +731,7 @@ mod tests {
             run.ticks(u32::from(CYCLE_TICKS));
         }
         assert_eq!(run.limits.health(), Health::Good);
-        assert_eq!(*run.levels.last().unwrap(), CEILING);
+        assert_eq!(run.level(), CEILING);
         assert_eq!(run.offs, 0);
     }
 
@@ -756,7 +764,7 @@ mod tests {
             assert_eq!(run.limits.health(), Health::Fault, "at {at}");
             assert_eq!(run.secs(3), 0, "at {at}");
             assert_eq!(run.offs, 1, "at {at}");
-            let lit: Vec<u8> = run.levels.iter().copied().filter(|&l| l > 0).collect();
+            let lit = run.lit();
             assert_eq!(lit.last(), Some(&1), "faded out, at {at}");
         }
     }
@@ -772,7 +780,7 @@ mod tests {
             run.ticks(u32::from(CYCLE_TICKS));
         }
         assert_eq!(run.limits.health(), Health::Good);
-        assert_eq!(*run.levels.last().unwrap(), 100);
+        assert_eq!(run.level(), 100);
     }
 
     #[test]
@@ -1064,9 +1072,7 @@ mod tests {
         run.ui = CEILING;
         run.secs(2);
         run.adc.voltage = 0;
-        while run.limits.health() == Health::Good {
-            run.tick();
-        }
+        run.until_fault();
         let fading = run.ticks(10);
         assert!(fading > 1 && fading < CEILING, "{fading}");
         run.vddio2 = false;
