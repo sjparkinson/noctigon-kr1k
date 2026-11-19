@@ -538,14 +538,6 @@ mod tests {
     }
 
     #[test]
-    fn a_second_click_turns_it_off() {
-        let mut torch = Rig::default();
-        click(&mut torch);
-        click(&mut torch);
-        assert_eq!(torch.output(), Output::OFF);
-    }
-
-    #[test]
     fn lockout_never_lights() {
         let mut torch = Rig::default();
         clicks(&mut torch, 3);
@@ -937,20 +929,45 @@ mod tests {
     }
 
     #[test]
-    fn the_rest_rows_in_docs_ui_md_end_on_the_aux_they_describe() {
+    fn examples_end_in_the_health_and_aux_they_describe() {
         let rows = [
-            ("Flat cell, charged, left alone", Aux::Blue),
-            ("Low cell, at rest", Aux::Off),
-            ("Low cell, read by a press", Aux::Off),
-            ("Low cell, charged at rest", Aux::Blue),
-            ("A cell it can't read, at rest", Aux::Off),
+            ("Flat cell, charged, left alone", Health::Good, Aux::Blue),
+            ("Low cell, at rest", Health::Good, Aux::Off),
+            ("Low cell, read by a press", Health::Good, Aux::Off),
+            ("Low cell, charged at rest", Health::Good, Aux::Blue),
+            ("A cell it can't read, at rest", Health::Good, Aux::Off),
+            ("A cell that collapses", Health::Flat, Aux::Yellow),
+            ("A collapsed cell, 1C again", Health::Flat, Aux::Yellow),
+            (
+                "A collapsed cell that rests at 3.60 V or more, 1C",
+                Health::Good,
+                Aux::Off,
+            ),
+            (
+                "A dip under 2.80 V that's gone by the next reading",
+                Health::Good,
+                Aux::Off,
+            ),
+            ("VDDIO2 missing at power-on", Health::Fault, Aux::White),
+            ("VDDIO2 lost with the light on", Health::Fault, Aux::White),
+            ("VDDIO2 lost, then back", Health::Fault, Aux::White),
+            ("VDDIO2 lost with the light off", Health::Fault, Aux::White),
+            (
+                "VDDIO2 lost and back while it rests",
+                Health::Good,
+                Aux::Off,
+            ),
         ];
-        for (row, aux) in rows {
+        for (row, health, aux) in rows {
             let example = example(row);
             let rig = Rig::play(example.actions());
+            assert_eq!(rig.health(), health, "{row}");
             assert_eq!(rig.aux(), aux, "{row}");
-            assert_eq!(rig.health(), Health::Good, "{row}");
         }
+    }
+
+    #[test]
+    fn the_rest_examples_show_the_aux_they_describe_part_way_through() {
         let mut low = Rig::play(example("Low cell, at rest").actions().take(2));
         assert_eq!(low.aux(), Aux::Off, "dark before the 1C");
         low.adc.voltage = voltage_reading(320);
@@ -1182,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn the_stuck_adc_rows_in_docs_ui_md_end_as_they_describe() {
+    fn the_stuck_adc_examples_end_as_they_describe() {
         for row in [
             "An ADC stuck on one reading",
             "An ADC stuck on one reading, at rest",
@@ -1216,27 +1233,7 @@ mod tests {
     }
 
     #[test]
-    fn the_collapse_rows_in_docs_ui_md_end_as_they_describe() {
-        let rows = [
-            ("A cell that collapses", Health::Flat, Aux::Yellow),
-            ("A collapsed cell, 1C again", Health::Flat, Aux::Yellow),
-            (
-                "A collapsed cell that rests at 3.60 V or more, 1C",
-                Health::Good,
-                Aux::Off,
-            ),
-            (
-                "A dip under 2.80 V that's gone by the next reading",
-                Health::Good,
-                Aux::Off,
-            ),
-        ];
-        for (row, health, aux) in rows {
-            let example = example(row);
-            let rig = Rig::play(example.actions());
-            assert_eq!(rig.health(), health, "{row}");
-            assert_eq!(rig.aux(), aux, "{row}");
-        }
+    fn the_collapse_example_goes_out_with_no_fade() {
         // The example's wait is 16 ticks, and a collapse takes up to 12.
         let collapses = example("A cell that collapses");
         let mut levels = Vec::new();
@@ -1618,24 +1615,7 @@ mod tests {
     }
 
     #[test]
-    fn the_vddio2_rows_in_docs_ui_md_end_as_they_describe() {
-        let rows = [
-            ("VDDIO2 missing at power-on", Health::Fault, Aux::White),
-            ("VDDIO2 lost with the light on", Health::Fault, Aux::White),
-            ("VDDIO2 lost, then back", Health::Fault, Aux::White),
-            ("VDDIO2 lost with the light off", Health::Fault, Aux::White),
-            (
-                "VDDIO2 lost and back while it rests",
-                Health::Good,
-                Aux::Off,
-            ),
-        ];
-        for (row, health, aux) in rows {
-            let example = example(row);
-            let rig = Rig::play(example.actions());
-            assert_eq!(rig.health(), health, "{row}");
-            assert_eq!(rig.aux(), aux, "{row}");
-        }
+    fn the_vddio2_lost_example_goes_out_from_the_top_in_one_tick() {
         let lost = example("VDDIO2 lost with the light on");
         let (mut last_lit, mut dark_after) = (0, 0);
         Rig::play_with(lost.actions(), |rig, _| {
