@@ -115,8 +115,6 @@ pub const EXIT_PASSES: u16 = 2;
 const _: () = {
     use crate::button::{HOLD_TICKS, RELEASE_TICKS};
     assert!(RELEASE_TICKS + 1 > EXIT_PASSES && HOLD_TICKS > EXIT_PASSES);
-    // A switch wake counts no ticks, so a spent gesture has to be over before the PIT slows.
-    assert!(u16_from(SETTLE_TICKS) > RELEASE_TICKS);
     // The first PIT period after a change isn't stated (§26.5.2.2), so the
     // first slow one counts as up to two.
     let slow = SLOW_TICKS * CLOCKS_PER_TICK;

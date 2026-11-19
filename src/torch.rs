@@ -122,9 +122,11 @@ impl Torch {
         event
     }
 
+    /// Never inlined, since every caller in the firmware's loop would get a copy.
+    #[inline(never)]
     const fn quiet(&self) -> bool {
         self.switch.settled()
-            && self.clicks.idle()
+            && !self.clicks.counting()
             && self.ui.output_level() == 0
             && self.limits.level() == 0
     }
@@ -136,7 +138,7 @@ impl Torch {
 
     /// How many resting ticks in a row would change nothing but counters.
     pub const fn quiet_for(&self) -> Option<u16> {
-        if !self.resting() || self.showing > 0 {
+        if !self.resting() || self.showing > 0 || !self.clicks.idle() {
             None
         } else if matches!(self.limits.health(), Health::Fault) {
             Some(u16::MAX)
@@ -158,7 +160,6 @@ impl Torch {
         if ticks == 0 {
             return;
         }
-        self.clicks.wait(ticks);
         self.limits.rest_for(ticks);
         self.check_in = self.check_in.saturating_sub(ticks);
     }
@@ -1627,7 +1628,6 @@ mod tests {
     fn still_turns_off_after_hours_on() {
         let mut torch = Rig::default();
         click(&mut torch);
-        // Past where button::Clicks' tick count saturates.
         for _ in 0..4 {
             run(&mut torch, false, u16::MAX);
         }
