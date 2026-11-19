@@ -39,8 +39,6 @@ pub struct Torch {
     limits: Limits,
     /// Ticks left of [`SHOW_TICKS`] or [`LOCKED_TICKS`].
     showing: u16,
-    /// Whether the light was on last tick.
-    warm: bool,
     /// Ticks of rest left until the next check of the cell, `0` meaning due.
     check_in: u16,
     /// Reading the cell with the switch up and the light off.
@@ -59,7 +57,6 @@ impl Torch {
             ui: Ui::new(),
             limits: Limits::new(calibration, faults),
             showing: if faults.any() { SHOW_TICKS } else { 0 },
-            warm: false,
             check_in: 0,
             checking: false,
             cell_low: false,
@@ -76,7 +73,6 @@ impl Torch {
         vddio2: bool,
         lit_window: bool,
     ) -> Option<Event> {
-        self.warm = self.level() > 0;
         self.showing = self.showing.saturating_sub(1);
         let down = self.switch.sample(pressed);
         let event = self.clicks.tick_up_to(down, self.ui.most_clicks());
@@ -174,7 +170,6 @@ impl Torch {
         if ticks == 0 {
             return;
         }
-        self.warm = false;
         self.clicks.wait(ticks);
         self.limits.rest_for(ticks);
         self.check_in = self.check_in.saturating_sub(ticks);
@@ -197,7 +192,7 @@ impl Torch {
     pub fn output(&self) -> Output {
         match self.level() {
             0 => Output::OFF,
-            _ if !self.warm => Output::STARTING,
+            _ if self.limits.starting() => Output::STARTING,
             _ => ramp::output_between(self.fade.position()),
         }
     }

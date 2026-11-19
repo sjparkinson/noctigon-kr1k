@@ -75,6 +75,10 @@ impl Limits {
         self.level
     }
 
+    pub const fn starting(&self) -> bool {
+        self.lit_for == 1
+    }
+
     /// The battery ceiling, then the thermal one.
     pub const fn ceilings(&self) -> (u8, u8) {
         (self.protection.ceiling(), self.thermal.ceiling())
