@@ -250,6 +250,7 @@ impl Pacer {
         matches!(self.state, State::Fast)
     }
 
+    #[cfg(test)]
     pub const fn slow(&self) -> bool {
         matches!(self.state, State::Slow { .. })
     }

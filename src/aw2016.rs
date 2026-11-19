@@ -226,6 +226,7 @@ impl Aw2016 {
         self.state = State::Failed(self.want);
     }
 
+    #[cfg(test)]
     pub const fn shown(&self) -> Option<Aux> {
         match self.state {
             State::Standby => Some(Aux::Off),
