@@ -51,8 +51,8 @@ pub const EXAMPLES: &[Example] = &[
     ex("Off: 1H", "1H", Level(1)),
     ex("Off: 1H, held for a minute", "1H:60s", Level(1)),
     ex("Off: 1H, let go", "1H wait:10s", Level(1)),
-    ex("Off: 1H, then 1H", "1H 1H:1s", Level(41)),
-    ex("Off: 1H, then 1H twice", "1H 1H:1s 1H:500ms", Level(33)),
+    ex("Off: 1H, then 1H", "1H 1H:1s", Level(40)),
+    ex("Off: 1H, then 1H twice", "1H 1H:1s 1H:500ms", Level(34)),
     ex("Off: 1H, then 1C", "1H 1C", Off),
     ex("Off: 1C, after 1H", "1H 1C 1C", Level(52)),
     ex("Off: Anything else", "2C 2H:2s wait:1s", Off),
@@ -65,7 +65,7 @@ pub const EXAMPLES: &[Example] = &[
     ex(
         "On: 1H, after one that stopped partway",
         "1C 1H:1s 1H:500ms",
-        Level(84),
+        Level(85),
     ),
     ex(
         "On: 1H, after turning it off and on",
