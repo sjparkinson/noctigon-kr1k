@@ -120,7 +120,7 @@ const _: () = assert!(u32_from(*PLAUSIBLE.end()) * 18 <= u32_from(u16::MAX));
 pub const GLITCHES: u8 = 3;
 
 /// Ticks per level as the ceiling fades down, and back up. Unmeasured.
-const DOWN_EVERY: u8 = 1;
+pub const DOWN_EVERY: u8 = 1;
 const UP_EVERY: u8 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -177,10 +177,6 @@ impl Protection {
 
     pub const fn flat(&self) -> bool {
         self.flat
-    }
-
-    pub fn fail(&mut self, level: u8) {
-        self.ceiling.set(1, level);
     }
 
     pub const fn tick(&mut self) -> u8 {
@@ -887,17 +883,6 @@ mod tests {
         assert_eq!(lvp.centivolts(), Some(295));
         assert_eq!(lvp.ceiling(), CEILING);
         assert_eq!(lvp.sample(295, 100), Verdict::Ceiling(100 - STEP));
-    }
-
-    #[test]
-    fn fail_fades_the_ceiling_to_level_1() {
-        let mut lvp = Protection::new();
-        lvp.fail(50);
-        assert_eq!(lvp.ceiling(), 50, "from the level the light's at");
-        for _ in 0..49 {
-            lvp.tick();
-        }
-        assert_eq!(lvp.ceiling(), 1);
     }
 
     #[test]

@@ -2,6 +2,7 @@
 //! level to run at out.
 
 use crate::battery::{self, Protection, Verdict};
+use crate::gradual::{Ceiling, Fade};
 use crate::ramp::CEILING;
 use crate::selftest::Faults;
 use crate::sensors::{Convert, Ground, Reading, Schedule};
@@ -37,8 +38,8 @@ pub struct Limits {
     protection: Protection,
     thermal: Thermal,
     ground: Ground,
-    /// Whether the UI was on last tick.
-    on: bool,
+    /// What the UI asked for last tick.
+    asked: u8,
     /// As of the last tick.
     level: u8,
     /// Lit on the tick before the last. A conversion starts before its
@@ -48,6 +49,8 @@ pub struct Limits {
     lit_for: u8,
     convert: Option<Convert>,
     fault: bool,
+    failing: Ceiling,
+    fade: Fade,
 }
 
 impl Limits {
@@ -58,12 +61,14 @@ impl Limits {
             protection: Protection::new(),
             thermal: Thermal::new(),
             ground: Ground::new(),
-            on: false,
+            asked: 0,
             level: 0,
             lit_before: false,
             lit_for: 0,
             convert: None,
             fault: faults.any(),
+            failing: Ceiling::new(battery::DOWN_EVERY, battery::DOWN_EVERY),
+            fade: Fade::new(),
         }
     }
 
@@ -79,9 +84,17 @@ impl Limits {
         self.lit_for == 1
     }
 
-    /// The battery ceiling, then the thermal one.
-    pub const fn ceilings(&self) -> (u8, u8) {
-        (self.protection.ceiling(), self.thermal.ceiling())
+    pub const fn position(&self) -> u16 {
+        self.fade.position()
+    }
+
+    /// The lower of the battery's ceiling and a fault's, then the thermal one.
+    #[cfg(test)]
+    pub fn ceilings(&self) -> (u8, u8) {
+        (
+            self.protection.ceiling().min(self.failing.level()),
+            self.thermal.ceiling(),
+        )
     }
 
     pub const fn health(&self) -> Health {
@@ -108,9 +121,10 @@ impl Limits {
         self.protection.rest_for(ticks);
         self.ground.rest();
         self.convert = None;
-        self.on = false;
+        self.asked = 0;
         self.level = 0;
         self.lit_for = 0;
+        self.fade = Fade::new();
     }
 
     /// `vddio2` is `MVIO.STATUS.VDDIO2S` (DS40002413B section 19.5.3). PC1 is
@@ -122,16 +136,18 @@ impl Limits {
     #[inline(never)]
     pub fn tick(&mut self, ui: u8, result: Option<u16>, vddio2: bool) -> Step {
         let on = ui != 0;
-        if on && !self.on {
+        if on && self.asked == 0 {
             self.thermal.reset();
         }
-        self.on = on;
+        let steady = ui == self.asked;
+        self.asked = ui;
         let ui = ui.min(CEILING);
         // The level the light's at this tick, before the ceilings move.
         let level = match on {
             true => ui
                 .min(self.thermal.ceiling())
                 .min(self.protection.ceiling())
+                .min(self.failing.level())
                 .max(self.level),
             false => 0,
         };
@@ -176,13 +192,13 @@ impl Limits {
             self.fault = true;
         }
         if self.fault {
-            self.protection.fail(level);
+            self.failing.set(1, level);
         }
 
         let thermal = self.thermal.tick();
-        let battery = self.protection.tick();
+        let battery = self.protection.tick().min(self.failing.tick());
         let fault = self.fault && (cut || self.level <= 1);
-        let flat = !self.fault && self.protection.flat();
+        let flat = self.protection.flat();
         let off = on && (fault || flat || collapsed);
         self.lit_before = self.level > 0;
         self.level = if on && !off {
@@ -194,6 +210,8 @@ impl Limits {
             0 => 0,
             _ => self.lit_for.saturating_add(1),
         };
+        let gentle = steady && thermal <= battery;
+        self.fade.tick(self.level, gentle);
         Step {
             level: self.level,
             off,
