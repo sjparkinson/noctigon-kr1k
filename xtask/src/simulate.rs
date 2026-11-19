@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use kr1k::TICKS_PER_SECOND;
 use kr1k::button::{Event, HOLD_TICKS};
-use kr1k::ramp::{self, LEVELS};
+use kr1k::ramp::{self, CEILING};
 use kr1k::testing::{self, Rig, Scene, clicks};
 
 pub use kr1k::testing::Action;
@@ -167,8 +167,8 @@ impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.0 {
             0 => f.pad("off"),
-            n if f.alternate() => f.pad(&format!("{n}/{LEVELS}")),
-            n => f.pad(&format!("level {n}/{LEVELS}")),
+            n if f.alternate() => f.pad(&format!("{n}/{CEILING}")),
+            n => f.pad(&format!("level {n}/{CEILING}")),
         }
     }
 }
@@ -300,7 +300,7 @@ impl Live {
 }
 
 fn lit(level: u8) -> usize {
-    (usize::from(level) * BAR).div_ceil(usize::from(LEVELS))
+    (usize::from(level) * BAR).div_ceil(usize::from(CEILING))
 }
 
 #[cfg(test)]
@@ -502,9 +502,9 @@ mod tests {
     fn the_bar_is_empty_only_when_off_and_full_only_at_the_top() {
         assert_eq!(lit(0), 0);
         assert_eq!(lit(1), 1);
-        assert_eq!(lit(LEVELS - 1), BAR);
-        assert_eq!(lit(LEVELS), BAR);
-        assert_eq!(lit(LEVELS / 2), BAR / 2);
+        assert_eq!(lit(CEILING - 1), BAR);
+        assert_eq!(lit(CEILING), BAR);
+        assert_eq!(lit(CEILING / 2), BAR / 2);
     }
 
     #[test]
@@ -513,7 +513,7 @@ mod tests {
         live.key(' ');
         ticks_of(&mut live, 64);
         let status = live.status(60);
-        assert!(status.contains(&format!(" {LEVEL}/{LEVELS} ")), "{status}");
+        assert!(status.contains(&format!(" {LEVEL}/{CEILING} ")), "{status}");
         let visible = status.replace("\x1b[33m", "").replace("\x1b[2m", "");
         let visible = visible.replace("\x1b[0m", "");
         assert_eq!(visible.chars().count(), 59);
