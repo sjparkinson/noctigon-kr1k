@@ -20,7 +20,7 @@ use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
 use kr1k::sensors::{CYCLE_TICKS, Channel};
-use kr1k::testing::{self, Action, EXAMPLES, Example, Paced, PitPhase, Rig, Sample, Scene};
+use kr1k::testing::{self, Action, EXAMPLES, Example, Paced, PitPhase, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{
     CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, TICK_DEADLINE_PERIODS,
@@ -400,23 +400,16 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
         Action::Clicks(1),
         Action::Wait(2 * TICKS_PER_SECOND),
     ];
-    let levels = std::cell::RefCell::new(Vec::new());
-    let mut shadow = Rig::default();
-    let samples = testing::samples(script).map(|sample| {
-        let sample = Sample {
-            scene: Scene {
-                adc_dead: true,
-                ..sample.scene
-            },
-            ..sample
-        };
-        shadow.tick_in(sample.pressed, &sample.scene);
-        levels.borrow_mut().push(shadow.level());
-        sample
+    let mut levels = Vec::new();
+    let samples = testing::samples(script).map(|sample| Sample {
+        scene: Scene {
+            adc_dead: true,
+            ..sample.scene
+        },
+        ..sample
     });
     let mut sim = sim;
-    let end = in_step(&mut sim, samples, report)?;
-    let levels = levels.into_inner();
+    let end = in_step_with(&mut sim, samples, report, |_, rig| levels.push(rig.level()))?;
     ends_off(end)?;
     let lit = levels
         .iter()
@@ -452,16 +445,10 @@ fn cell_collapses(mut sim: Sim, report: &mut Report) -> Result<(), String> {
             Action::Wait(TICKS_PER_SECOND),
         ]
     });
-    let ticks = std::cell::RefCell::new(Vec::new());
-    let mut shadow = Rig::default();
-    let samples = testing::samples(script).inspect(|sample| {
-        shadow.tick_in(sample.pressed, &sample.scene);
-        ticks
-            .borrow_mut()
-            .push((sample.scene.cell, shadow.level(), shadow.aux()));
-    });
-    let end = in_step(&mut sim, samples, report)?;
-    let ticks = ticks.into_inner();
+    let mut ticks = Vec::new();
+    let end = in_step_with(&mut sim, testing::samples(script), report, |sample, rig| {
+        ticks.push((sample.scene.cell, rig.level(), rig.aux()));
+    })?;
     ends_off(end)?;
     let good = |tick: &(u16, u8, Aux)| tick.0 >= COLLAPSE_BELOW;
     let mut slowest = 0;
@@ -529,18 +516,12 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
         Action::Clicks(1),
         Action::Wait(2 * TICKS_PER_SECOND),
     ];
-    let ticks = std::cell::RefCell::new(Vec::new());
-    let mut shadow = Rig::default();
-    let samples = testing::samples(script).inspect(|sample| {
-        shadow.tick_in(sample.pressed, &sample.scene);
-        let fault = shadow.health() == kr1k::limits::Health::Fault;
-        ticks
-            .borrow_mut()
-            .push((sample.scene.adc_stuck.is_some(), shadow.level(), fault));
-    });
+    let mut ticks = Vec::new();
     let mut sim = sim;
-    let end = in_step(&mut sim, samples, report)?;
-    let ticks = ticks.into_inner();
+    let end = in_step_with(&mut sim, testing::samples(script), report, |sample, rig| {
+        let fault = rig.health() == kr1k::limits::Health::Fault;
+        ticks.push((sample.scene.adc_stuck.is_some(), rig.level(), fault));
+    })?;
     ends_off(end)?;
     let stuck = ticks
         .iter()
@@ -872,6 +853,15 @@ fn in_step(
     samples: impl IntoIterator<Item = Sample>,
     report: &mut Report,
 ) -> Result<Option<u8>, String> {
+    in_step_with(sim, samples, report, |_, _| {})
+}
+
+fn in_step_with(
+    sim: &mut Sim,
+    samples: impl IntoIterator<Item = Sample>,
+    report: &mut Report,
+    mut each: impl FnMut(&Sample, &Paced),
+) -> Result<Option<u8>, String> {
     // The fuses are read before the first tick.
     let mut samples = samples.into_iter().peekable();
     let power_on = World::from(samples.peek().map_or(Scene::NORMAL, |s| s.scene));
@@ -937,6 +927,7 @@ fn in_step(
                 ends.len()
             )));
         }
+        each(&sample, &rig);
         let Some(&end) = ends.last() else {
             if sim.chip.wdt.feeds != feeds {
                 return Err(at("fed the watchdog with no pass to run".into()));
