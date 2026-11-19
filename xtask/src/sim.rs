@@ -1150,29 +1150,29 @@ fn startup_with_statics(image: &[u8], reset: u32, linked: &Linked) -> Result<(),
     Ok(())
 }
 
+/// (register, byte) for each `ldi`, in the order rt.rs loads them.
+fn loads(l: &Layout) -> Vec<(u8, u8)> {
+    [
+        (26, l.data.start),
+        (30, l.load),
+        (24, l.data.end),
+        (26, l.bss.start),
+        (24, l.bss.end),
+    ]
+    .into_iter()
+    .flat_map(|(r, v)| {
+        let [lo, hi] = v.to_le_bytes();
+        [(r, lo), (r + 1, hi)]
+    })
+    .collect()
+}
+
 fn patch_startup(
     image: &mut [u8],
     reset: usize,
     linked: &Layout,
     moved: &Layout,
 ) -> Result<(), String> {
-    // (register, byte) for each `ldi`, in the order rt.rs loads them.
-    let loads = |l: &Layout| -> Vec<(u8, u8)> {
-        [
-            (26, l.data.start),
-            (30, l.load),
-            (24, l.data.end),
-            (26, l.bss.start),
-            (24, l.bss.end),
-        ]
-        .into_iter()
-        .flat_map(|(r, v)| {
-            let [lo, hi] = v.to_le_bytes();
-            [(r, lo), (r + 1, hi)]
-        })
-        .collect()
-    };
-
     let mut found = Vec::new();
     let mut at = reset;
     loop {
@@ -3432,6 +3432,16 @@ mod tests {
         poke(chip, a, value).expect_err("the write went through")
     }
 
+    fn peek(chip: &mut Chip, a: usize) -> Result<u8, String> {
+        chip.read(a as u16)
+    }
+
+    fn peek16(chip: &mut Chip, low: usize) -> u16 {
+        let lo = peek(chip, low).unwrap();
+        let hi = peek(chip, low + 1).unwrap();
+        u16::from_le_bytes([lo, hi])
+    }
+
     fn unlocked(chip: &mut Chip, a: usize, value: u8) -> Result<(), String> {
         poke(chip, reg::CPU_CCP, CCP_IOREG)?;
         poke(chip, a, value)
@@ -3812,7 +3822,7 @@ mod tests {
     #[test]
     fn pd4_reads_through_the_boards_pull_up_and_an_edge_flags_it() {
         let mut chip = Chip::new(Vec::new());
-        let read = |chip: &mut Chip| chip.read(reg::VPORTD_IN as u16);
+        let read = |chip: &mut Chip| peek(chip, reg::VPORTD_IN);
         assert_eq!(read(&mut chip), Ok(0xFF));
         chip.set_switch(true).unwrap();
         assert_eq!(read(&mut chip), Ok(!SWITCH));
@@ -3837,7 +3847,7 @@ mod tests {
     #[test]
     fn vddio2s_reads_the_world_with_dual_supply_and_1_with_single() {
         let mut chip = Chip::new(Vec::new());
-        let read = |chip: &mut Chip| chip.read(reg::MVIO_STATUS as u16);
+        let read = |chip: &mut Chip| peek(chip, reg::MVIO_STATUS);
         assert_eq!(read(&mut chip), Ok(MVIO_VDDIO2S));
         chip.set_vddio2(false).unwrap();
         assert_eq!(read(&mut chip), Ok(0));
@@ -3960,7 +3970,7 @@ mod tests {
             vddio2: false,
             ..Scene::NORMAL
         });
-        let read = |chip: &mut Chip| chip.read(reg::MVIO_STATUS as u16);
+        let read = |chip: &mut Chip| peek(chip, reg::MVIO_STATUS);
         let mut chip = lit_and_idling();
         chip.enter(lost).unwrap();
         assert!(!chip.vddio2_ok());
@@ -4018,10 +4028,8 @@ mod tests {
     fn convert(chip: &mut Chip) -> u16 {
         start(chip).unwrap();
         wait(chip, CONVERSION);
-        assert_eq!(chip.read(reg::ADC0_INTFLAGS as u16), Ok(ADC_RESRDY));
-        let lo = chip.read(reg::ADC0_RES as u16).unwrap();
-        let hi = chip.read(reg::ADC0_RES as u16 + 1).unwrap();
-        u16::from_le_bytes([lo, hi])
+        assert_eq!(peek(chip, reg::ADC0_INTFLAGS), Ok(ADC_RESRDY));
+        peek16(chip, reg::ADC0_RES)
     }
 
     #[test]
@@ -4064,9 +4072,9 @@ mod tests {
         let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);
         start(&mut chip).unwrap();
         wait(&mut chip, CONVERSION - 1);
-        assert_eq!(chip.read(reg::ADC0_INTFLAGS as u16), Ok(0));
+        assert_eq!(peek(&mut chip, reg::ADC0_INTFLAGS), Ok(0));
         assert!(
-            chip.read(reg::ADC0_RES as u16)
+            peek(&mut chip, reg::ADC0_RES)
                 .unwrap_err()
                 .contains("no result")
         );
@@ -4075,8 +4083,8 @@ mod tests {
         let err = start(&mut chip).unwrap_err();
         assert!(err.contains("still running"), "{err}");
         wait(&mut chip, 1);
-        chip.read(reg::ADC0_RES as u16).unwrap();
-        assert_eq!(chip.read(reg::ADC0_INTFLAGS as u16), Ok(0));
+        peek(&mut chip, reg::ADC0_RES).unwrap();
+        assert_eq!(peek(&mut chip, reg::ADC0_INTFLAGS), Ok(0));
     }
 
     #[test]
@@ -4084,11 +4092,10 @@ mod tests {
         let mut chip = adc_ready(ADC_MUXPOS_VDDDIV10);
         start(&mut chip).unwrap();
         wait(&mut chip, CONVERSION);
-        let err = chip.read(reg::ADC0_RES as u16 + 1).unwrap_err();
+        let err = peek(&mut chip, reg::ADC0_RES + 1).unwrap_err();
         assert!(err.contains("without its low byte"), "{err}");
-        chip.read(reg::ADC0_RES as u16).unwrap();
-        chip.read(reg::ADC0_RES as u16 + 1).unwrap();
-        assert!(chip.read(reg::ADC0_RES as u16 + 1).is_err(), "only once");
+        peek16(&mut chip, reg::ADC0_RES);
+        assert!(peek(&mut chip, reg::ADC0_RES + 1).is_err(), "only once");
     }
 
     #[test]
@@ -4181,15 +4188,15 @@ mod tests {
     fn a_feed_within_a_clock_of_either_edge_bites() {
         let mut chip = watched();
         chip.wdr().unwrap();
-        chip.advance_to(chip.now + clocks(33)).unwrap();
+        wait(&mut chip, clocks(33));
         assert!(chip.wdr().unwrap_err().contains("closed window"));
         let mut chip = watched();
         chip.wdr().unwrap();
-        chip.advance_to(chip.now + clocks(34)).unwrap();
+        wait(&mut chip, clocks(34));
         chip.wdr().unwrap();
         let mut chip = watched();
         chip.wdr().unwrap();
-        chip.advance_to(chip.now + clocks(62)).unwrap();
+        wait(&mut chip, clocks(62));
         chip.wdr().unwrap();
         let err = ticks(&mut chip, 4).unwrap_err();
         assert!(err.contains("without wdr"), "{err}");
@@ -4214,14 +4221,14 @@ mod tests {
         let err = unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap_err();
         assert!(err.contains("SYNCBUSY is set"), "{err}");
         assert_eq!(
-            chip.read(reg::WDT_STATUS as u16).unwrap(),
+            peek(&mut chip, reg::WDT_STATUS).unwrap(),
             WDT_SYNCBUSY,
             "busy for three WDT clocks"
         );
         chip.advance_to(clocks(3) - 1).unwrap();
-        assert_eq!(chip.read(reg::WDT_STATUS as u16).unwrap(), WDT_SYNCBUSY);
+        assert_eq!(peek(&mut chip, reg::WDT_STATUS).unwrap(), WDT_SYNCBUSY);
         chip.advance_to(clocks(3)).unwrap();
-        assert_eq!(chip.read(reg::WDT_STATUS as u16).unwrap(), 0);
+        assert_eq!(peek(&mut chip, reg::WDT_STATUS).unwrap(), 0);
     }
 
     #[test]
@@ -4253,7 +4260,7 @@ mod tests {
         chip.wdr().unwrap();
         ticks(&mut chip, 3).unwrap();
         chip.wdr().unwrap();
-        chip.advance_to(chip.now + clocks(3) - 1).unwrap();
+        wait(&mut chip, clocks(3) - 1);
         let err = unlocked(&mut chip, reg::WDT_CTRLA, regs::WDT_PERIOD_8KCLK).unwrap_err();
         assert!(err.contains("within three WDT clocks of a wdr"), "{err}");
         chip.elapse().unwrap();
@@ -4304,7 +4311,7 @@ mod tests {
         synced(&mut chip);
         let err = refused(&mut chip, reg::VPORTC_OUT, ENABLE);
         assert!(err.contains("WDT.CTRLA at 0x0b"), "{err}");
-        chip.advance_to(chip.now + clocks(4)).unwrap();
+        wait(&mut chip, clocks(4));
         unlocked(&mut chip, reg::WDT_CTRLA, WDT_LIT).unwrap();
         let err = refused(&mut chip, reg::VPORTC_OUT, ENABLE);
         assert!(err.contains("still syncing"), "{err}");
@@ -4373,7 +4380,7 @@ mod tests {
         let mut chip = Chip::new(Vec::new());
         let err = refused(&mut chip, reg::RTC_PITCTRLA, PIT_FAST);
         assert!(err.contains("CTRLBUSY is set"), "{err}");
-        while chip.read(reg::RTC_PITSTATUS as u16).unwrap() != 0 {}
+        while peek(&mut chip, reg::RTC_PITSTATUS).unwrap() != 0 {}
         poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).unwrap();
         assert!(poke(&mut chip, reg::RTC_PITCTRLA, PIT_FAST).is_err());
     }
@@ -4386,11 +4393,11 @@ mod tests {
         for (image, want) in [(signed, CRCSCAN_OK), (bad, 0)] {
             let mut chip = Chip::new(image);
             poke(&mut chip, reg::CRCSCAN_CTRLA, CRCSCAN_ENABLE).unwrap();
-            assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(CRCSCAN_OK));
+            assert_eq!(peek(&mut chip, reg::CRCSCAN_STATUS), Ok(CRCSCAN_OK));
             wait(&mut chip, CRC_START_INSTRUCTIONS + 1);
-            assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(CRCSCAN_BUSY));
-            assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(CRCSCAN_BUSY));
-            assert_eq!(chip.read(reg::CRCSCAN_STATUS as u16), Ok(want));
+            assert_eq!(peek(&mut chip, reg::CRCSCAN_STATUS), Ok(CRCSCAN_BUSY));
+            assert_eq!(peek(&mut chip, reg::CRCSCAN_STATUS), Ok(CRCSCAN_BUSY));
+            assert_eq!(peek(&mut chip, reg::CRCSCAN_STATUS), Ok(want));
         }
     }
 
@@ -4425,21 +4432,16 @@ mod tests {
     #[test]
     fn the_signature_row_holds_this_torchs_calibration_low_byte_first() {
         let mut chip = Chip::new(Vec::new());
-        let word = |chip: &mut Chip, a: usize| {
-            let lo = chip.read(a as u16).unwrap();
-            let hi = chip.read(a as u16 + 1).unwrap();
-            u16::from_le_bytes([lo, hi])
-        };
-        assert_eq!(word(&mut chip, reg::SIGROW_TEMPSENSE0), 0x03EE);
-        assert_eq!(word(&mut chip, reg::SIGROW_TEMPSENSE1), 0x0D24);
+        assert_eq!(peek16(&mut chip, reg::SIGROW_TEMPSENSE0), 0x03EE);
+        assert_eq!(peek16(&mut chip, reg::SIGROW_TEMPSENSE1), 0x0D24);
     }
 
     #[test]
     fn the_reset_flags_clear_by_writing_a_one() {
         let mut chip = Chip::new(Vec::new());
-        assert_eq!(chip.read(reg::RSTCTRL_RSTFR as u16), Ok(RSTCTRL_PORF));
+        assert_eq!(peek(&mut chip, reg::RSTCTRL_RSTFR), Ok(RSTCTRL_PORF));
         poke(&mut chip, reg::RSTCTRL_RSTFR, RSTCTRL_PORF).unwrap();
-        assert_eq!(chip.read(reg::RSTCTRL_RSTFR as u16), Ok(0));
+        assert_eq!(peek(&mut chip, reg::RSTCTRL_RSTFR), Ok(0));
     }
 
     #[test]
@@ -4707,19 +4709,8 @@ mod tests {
     const CALL: [u16; 2] = [0x940E, 0];
 
     fn loads(layout: &Layout) -> Vec<u16> {
-        [
-            (26, layout.data.start),
-            (30, layout.load),
-            (24, layout.data.end),
-            (26, layout.bss.start),
-            (24, layout.bss.end),
-        ]
-        .into_iter()
-        .flat_map(|(r, value)| {
-            let [lo, hi] = value.to_le_bytes();
-            [ldi(r, lo), ldi(r + 1, hi)]
-        })
-        .collect()
+        let loads = super::loads(layout).into_iter();
+        loads.map(|(r, k)| ldi(r, k)).collect()
     }
 
     #[test]
@@ -4899,107 +4890,39 @@ mod tests {
         watchdog_on: Some(7),
     };
 
+    fn out_of_order(change: fn(&mut Boot)) -> String {
+        let mut boot = IN_ORDER;
+        change(&mut boot);
+        boot.in_order().unwrap_err()
+    }
+
     #[test]
     fn start_up_has_to_do_every_step() {
         IN_ORDER.in_order().unwrap();
-        let missing = |boot: Boot| boot.in_order().unwrap_err();
-        for (boot, what) in [
-            (
-                Boot {
-                    flags_cleared: None,
-                    ..IN_ORDER
-                },
-                "never cleared RSTCTRL.RSTFR",
-            ),
-            (
-                Boot {
-                    flash_checked: None,
-                    ..IN_ORDER
-                },
-                "never started a CRC scan",
-            ),
-            (
-                Boot {
-                    fuses_read: None,
-                    ..IN_ORDER
-                },
-                "never read the fuses",
-            ),
-            (
-                Boot {
-                    supply_read: None,
-                    ..IN_ORDER
-                },
-                "never read MVIO.STATUS",
-            ),
-            (
-                Boot {
-                    set_up: None,
-                    ..IN_ORDER
-                },
-                "never set anything up",
-            ),
-            (
-                Boot {
-                    pit_on: None,
-                    ..IN_ORDER
-                },
-                "never turned the PIT on",
-            ),
-            (
-                Boot {
-                    watchdog_on: None,
-                    ..IN_ORDER
-                },
-                "never turned the watchdog on",
-            ),
-        ] {
-            assert_eq!(missing(boot), what);
-        }
+        let missing = |change, what: &str| assert_eq!(out_of_order(change), what);
+        missing(|b| b.flags_cleared = None, "never cleared RSTCTRL.RSTFR");
+        missing(|b| b.flash_checked = None, "never started a CRC scan");
+        missing(|b| b.fuses_read = None, "never read the fuses");
+        missing(|b| b.supply_read = None, "never read MVIO.STATUS");
+        missing(|b| b.set_up = None, "never set anything up");
+        missing(|b| b.pit_on = None, "never turned the PIT on");
+        missing(|b| b.watchdog_on = None, "never turned the watchdog on");
     }
 
     #[test]
     fn start_up_has_to_be_in_order() {
-        for (boot, why) in [
-            (
-                Boot {
-                    flags_cleared: Some(8),
-                    ..IN_ORDER
-                },
-                "before clearing the reset flags",
-            ),
-            (
-                Boot {
-                    flash_checked: Some(6),
-                    ..IN_ORDER
-                },
-                "before the CRC scan",
-            ),
-            (
-                Boot {
-                    fuses_read: Some(6),
-                    ..IN_ORDER
-                },
-                "before reading the fuses",
-            ),
-            (
-                Boot {
-                    supply_read: Some(6),
-                    ..IN_ORDER
-                },
-                "before checking VDDIO2",
-            ),
-            (
-                Boot {
-                    pit_on: Some(8),
-                    ..IN_ORDER
-                },
-                "before the PIT",
-            ),
-        ] {
-            let err = boot.in_order().unwrap_err();
+        let late = |change, why: &str| {
+            let err = out_of_order(change);
             assert!(err.contains(why), "{err}");
-        }
+        };
+        late(
+            |b| b.flags_cleared = Some(8),
+            "before clearing the reset flags",
+        );
+        late(|b| b.flash_checked = Some(6), "before the CRC scan");
+        late(|b| b.fuses_read = Some(6), "before reading the fuses");
+        late(|b| b.supply_read = Some(6), "before checking VDDIO2");
+        late(|b| b.pit_on = Some(8), "before the PIT");
     }
 
     #[test]
@@ -5017,9 +4940,9 @@ mod tests {
         poke(&mut chip, reg::CRCSCAN_CTRLB, CRCSCAN_SRC_FLASH).unwrap();
         poke(&mut chip, reg::CRCSCAN_CTRLA, CRCSCAN_ENABLE).unwrap();
         let fuses = step(&mut chip);
-        chip.read(reg::FUSE_OSCCFG as u16).unwrap();
+        peek(&mut chip, reg::FUSE_OSCCFG).unwrap();
         let supply = step(&mut chip);
-        chip.read(reg::MVIO_STATUS as u16).unwrap();
+        peek(&mut chip, reg::MVIO_STATUS).unwrap();
         assert_eq!(chip.boot.set_up, None);
         let set_up = step(&mut chip);
         poke(&mut chip, reg::RTC_PITINTCTRL, RTC_PI).unwrap();
