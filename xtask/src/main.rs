@@ -262,6 +262,7 @@ fn this_boards_hex(path: &Path) -> Result<(), String> {
 
 /// Not for `restore`, since a factory backup has no CRC from this repo.
 fn signed(image: &[u8]) -> Result<(), String> {
+    updi::fits_flash(image)?;
     if image.len() < map::FLASH_SIZE {
         eprintln!(
             "warning: the image isn't the full {} bytes with a CRC, so it isn't a signed build \
@@ -743,6 +744,12 @@ mod tests {
 
     fn no_connection() -> Result<Programmer<Dd20>, String> {
         Programmer::connect_for_programming(no_port()?)
+    }
+
+    #[test]
+    fn an_image_bigger_than_flash_is_refused_as_too_big_before_its_crc_is_checked() {
+        let err = signed(&vec![0x12; FLASH_SIZE + 1]).unwrap_err();
+        assert_eq!(err, "the image is 32769 bytes; the AVR32DD20 has 32768");
     }
 
     #[test]
