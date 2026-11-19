@@ -266,7 +266,7 @@ fn signed(image: &[u8]) -> Result<(), String> {
         eprintln!(
             "warning: the image isn't the full {} bytes with a CRC, so it isn't a signed build \
              of the full firmware. That's right for the stock firmware, which checks no CRC. If \
-             it's a build from main, it'll cap itself at level 50 on every boot, so \
+             it's a build from main, it'll leave the light off on every boot, so \
              flash the file `cargo xtask hex` writes instead",
             map::FLASH_SIZE
         );
@@ -274,7 +274,7 @@ fn signed(image: &[u8]) -> Result<(), String> {
     }
     if crc::crc16(image.iter().copied()) != 0 {
         return Err(
-            "the image's CRC doesn't check, so the firmware would cap itself at level 50 on \
+            "the image's CRC doesn't check, so the firmware would leave the light off on \
              every boot. Flash the file `cargo xtask hex` writes"
                 .to_string(),
         );
