@@ -575,6 +575,20 @@ mod tests {
         panic!("no {event:?}");
     }
 
+    fn shows_for(torch: &mut Rig, aux: Aux, ticks: u16) {
+        for tick in 0..ticks {
+            assert_eq!(torch.aux(), aux, "tick {tick}");
+            torch.tick(false);
+        }
+        assert_eq!(torch.aux(), Aux::Off);
+    }
+
+    fn until_fault(torch: &mut Rig) {
+        while torch.health() == Health::Good {
+            torch.tick(false);
+        }
+    }
+
     #[test]
     fn a_click_counts_as_it_is_let_go_when_no_more_would_mean_anything() {
         let mut torch = Rig::default();
@@ -656,12 +670,7 @@ mod tests {
         let mut torch = Rig::default();
         tap(&mut torch, 3, Event::Click(3));
         assert_eq!(torch.aux(), Aux::Red, "as 3C locks it");
-        for tick in 1..LOCKED_TICKS {
-            torch.tick(false);
-            assert_eq!(torch.aux(), Aux::Red, "tick {tick}");
-        }
-        torch.tick(false);
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::Red, LOCKED_TICKS);
         tap(&mut torch, 1, Event::Click(1));
         assert_eq!(torch.aux(), Aux::Red, "a press that does nothing");
         run(&mut torch, false, LOCKED_TICKS);
@@ -906,7 +915,7 @@ mod tests {
             for _ in 0..12 {
                 next_check(&mut torch);
                 assert_eq!(torch.aux(), Aux::Off, "{garbage}");
-                assert_eq!(torch.torch.limits.health(), Health::Good, "{garbage}");
+                assert_eq!(torch.health(), Health::Good, "{garbage}");
             }
             torch.adc.voltage = voltage_reading(380);
             next_check(&mut torch);
@@ -915,7 +924,7 @@ mod tests {
             for _ in 0..12 {
                 next_check(&mut torch);
                 assert_eq!(torch.aux(), Aux::Blue, "{garbage}");
-                assert_eq!(torch.torch.limits.health(), Health::Good, "{garbage}");
+                assert_eq!(torch.health(), Health::Good, "{garbage}");
             }
             torch.adc.voltage = voltage_reading(380);
             click(&mut torch);
@@ -923,7 +932,7 @@ mod tests {
             click(&mut torch);
             torch.adc.voltage = garbage;
             run(&mut torch, true, 2 * TICKS_PER_SECOND);
-            assert_eq!(torch.torch.limits.health(), Health::Fault, "{garbage}");
+            assert_eq!(torch.health(), Health::Fault, "{garbage}");
         }
     }
 
@@ -940,7 +949,7 @@ mod tests {
             let example = example(row);
             let rig = Rig::play(example.actions());
             assert_eq!(rig.aux(), aux, "{row}");
-            assert_eq!(rig.torch.limits.health(), Health::Good, "{row}");
+            assert_eq!(rig.health(), Health::Good, "{row}");
         }
         let mut low = Rig::play(example("Low cell, at rest").actions().take(2));
         assert_eq!(low.aux(), Aux::Off, "dark before the 1C");
@@ -951,7 +960,7 @@ mod tests {
         assert_eq!(low.aux(), Aux::Off, "and once it's off again");
         let garbage = Rig::play(example("A cell it can't read, at rest").actions().take(2));
         assert_eq!(garbage.aux(), Aux::Blue, "blue through the garbage");
-        assert_eq!(garbage.torch.limits.health(), Health::Good, "no fault yet");
+        assert_eq!(garbage.health(), Health::Good, "no fault yet");
     }
 
     #[test]
@@ -970,7 +979,7 @@ mod tests {
         assert!(torch.resting());
         assert_eq!(torch.convert(), None);
         assert_eq!(torch.aux(), Aux::Off);
-        assert_eq!(torch.torch.limits.health(), Health::Good);
+        assert_eq!(torch.health(), Health::Good);
     }
 
     #[test]
@@ -979,17 +988,17 @@ mod tests {
         click(&mut torch);
         torch.adc.voltage = voltage_reading(280);
         run(&mut torch, false, 10 * TICKS_PER_SECOND);
-        assert_eq!(torch.torch.limits.health(), Health::Flat);
+        assert_eq!(torch.health(), Health::Flat);
         torch.adc.voltage = voltage_reading(350);
         for _ in 0..3 {
             next_check(&mut torch);
-            assert_eq!(torch.torch.limits.health(), Health::Flat);
+            assert_eq!(torch.health(), Health::Flat);
             assert_eq!(torch.aux(), Aux::Off, "yellow only after a press");
         }
         torch.adc.voltage = voltage_reading(380);
         let ticks = next_check(&mut torch);
         assert!(ticks <= u32::from(CHECK_TICKS + CHECK_AWAKE) + 1, "{ticks}");
-        assert_eq!(torch.torch.limits.health(), Health::Good, "with no press");
+        assert_eq!(torch.health(), Health::Good, "with no press");
         assert_eq!(torch.aux(), Aux::Blue);
         assert_eq!(torch.level(), 0, "and still off");
         click(&mut torch);
@@ -1008,7 +1017,7 @@ mod tests {
         click(&mut torch);
         torch.adc.voltage = 0;
         run(&mut torch, false, 5 * TICKS_PER_SECOND);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
         assert!(torch.resting());
         for tick in 0..2 * u32::from(CHECK_TICKS) {
             torch.tick(false);
@@ -1123,11 +1132,7 @@ mod tests {
         while torch.level() != 0 {
             torch.tick(false);
         }
-        for _ in 0..SHOW_TICKS {
-            assert_eq!(torch.aux(), Aux::Yellow);
-            torch.tick(false);
-        }
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::Yellow, SHOW_TICKS);
     }
 
     #[test]
@@ -1144,14 +1149,10 @@ mod tests {
         assert_eq!(torch.level(), 0);
         assert_eq!(torch.output(), Output::OFF);
         assert_eq!(torch.ui.output_level(), 0, "the UI's off too");
-        assert_eq!(torch.torch.limits.health(), Health::Flat);
+        assert_eq!(torch.health(), Health::Flat);
         assert!(torch.resting());
         assert_eq!(torch.convert(), None);
-        for _ in 0..SHOW_TICKS {
-            assert_eq!(torch.aux(), Aux::Yellow);
-            torch.tick(false);
-        }
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::Yellow, SHOW_TICKS);
         click(&mut torch);
         assert_eq!(torch.level(), 0);
         assert_eq!(torch.aux(), Aux::Yellow);
@@ -1176,7 +1177,7 @@ mod tests {
             torch.adc.voltage = voltage_reading(380);
             run(&mut torch, false, 10 * TICKS_PER_SECOND);
             assert_eq!(torch.level(), CEILING, "at {at}");
-            assert_eq!(torch.torch.limits.health(), Health::Good, "at {at}");
+            assert_eq!(torch.health(), Health::Good, "at {at}");
         }
     }
 
@@ -1188,7 +1189,7 @@ mod tests {
         ] {
             let example = example(row);
             let rig = Rig::play(example.actions());
-            assert_eq!(rig.torch.limits.health(), Health::Fault, "{row}");
+            assert_eq!(rig.health(), Health::Fault, "{row}");
             let mut levels = Vec::new();
             Rig::play_with(example.actions(), |rig, _| levels.push(rig.level()));
             let lit: Vec<u8> = levels.iter().copied().filter(|&l| l > 0).collect();
@@ -1196,7 +1197,7 @@ mod tests {
         }
         let rest = example("An ADC stuck on one reading, at rest");
         let rig = Rig::play(rest.actions().take(2));
-        assert_eq!(rig.torch.limits.health(), Health::Good);
+        assert_eq!(rig.health(), Health::Good);
         assert_eq!(rig.aux(), Aux::Blue);
     }
 
@@ -1207,11 +1208,11 @@ mod tests {
         torch.adc.stuck(voltage_reading(380));
         for _ in 0..12 {
             next_check(&mut torch);
-            assert_eq!(torch.torch.limits.health(), Health::Good);
+            assert_eq!(torch.health(), Health::Good);
             assert_eq!(torch.aux(), Aux::Blue);
         }
         run(&mut torch, true, TICKS_PER_SECOND);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
     }
 
     #[test]
@@ -1233,7 +1234,7 @@ mod tests {
         for (row, health, aux) in rows {
             let example = example(row);
             let rig = Rig::play(example.actions());
-            assert_eq!(rig.torch.limits.health(), health, "{row}");
+            assert_eq!(rig.health(), health, "{row}");
             assert_eq!(rig.aux(), aux, "{row}");
         }
         // The example's wait is 16 ticks, and a collapse takes up to 12.
@@ -1286,9 +1287,7 @@ mod tests {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
-        while torch.torch.limits.health() == Health::Good {
-            torch.tick(false);
-        }
+        until_fault(&mut torch);
         run(&mut torch, true, 4);
         torch.tick(false);
         assert!(torch.level() > 0, "still fading when the click counts");
@@ -1316,13 +1315,7 @@ mod tests {
         run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.aux(), Aux::Off, "not before the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
-        assert_eq!(torch.aux(), Aux::Yellow);
-        for tick in 1..THREE_SECONDS {
-            torch.tick(false);
-            assert_eq!(torch.aux(), Aux::Yellow, "tick {tick}");
-        }
-        torch.tick(false);
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::Yellow, THREE_SECONDS);
     }
 
     #[test]
@@ -1330,9 +1323,7 @@ mod tests {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
-        while torch.torch.limits.health() == Health::Good {
-            torch.tick(false);
-        }
+        until_fault(&mut torch);
         let mut fade = 0;
         while torch.level() != 0 {
             assert_eq!(torch.aux(), Aux::Off, "out while the main LED's lit");
@@ -1340,13 +1331,7 @@ mod tests {
             fade += 1;
         }
         assert!(fade > TICKS_PER_SECOND, "a fade of {fade} ticks");
-        for tick in 1..SHOW_TICKS {
-            assert_eq!(torch.aux(), Aux::White, "tick {tick}");
-            torch.tick(false);
-        }
-        assert_eq!(torch.aux(), Aux::White);
-        torch.tick(false);
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::White, SHOW_TICKS);
     }
 
     #[test]
@@ -1354,22 +1339,14 @@ mod tests {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
-        while torch.torch.limits.health() == Health::Good {
-            torch.tick(false);
-        }
+        until_fault(&mut torch);
         run(&mut torch, false, TICKS_PER_SECOND);
         run(&mut torch, true, 4);
         torch.tick(false);
         assert!(torch.level() > 0, "still fading when the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.level(), 0);
-        for tick in 1..SHOW_TICKS {
-            assert_eq!(torch.aux(), Aux::White, "tick {tick}");
-            torch.tick(false);
-        }
-        assert_eq!(torch.aux(), Aux::White);
-        torch.tick(false);
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::White, SHOW_TICKS);
     }
 
     #[test]
@@ -1518,16 +1495,10 @@ mod tests {
         torch.tick(false);
         assert_eq!(torch.level(), 0, "no fade");
         assert_eq!(torch.output(), Output::OFF);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
         assert_eq!(torch.ui.mode(), Mode::Off, "the UI's off too");
         assert!(torch.resting(), "and it rests from that pass");
-        for tick in 1..SHOW_TICKS {
-            assert_eq!(torch.aux(), Aux::White, "tick {tick}");
-            torch.tick(false);
-        }
-        assert_eq!(torch.aux(), Aux::White);
-        torch.tick(false);
-        assert_eq!(torch.aux(), Aux::Off);
+        shows_for(&mut torch, Aux::White, SHOW_TICKS);
         for back in [false, true] {
             torch.vddio2 = back;
             click(&mut torch);
@@ -1538,7 +1509,7 @@ mod tests {
             run(&mut torch, false, SHOW_TICKS);
             assert_eq!(torch.level(), 0, "VDDIO2 back: {back}");
         }
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
     }
 
     #[test]
@@ -1562,7 +1533,7 @@ mod tests {
         torch.vddio2 = false;
         torch.tick(false);
         assert_eq!(torch.output(), Output::OFF, "never got its level");
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
     }
 
     #[test]
@@ -1574,7 +1545,7 @@ mod tests {
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
         assert_eq!(torch.output(), Output::OFF);
         assert_eq!(torch.ui.mode(), Mode::Off);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
         assert_eq!(torch.aux(), Aux::White);
         torch.vddio2 = true;
         for _ in 0..TICKS_PER_SECOND {
@@ -1589,7 +1560,7 @@ mod tests {
         run(&mut torch, false, TICKS_PER_SECOND);
         torch.vddio2 = false;
         rest(&mut torch, 10 * TICKS_PER_SECOND, "with VDDIO2 gone");
-        assert_eq!(torch.torch.limits.health(), Health::Good);
+        assert_eq!(torch.health(), Health::Good);
         assert_eq!(torch.aux(), Aux::Blue);
         torch.vddio2 = true;
         click(&mut torch);
@@ -1603,7 +1574,7 @@ mod tests {
         torch.vddio2 = false;
         rest(&mut torch, TICKS_PER_SECOND, "with VDDIO2 gone");
         assert_eq!(torch.tick(true), None);
-        assert_eq!(torch.torch.limits.health(), Health::Fault, "at the press");
+        assert_eq!(torch.health(), Health::Fault, "at the press");
         assert_eq!(torch.aux(), Aux::White);
         run(&mut torch, true, 3);
         for _ in 0..RELEASE_TICKS + 1 {
@@ -1619,9 +1590,9 @@ mod tests {
         run(&mut torch, false, CHECK_AWAKE + 1);
         torch.vddio2 = false;
         rest(&mut torch, CHECK_TICKS - 1, "to the next check");
-        assert_eq!(torch.torch.limits.health(), Health::Good);
+        assert_eq!(torch.health(), Health::Good);
         torch.tick(false);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
         assert_eq!(torch.aux(), Aux::White, "from the check");
         run(&mut torch, false, CHECK_AWAKE);
         assert!(torch.resting());
@@ -1641,7 +1612,7 @@ mod tests {
         torch.vddio2 = false;
         rest(&mut torch, TICKS_PER_SECOND, "locked, with VDDIO2 gone");
         torch.tick(true);
-        assert_eq!(torch.torch.limits.health(), Health::Fault);
+        assert_eq!(torch.health(), Health::Fault);
         assert_eq!(torch.aux(), Aux::White);
         assert_eq!(torch.level(), 0);
     }
@@ -1662,7 +1633,7 @@ mod tests {
         for (row, health, aux) in rows {
             let example = example(row);
             let rig = Rig::play(example.actions());
-            assert_eq!(rig.torch.limits.health(), health, "{row}");
+            assert_eq!(rig.health(), health, "{row}");
             assert_eq!(rig.aux(), aux, "{row}");
         }
         let lost = example("VDDIO2 lost with the light on");
@@ -1977,7 +1948,7 @@ mod tests {
             gone_left = gone_left.saturating_sub(1);
             up = if pressed { 0 } else { up + 1 };
 
-            let health_before = rig.torch.limits.health();
+            let health_before = rig.health();
             let level_before = rig.level();
             let resting_before = rig.resting();
             let mut result = rig.adc.result();
@@ -1994,7 +1965,7 @@ mod tests {
                         _ => GROUND_READING,
                     },
                 });
-            let health = rig.torch.limits.health();
+            let health = rig.health();
             let level = rig.level();
             let convert = rig.convert();
 
