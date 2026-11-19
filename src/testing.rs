@@ -30,7 +30,7 @@ use crate::thermal;
 use crate::torch::Torch;
 use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Wake};
 
-pub const FULL_SCALE: u16 = 4 * 4095;
+pub use crate::sensors::FULL_SCALE;
 
 /// Read off this torch's signature row (`TEMPSENSE0` 0x03EE, `TEMPSENSE1` 0x0D24).
 pub const CALIBRATION: Calibration = Calibration {

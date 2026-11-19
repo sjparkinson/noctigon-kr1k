@@ -4,14 +4,11 @@
 use crate::TICKS_PER_SECOND;
 use crate::gradual::Ceiling;
 use crate::ramp::CEILING;
-use crate::sensors::CYCLE_TICKS;
+use crate::sensors::{CYCLE_TICKS, FULL_SCALE};
 
 /// The voltage calibration, against a default of 1024, higher reading higher.
 /// The stock firmware's figure for this driver, unmeasured on this torch.
 pub const SLOPE: u16 = 1014;
-
-/// Four full-scale 12-bit conversions.
-const MAX_READING: u16 = 4 * 4095;
 
 #[expect(
     clippy::arithmetic_side_effects,
@@ -43,7 +40,7 @@ const _: () = assert!(LOW as u32 * 0xFF <= u16::MAX as u32);
     reason = "widening to u32 in a const, where From can't be called"
 )]
 const _: () = {
-    let top = (MAX_READING >> 8) as u32 * HIGH as u32 + ((0xFF * LOW as u32) >> 6) + 32;
+    let top = (FULL_SCALE >> 8) as u32 * HIGH as u32 + ((0xFF * LOW as u32) >> 6) + 32;
     assert!(top <= u16::MAX as u32);
 };
 
@@ -51,11 +48,11 @@ const _: () = {
 /// no runtime 32-bit multiply.
 #[expect(
     clippy::arithmetic_side_effects,
-    reason = "reading is at most MAX_READING here, and the asserts on HIGH and LOW bound \
+    reason = "reading is at most FULL_SCALE here, and the asserts on HIGH and LOW bound \
               every step for that"
 )]
 pub const fn centivolts(reading: u16) -> u16 {
-    if reading > MAX_READING {
+    if reading > FULL_SCALE {
         return u16::MAX;
     }
     let (hi, lo) = (reading >> 8, reading & 0xFF);
@@ -364,7 +361,7 @@ mod tests {
 
     #[test]
     fn matches_the_formula_for_every_reading_the_adc_can_give() {
-        for reading in 0..=MAX_READING {
+        for reading in 0..=FULL_SCALE {
             let error = (f64::from(centivolts(reading)) - exact(reading)).abs();
             // Half a centivolt of rounding, plus what LOW loses.
             assert!(error < 0.6, "{reading} is off by {error}");
@@ -373,7 +370,7 @@ mod tests {
 
     #[test]
     fn rises_with_the_reading() {
-        for reading in 0..MAX_READING {
+        for reading in 0..FULL_SCALE {
             assert!(centivolts(reading) <= centivolts(reading + 1), "{reading}");
         }
     }
@@ -390,12 +387,12 @@ mod tests {
         assert_eq!(centivolts(0), 0);
         assert_eq!(centivolts(4847), 300);
         assert_eq!(centivolts(6786), 420);
-        assert_eq!(centivolts(MAX_READING), 1014);
+        assert_eq!(centivolts(FULL_SCALE), 1014);
     }
 
     #[test]
     fn a_reading_the_adc_cant_give_is_safe_rather_than_an_overflow() {
-        assert_eq!(centivolts(MAX_READING + 1), u16::MAX);
+        assert_eq!(centivolts(FULL_SCALE + 1), u16::MAX);
         assert_eq!(centivolts(u16::MAX), u16::MAX);
     }
 
@@ -688,7 +685,7 @@ mod tests {
         }
         for cv in [
             centivolts(0),
-            centivolts(MAX_READING),
+            centivolts(FULL_SCALE),
             centivolts(u16::MAX),
             99,
             441,
@@ -719,7 +716,7 @@ mod tests {
     #[test]
     fn a_second_of_garbage_is_blind_on_or_off() {
         for level in [0, 1, 30, CEILING] {
-            for garbage in [0, 99, 441, centivolts(MAX_READING), u16::MAX] {
+            for garbage in [0, 99, 441, centivolts(FULL_SCALE), u16::MAX] {
                 let mut lvp = Protection::new();
                 let verdicts = run(&mut lvp, garbage, level, u16::from(GLITCHES));
                 assert!(all(&verdicts, NONE), "{garbage} at level {level}");
@@ -841,7 +838,7 @@ mod tests {
 
     #[test]
     fn garbage_neither_counts_towards_a_collapse_nor_starts_the_run_again() {
-        let garbage = [0, 99, 441, centivolts(MAX_READING), u16::MAX];
+        let garbage = [0, 99, 441, centivolts(FULL_SCALE), u16::MAX];
         let mut lvp = Protection::new();
         for _ in 0..1000 {
             for cv in garbage {
@@ -872,7 +869,7 @@ mod tests {
     #[test]
     fn every_reading_twice_running_is_a_collapse_only_under_the_floor() {
         let mut collapses = 0_u32;
-        for raw in 0..=MAX_READING {
+        for raw in 0..=FULL_SCALE {
             let cv = centivolts(raw);
             let mut lvp = Protection::new();
             assert!(!lvp.quick(cv), "raw {raw}");
@@ -965,7 +962,7 @@ mod tests {
     #[test]
     fn every_reading_held_ends_where_the_thresholds_say() {
         let mut ends = [0_u32; 3];
-        for raw in 0..=MAX_READING {
+        for raw in 0..=FULL_SCALE {
             let cv = centivolts(raw);
             let expected = held(cv);
             let mut lvp = Protection::new();
