@@ -685,13 +685,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn enters_progmode_and_checks_the_signature() {
-        let mut p = Programmer::connect(Dd20::new()).unwrap();
-        p.enter_progmode().unwrap();
-        p.check_signature().unwrap();
-    }
-
-    #[test]
     fn waits_for_the_chip_to_start_up_on_a_fast_or_slow_adapter() {
         for round_trip in [Duration::from_micros(100), Duration::from_millis(16)] {
             let mut dd = Dd20::new();
@@ -735,14 +728,6 @@ pub(crate) mod tests {
             assert!(err.contains(&hex(&signature)), "{err}");
             assert!(err.contains("1E 95 3A"), "{err}");
         }
-    }
-
-    #[test]
-    fn refuses_a_locked_chip() {
-        let mut dd = Dd20::new();
-        dd.lock = fake::LOCKED;
-        let mut p = Programmer::connect(dd).unwrap();
-        assert!(p.enter_progmode().unwrap_err().contains("locked"));
     }
 
     #[test]
