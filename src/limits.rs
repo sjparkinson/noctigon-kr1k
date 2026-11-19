@@ -26,7 +26,7 @@ pub struct Step {
     /// The UI should turn off.
     pub off: bool,
     /// Centivolts of a voltage reading that came due with the light off on
-    /// this tick and the two before. Implausible readings included.
+    /// this tick and the two before.
     pub unloaded: Option<u16>,
 }
 
@@ -149,7 +149,7 @@ impl Limits {
             Some(Reading::Voltage(raw) | Reading::Quick(raw)) => {
                 let centivolts = battery::centivolts(raw);
                 if matches!(reading, Some(Reading::Voltage(_))) {
-                    if quiet {
+                    if quiet && battery::plausible(centivolts) {
                         unloaded = Some(centivolts);
                     }
                     if self.protection.sample(centivolts, level) == Verdict::Blind {
@@ -948,7 +948,9 @@ mod tests {
             for tick in 0..64 {
                 let step = limits.tick(0, adc.result(), true);
                 adc.start(limits.convert());
-                let read = due(tick).then(|| battery::centivolts(voltage));
+                let read = due(tick)
+                    .then(|| battery::centivolts(voltage))
+                    .filter(|&volts| battery::plausible(volts));
                 assert_eq!(step.unloaded, read, "{voltage}: tick {tick}");
             }
         }

@@ -2,7 +2,6 @@
 //! an ADC result in, a level and the next conversion out.
 
 use crate::TICKS_PER_SECOND;
-use crate::battery;
 use crate::button::{Clicks, Debounce, Event};
 use crate::gradual::Fade;
 use crate::limits::{Health, Limits};
@@ -110,7 +109,6 @@ impl Torch {
                 self.ui.off();
             }
             match step.unloaded {
-                Some(volts) if !battery::plausible(volts) => {}
                 Some(volts) if volts < AUX_DARK_BELOW => self.cell_low = true,
                 Some(volts) if volts >= AUX_LIT_FROM => self.cell_low = false,
                 _ => {}
