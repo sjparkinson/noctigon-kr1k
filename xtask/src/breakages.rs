@@ -373,6 +373,14 @@ const BREAKAGES: &[Breakage] = &[
         expect: "isn't followed by `st Z`",
     },
     Breakage {
+        name: "sleep-apart-from-sei",
+        file: HW,
+        find: "asm!(\"sei\", \"sleep\", options(nostack))",
+        replace: "asm!(\"sei\", \"nop\", \"sleep\", options(nostack))",
+        stage: Stage::Layout,
+        expect: "doesn't follow `sei`",
+    },
+    Breakage {
         name: "handler-races-temp",
         file: HW,
         find: "pub extern \"avr-interrupt\" fn portd_port() {\n",
