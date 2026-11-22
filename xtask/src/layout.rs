@@ -28,10 +28,10 @@ pub fn check(elf: &Elf) -> Result<(), String> {
 }
 
 /// Substrings of the symbols this nightly emits for panic machinery, which
-/// LTO drops while nothing reaches it. Re-prove the check fires on a bump.
+/// LTO drops while nothing reaches it.
 const PANIC_PATTERNS: [&str; 2] = ["panic", "begin_unwind"];
 
-fn no_panics<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
+pub(crate) fn no_panics<'a>(symbols: impl IntoIterator<Item = &'a str>) -> Result<(), String> {
     let found: Vec<&str> = symbols
         .into_iter()
         .filter(|name| PANIC_PATTERNS.iter().any(|p| name.contains(p)))

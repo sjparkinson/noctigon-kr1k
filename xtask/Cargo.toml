@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Build helpers for the KR1K firmware: hex, breakages, flash, backup, simulate."
+description = "Build helpers for the KR1K firmware: hex, flash, backup, simulate."
 publish = false
 edition.workspace = true
 authors.workspace = true
