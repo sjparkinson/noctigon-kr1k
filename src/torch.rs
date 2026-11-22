@@ -28,6 +28,10 @@ pub const AUX_DARK_BELOW: u16 = 330;
 pub const AUX_LIT_FROM: u16 = 340;
 
 const _: () = assert!(AUX_DARK_BELOW < AUX_LIT_FROM);
+const _: () = assert!(
+    crate::battery::LIGHT_FROM <= AUX_DARK_BELOW,
+    "off's blue would show on a cell too weak to light"
+);
 const _: () = assert!(crate::battery::FORGET_TICKS <= CHECK_TICKS);
 
 #[derive(Clone, Debug)]
@@ -920,6 +924,13 @@ mod tests {
             ("Low cell, read by a press", Health::Good, Aux::Off),
             ("Low cell, charged at rest", Health::Good, Aux::Blue),
             ("A cell it can't read, at rest", Health::Good, Aux::Off),
+            ("Weak cell, 1C", Health::Flat, Aux::Yellow),
+            ("Weak cell, 1H", Health::Flat, Aux::Yellow),
+            (
+                "Weak cell that recovers before a press",
+                Health::Good,
+                Aux::Off,
+            ),
             ("A cell that collapses", Health::Flat, Aux::Yellow),
             ("A collapsed cell, 1C again", Health::Flat, Aux::Yellow),
             (
@@ -1094,6 +1105,46 @@ mod tests {
         assert_eq!(torch.aux(), Aux::Blue);
         click(&mut torch);
         assert_eq!(torch.aux(), Aux::Off);
+    }
+
+    #[test]
+    fn a_press_on_a_weak_cell_shows_yellow_and_never_raises_the_output() {
+        for hold in [false, true] {
+            let mut torch = Rig::default();
+            torch.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
+            let press = |torch: &mut Rig, pressed: bool, ticks: u16| {
+                for _ in 0..ticks {
+                    torch.tick(pressed);
+                    assert_eq!(torch.output(), Output::OFF, "hold {hold}");
+                }
+            };
+            press(&mut torch, true, if hold { HOLD_TICKS + 2 } else { 4 });
+            press(&mut torch, false, RELEASE_TICKS + 5);
+            assert_eq!(torch.health(), Health::Flat, "hold {hold}");
+            assert_eq!(torch.aux(), Aux::Yellow, "hold {hold}");
+            assert_eq!(torch.torch.ui.mode(), Mode::Off, "hold {hold}");
+        }
+    }
+
+    #[test]
+    fn a_weak_cell_shows_no_blue_and_still_locks_and_unlocks() {
+        let mut torch = Rig::default();
+        torch.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
+        run(&mut torch, false, TICKS_PER_SECOND);
+        assert_eq!(
+            torch.health(),
+            Health::Good,
+            "weak isn't flat until a press"
+        );
+        assert_eq!(torch.aux(), Aux::Off);
+        clicks(&mut torch, 3);
+        run(&mut torch, false, RELEASE_TICKS + 1);
+        assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
+        assert_eq!(torch.aux(), Aux::Red);
+        clicks(&mut torch, 3);
+        run(&mut torch, false, RELEASE_TICKS + 1);
+        assert_eq!(torch.torch.ui.mode(), Mode::Off);
+        assert_eq!(torch.health(), Health::Good);
     }
 
     #[test]
@@ -1728,6 +1779,8 @@ mod tests {
         lit_for: u32,
         /// Plausible readings in a row under 2.80 V with the light on.
         sagging: u8,
+        /// The last plausible reading with the light off was under 3.00 V.
+        weak: bool,
     }
 
     impl Model {
@@ -1752,6 +1805,7 @@ mod tests {
             if !battery::PLAUSIBLE.contains(&volts) {
                 return;
             }
+            self.weak = volts < 300;
             if volts < 330 {
                 self.cell_low = true;
             } else if volts >= 340 {
@@ -1819,6 +1873,7 @@ mod tests {
         went_flat: u32,
         collapsed: u32,
         collapsed_mid_fade: u32,
+        refused: u32,
         charged: u32,
         went_blind: u32,
         clicked_off_mid_fade: u32,
@@ -1864,6 +1919,7 @@ mod tests {
             checked_at: 0,
             lit_for: 0,
             sagging: 0,
+            weak: false,
         };
         let start_up = pace == Pace::Slow && rng.next_u16().is_multiple_of(2);
         let (mut pressed, mut switch_left) = (start_up, 0);
@@ -2041,6 +2097,7 @@ mod tests {
                 check!(t, health_before == Health::Good, "{health_before:?}");
                 check!(t, health == Health::Good, "{health:?}");
                 check!(t, vddio2, "lit with VDDIO2 missing");
+                check!(t, !model.weak, "lit a cell last read under 3.00 V");
                 let most = if held { ui::FLOOR } else { ON_LEVEL };
                 check!(t, level <= most, "on at {level}");
                 seen.turned_on += 1;
@@ -2060,12 +2117,14 @@ mod tests {
                 | (Health::Flat, Health::Flat)
                 | (Health::Fault, Health::Fault) => {}
                 (Health::Good, Health::Flat) => {
+                    let refused = level_before == 0 && (click || held) && model.weak;
                     check!(
                         t,
-                        level_before == 1 || collapsed,
+                        level_before == 1 || collapsed || refused,
                         "flat from level {level_before}"
                     );
-                    seen.went_flat += u32::from(!collapsed);
+                    seen.went_flat += u32::from(!collapsed && !refused);
+                    seen.refused += u32::from(refused);
                 }
                 (Health::Flat, Health::Good) => {
                     let volts = result.map(battery::centivolts);
@@ -2270,6 +2329,7 @@ mod tests {
             ("turned on", seen.turned_on),
             ("lit by a hold", seen.lit_by_a_hold),
             ("gone flat", seen.went_flat),
+            ("refused to light a weak cell", seen.refused),
             ("collapsed", seen.collapsed),
             ("collapsed in a fault's fade", seen.collapsed_mid_fade),
             ("charged", seen.charged),

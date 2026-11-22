@@ -80,9 +80,17 @@ pub const COLLAPSE_BELOW: u16 = 280;
 /// Readings in a row. Unmeasured.
 pub const COLLAPSE_READINGS: u8 = 2;
 
+/// Centivolts, read with the light off. Unmeasured.
+pub const LIGHT_FROM: u16 = 300;
+
 const _: () = assert!(REFERENCE_MIN < COLLAPSE_BELOW && COLLAPSE_BELOW < OFF_BELOW);
 const _: () = assert!(*PLAUSIBLE.start() < COLLAPSE_BELOW);
 const _: () = assert!(COLLAPSE_READINGS > 1);
+const _: () = assert!(
+    COLLAPSE_BELOW < LIGHT_FROM && LIGHT_FROM <= STEP_DOWN_BELOW,
+    "a lit cell never reads over what it read unloaded, so one refused under LIGHT_FROM is one \
+     the steps down would have walked to flat"
+);
 const _: () = assert!(REFERENCE_MIN < OFF_BELOW);
 const _: () = assert!(OFF_BELOW < STEP_DOWN_BELOW && STEP_DOWN_BELOW < RECOVER_AT);
 const _: () = assert!(RECOVER_AT < CHARGED_AT && CHARGED_AT < *PLAUSIBLE.end());
@@ -143,8 +151,10 @@ pub struct Protection {
     sagging: u8,
     /// Implausible samples in a row.
     implausible: u8,
-    /// Turned off for a flat cell, and not yet read as charged.
+    /// Turned off or kept off for a flat cell, and not yet read as charged.
     flat: bool,
+    /// The last reading with the light off was under [`LIGHT_FROM`].
+    weak: bool,
     ceiling: Ceiling,
     /// Ticks of rest since the last sample, up to [`FORGET_TICKS`].
     rested: u16,
@@ -166,6 +176,7 @@ impl Protection {
             sagging: 0,
             implausible: 0,
             flat: false,
+            weak: false,
             ceiling: Ceiling::new(DOWN_EVERY, UP_EVERY),
             rested: 0,
         }
@@ -177,6 +188,16 @@ impl Protection {
 
     pub const fn flat(&self) -> bool {
         self.flat
+    }
+
+    /// A plausible reading with the light off.
+    pub const fn unloaded(&mut self, centivolts: u16) {
+        self.weak = centivolts < LIGHT_FROM;
+    }
+
+    /// The light's asked on. A weak cell is flat instead.
+    pub const fn turn_on(&mut self) {
+        self.flat |= self.weak;
     }
 
     pub const fn tick(&mut self) -> u8 {
@@ -771,6 +792,53 @@ mod tests {
         assert!(!lvp.flat());
         assert!(follow(&mut lvp, 250, CEILING, secs(30)).contains(&Verdict::Flat));
         assert!(lvp.flat());
+    }
+
+    #[test]
+    fn turning_on_after_a_weak_reading_with_the_light_off_is_flat_until_charged() {
+        let mut lvp = Protection::new();
+        lvp.turn_on();
+        assert!(!lvp.flat(), "nothing read yet");
+        lvp.unloaded(LIGHT_FROM);
+        lvp.turn_on();
+        assert!(!lvp.flat());
+        lvp.unloaded(LIGHT_FROM - 1);
+        assert!(!lvp.flat(), "only once it turns on");
+        lvp.turn_on();
+        assert!(lvp.flat());
+        lvp.unloaded(CHARGED_AT - 1);
+        assert_eq!(lvp.sample(CHARGED_AT - 1, 0), NONE);
+        assert!(lvp.flat(), "until charged");
+        lvp.unloaded(CHARGED_AT);
+        assert_eq!(lvp.sample(CHARGED_AT, 0), NONE);
+        lvp.turn_on();
+        assert!(!lvp.flat());
+    }
+
+    #[test]
+    fn only_the_last_reading_with_the_light_off_says_whether_its_weak() {
+        let mut lvp = Protection::new();
+        lvp.unloaded(LIGHT_FROM - 1);
+        for _ in 0..FORGET_TICKS {
+            lvp.rest();
+        }
+        lvp.unloaded(LIGHT_FROM);
+        lvp.turn_on();
+        assert!(!lvp.flat());
+        lvp.unloaded(LIGHT_FROM - 1);
+        for _ in 0..FORGET_TICKS {
+            lvp.rest();
+        }
+        lvp.turn_on();
+        assert!(lvp.flat(), "a rest forgets the filter, not this");
+    }
+
+    #[test]
+    fn a_cell_too_weak_to_light_is_one_the_steps_down_would_turn_off() {
+        assert_eq!(
+            (COLLAPSE_BELOW, LIGHT_FROM, STEP_DOWN_BELOW),
+            (280, 300, 300)
+        );
     }
 
     #[test]

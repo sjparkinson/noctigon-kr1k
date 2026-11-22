@@ -339,7 +339,7 @@ mod tests {
 
     #[test]
     fn a_flat_cell_turns_it_off_and_a_fault_keeps_it_off() {
-        assert_eq!(script("cell:2.80V 1C wait:10s").level, 0);
+        assert_eq!(script("1C cell:2.85V wait:10s").level, 0);
         assert_eq!(script("fault 1C").level, 0);
     }
 
