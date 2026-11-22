@@ -44,17 +44,17 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** The cell has no protection of its own, and the boost converter likely pulls over 10 A from it.
 
-**Cover.** `battery::Protection` steps the ceiling down as the cell falls, fades the light off, and keeps it off until the cell reads charged.
+**Cover.** `battery::Protection` steps the ceiling down as the cell falls, fades the light off, and keeps it off until the cell reads charged. A light asked on after the last reading with the light off was under `battery::LIGHT_FROM` is kept off the same way, and a press from rest takes that reading before its click or hold can light anything.
 
-**Unproven.** Simulator, with the reading scripted. Every threshold is unmeasured, against a ±4 % reference (table 38-18).
+**Unproven.** Simulator, with the reading scripted. Every threshold is unmeasured, against a ±4 % reference (table 38-18). The scripted cell doesn't sag under load, so how far a real one falls from its reading with the light off is unknown. A cell kept off stays off until it reads `battery::CHARGED_AT` or comes out, however it rests after.
 
 ### H6. The MCU browning out with the cell
 
 **Hazard.** VDD is the cell and this torch's BOD is off, so a sagging cell browns the MCU out with no reset while PC1 is high.
 
-**Cover.** A floor that narrows the window and doesn't close it. While lit, two cell readings running under `battery::COLLAPSE_BELOW` put the light out that tick.
+**Cover.** A floor that narrows the window and doesn't close it. While lit, two cell readings running under `battery::COLLAPSE_BELOW` put the light out that tick. PC1 never rises on a cell last read under `battery::LIGHT_FROM` with the light off.
 
-**Unproven.** Simulator, with the cell scripted. Nothing covers a brown-out itself. A trip can take 188 ms, or 203 ms as a light starts, and how this cell sags is unmeasured.
+**Unproven.** Simulator, with the cell scripted. Nothing covers a brown-out itself. A trip can take 188 ms, or 203 ms as a light starts, and how this cell sags is unmeasured. Whether a cell that reads `battery::LIGHT_FROM` or more with the light off holds VDD up as the boost converter starts is unmeasured too.
 
 ### H7. Overheating
 
@@ -172,7 +172,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 - Nobody knows what holds PC1 low through reset and in programming mode (H1, H12).
 - No current, temperature or tail current is measured, and the top of the ramp hasn't been seen (H2, H3, H7, H13).
-- No low-voltage step, cut-off, collapse or brown-out has been seen (H5, H6).
+- No low-voltage step, cut-off, collapse, refusal of a weak cell or brown-out has been seen (H5, H6).
 - No fault, watchdog reset or tick deadline has been seen on the chip (H4, H9, H14, H15).
 - `restore` has never run on this torch (H11).
 - Nothing limits how long a lit light stays lit (H8, H17).

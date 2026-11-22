@@ -138,6 +138,7 @@ impl Limits {
         let on = ui != 0;
         if on && self.asked == 0 {
             self.thermal.reset();
+            self.protection.turn_on();
         }
         let steady = ui == self.asked;
         self.asked = ui;
@@ -167,6 +168,7 @@ impl Limits {
                 if matches!(reading, Some(Reading::Voltage(_))) {
                     if quiet && battery::plausible(centivolts) {
                         unloaded = Some(centivolts);
+                        self.protection.unloaded(centivolts);
                     }
                     if self.protection.sample(centivolts, level) == Verdict::Blind {
                         self.fault = true;
@@ -412,7 +414,7 @@ mod tests {
         let sample = usize::from(CYCLE_TICKS);
         let mut run = Run::new();
         run.adc.voltage = voltage_reading(280);
-        let on_at = 4 * sample + 2;
+        let on_at = 2;
         run.ticks(on_at as u32);
         run.ui = 1;
         run.ticks(1);
@@ -422,6 +424,50 @@ mod tests {
         assert!(run.levels[on_at..off_at].iter().all(|&l| l == 1));
         assert_eq!(run.levels[off_at], 0);
         assert_eq!(run.offs, 1);
+    }
+
+    #[test]
+    fn a_cell_read_under_3_volts_with_the_light_off_never_lights() {
+        for ui in [1, 50, CEILING] {
+            let mut run = Run::new();
+            run.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
+            run.ticks(3);
+            run.ui = ui;
+            run.secs(1);
+            assert!(run.levels.iter().all(|&l| l == 0), "{ui}");
+            assert_eq!(run.offs, 1, "{ui}");
+            assert_eq!(run.limits.health(), Health::Flat, "{ui}");
+        }
+    }
+
+    #[test]
+    fn a_cell_read_at_3_volts_with_the_light_off_lights() {
+        let mut run = Run::new();
+        run.adc.voltage = voltage_reading(battery::LIGHT_FROM);
+        run.ticks(3);
+        run.ui = 50;
+        assert_eq!(run.ticks(1), 50);
+        assert_eq!(run.limits.health(), Health::Good);
+    }
+
+    #[test]
+    fn the_last_reading_with_the_light_off_decides_whether_it_lights() {
+        let round = u32::from(CYCLE_TICKS);
+        let mut run = Run::new();
+        run.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
+        run.ticks(round);
+        run.adc.voltage = voltage_reading(battery::LIGHT_FROM);
+        run.ticks(round);
+        run.ui = 50;
+        assert_eq!(run.ticks(1), 50);
+        run.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
+        run.ticks(round);
+        assert_eq!(run.level(), 50, "a reading with the light on isn't one");
+        run.ui = 0;
+        run.ticks(round + 2);
+        run.ui = 50;
+        assert_eq!(run.ticks(1), 0);
+        assert_eq!(run.limits.health(), Health::Flat);
     }
 
     #[test]
