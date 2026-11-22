@@ -61,7 +61,7 @@ pub fn memory(elf: &Elf) -> Result<(), String> {
         &image,
         reset,
         symbol("__unhandled_interrupt")?,
-        halt(elf.symbols(), |name| elf.symbol(name))?,
+        symbol("__halt")?,
     )?;
 
     let ram_layout = Ram {
@@ -73,25 +73,6 @@ pub fn memory(elf: &Elf) -> Result<(), String> {
     };
     ram(&ram_layout, elf.segments())?;
     mapped(elf.segments())
-}
-
-/// `hw::halt` as both of Rust's mangling schemes spell it, each path
-/// segment as its length then its name.
-const HALT: &str = "2hw4halt";
-
-pub(crate) fn halt<'a>(
-    names: impl IntoIterator<Item = &'a str>,
-    value: impl Fn(&str) -> Option<u32>,
-) -> Result<u32, String> {
-    let found: Vec<&str> = names.into_iter().filter(|n| n.contains(HALT)).collect();
-    match found[..] {
-        [name] => value(name).ok_or_else(|| format!("no value for `{name}`")),
-        [] => Err("no `hw::halt` symbol".into()),
-        _ => Err(format!(
-            "more than one symbol looks like `hw::halt`: {}",
-            found.join(", ")
-        )),
-    }
 }
 
 fn vectors(image: &[u8], reset: u32, unhandled: u32, halt: u32) -> Result<(), String> {
@@ -360,29 +341,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn finds_halt_by_its_mangled_path() {
-        let value = |name: &str| name.starts_with("_ZN").then_some(0x1234);
-        let firmware = [
-            "__reset",
-            "_ZN3kr1k3avr2hw8set_output17h0123456789abcdefE",
-            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
-        ];
-        assert_eq!(halt(firmware, value), Ok(0x1234));
-        let probe = ["main", "_ZN4link2hw4halt17h0123456789abcdefE"];
-        assert_eq!(halt(probe, value), Ok(0x1234));
-        let v0 = ["_RNvNtNtCs1234_4kr1k3avr2hw4halt"];
-        assert_eq!(halt(v0, |_| Some(0x42)), Ok(0x42));
-
-        let none = ["main", "_ZN3kr1k3avr2hw8set_output17h0123456789abcdefE"];
-        assert!(halt(none, value).unwrap_err().contains("no `hw::halt`"));
-        let two = [
-            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
-            "_ZN3kr1k3avr2hw4halt17hfedcba9876543210E",
-        ];
-        assert!(halt(two, value).unwrap_err().contains("more than one"));
-    }
-
     fn ram_at(data: u32, data_len: u32, bss_len: u32, data_load: u32) -> Ram {
         Ram {
             data_start: data,
@@ -537,7 +495,7 @@ mod tests {
             "__unhandled_interrupt",
             "main",
             "_ZN3kr1k6torch5Torch4tick17h0123456789abcdefE",
-            "_ZN3kr1k3avr2hw4halt17h0123456789abcdefE",
+            "__halt",
         ];
         assert_eq!(no_panics(symbols), Ok(()));
     }

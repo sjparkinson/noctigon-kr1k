@@ -300,6 +300,7 @@ pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
 
 /// Also reached from an unhandled interrupt with no `reti`, so CPUINT still
 /// has it running (section 15.5.2) and its flag up. The `sleep` loops.
+#[unsafe(export_name = "__halt")]
 pub fn halt() -> ! {
     // SAFETY: `cli` only clears SREG.I. No `nomem`, so nothing moves above it.
     unsafe { asm!("cli", options(nostack)) };
