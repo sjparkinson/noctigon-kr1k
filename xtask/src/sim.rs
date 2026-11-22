@@ -30,7 +30,7 @@ use kr1k::watchdog::{
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_call, is_two_words, ldi, ldi_operands};
 use crate::crc;
 use crate::elf::{DATA_SPACE, Elf, SRAM};
-use crate::layout::{self, jmp_target, word};
+use crate::layout::{jmp_target, word};
 use crate::stamp;
 use crate::switching::RandomSwitching;
 use crate::twi::{Fault, Twi};
@@ -186,7 +186,7 @@ impl Linked {
             main: symbol("main")? / 2,
             ends: Ends {
                 unhandled: symbol("__unhandled_interrupt")?,
-                halt: layout::halt(elf.symbols(), |name| elf.symbol(name))?,
+                halt: symbol("__halt")?,
             },
             layout: Layout {
                 data: sram("__data_start")?..sram("__data_end")?,

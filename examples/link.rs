@@ -23,7 +23,8 @@ mod hw {
     pub extern "avr-interrupt" fn tcb0_int() {}
     pub extern "avr-interrupt" fn portd_port() {}
 
-    #[allow(clippy::empty_loop)]
+    #[allow(unsafe_code, clippy::empty_loop)]
+    #[unsafe(export_name = "__halt")]
     pub fn halt() -> ! {
         loop {}
     }
