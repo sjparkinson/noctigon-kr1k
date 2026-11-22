@@ -549,8 +549,8 @@ fn every_mistake_has_its_own_name_and_finds_its_text_exactly_once() {
     }
 }
 
-// The simulator here is built from the unbroken library, so it would refuse
-// a broken one for disagreeing with it, whatever the mistake.
+// The simulator here is built from the unbroken library, so a broken one may
+// be refused only for disagreeing with it.
 #[test]
 fn every_mistake_is_outside_the_library_whose_own_tests_catch_its_mistakes() {
     for (mistake, _) in mistakes() {
