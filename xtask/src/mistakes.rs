@@ -3,11 +3,10 @@
 
 use std::fs::{self, File};
 use std::path::Path;
-use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
-use crate::{TempDir, at, cargo, checked, firmware_build, guards_checked, root};
+use crate::{TempDir, at, checked, firmware_build, guards_checked, root};
 
 const COPIED: [&str; 10] = [
     ".cargo",
@@ -43,11 +42,6 @@ struct Mistake {
 
 const HW: &str = "src/avr/hw.rs";
 const MAIN: &str = "src/main.rs";
-const AW2016: &str = "src/aw2016.rs";
-const LIMITS: &str = "src/limits.rs";
-const BATTERY: &str = "src/battery.rs";
-const SENSORS: &str = "src/sensors.rs";
-const TORCH: &str = "src/torch.rs";
 
 const MISTAKES: &[Mistake] = &[
     // DAC0 above 0 with PC1 low is refused first, as close as a mistake gets.
@@ -264,14 +258,6 @@ const MISTAKES: &[Mistake] = &[
         expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
     Mistake {
-        name: "vddio2-loss-fades-out",
-        file: LIMITS,
-        find: "        let fault = self.fault && (cut || self.level <= 1);\n",
-        replace: "        let fault = self.fault && self.level <= 1;\n",
-        stage: Stage::Simulator,
-        expect: "began with MVIO.STATUS.VDDIO2S clear",
-    },
-    Mistake {
         name: "watchdog-never-fed",
         file: MAIN,
         find: "            hw::feed_watchdog();\n",
@@ -295,17 +281,6 @@ const MISTAKES: &[Mistake] = &[
                   hw::set_watchdog(setting);\n            }\n",
         stage: Stage::Simulator,
         expect: "raises PC1 with WDT.CTRLA at 0x0b",
-    },
-    // The guard alone changes nothing, so this also lights while the switch is down.
-    Mistake {
-        name: "unguarded-light-at-rest",
-        file: TORCH,
-        find: "            let asked = if lit_window {\n                \
-               self.ui.output_level()\n            } else {\n                0\n            };\n",
-        replace: "            let _ = lit_window;\n            \
-                  let asked = self.ui.output_level().max(u8::from(pressed));\n",
-        stage: Stage::Simulator,
-        expect: "the light only comes on with the lit window in force and a wdr since it was written",
     },
     Mistake {
         name: "watchdog-write-not-waited-for",
@@ -428,45 +403,12 @@ const MISTAKES: &[Mistake] = &[
         expect: "raises PC1 with the aux lit",
     },
     Mistake {
-        name: "aux-off-not-standby",
-        file: AW2016,
-        find: "        data: &[CHGDIS],\n",
-        replace: "        data: &[CHGDIS | CHIPEN],\n",
-        stage: Stage::Simulator,
-        expect: "isn't in standby",
-    },
-    Mistake {
         name: "aux-retried-on-the-next-tick",
         file: MAIN,
         find: "            aux.failed();\n",
         replace: "",
         stage: Stage::Simulator,
         expect: "tries the AW2016 again",
-    },
-    // Four readings in a row can't put the light out within 12 ticks.
-    Mistake {
-        name: "collapse-waits",
-        file: BATTERY,
-        find: "pub const COLLAPSE_READINGS: u8 = 2;\n",
-        replace: "pub const COLLAPSE_READINGS: u8 = 4;\n",
-        stage: Stage::Simulator,
-        expect: "with a collapsing cell: the cell falls on tick",
-    },
-    Mistake {
-        name: "no-quick-readings",
-        file: SENSORS,
-        find: "        if channel == Channel::Voltage && step >= READING_STEP && lit {\n",
-        replace: "        if channel == Channel::Voltage && step >= READING_STEP && lit && false {\n",
-        stage: Stage::Simulator,
-        expect: "A cell that collapses: expected Off",
-    },
-    Mistake {
-        name: "ground-ignored",
-        file: SENSORS,
-        find: "        if raw <= GROUND_MAX {\n",
-        replace: "        if raw <= GROUND_MAX || true {\n",
-        stage: Stage::Simulator,
-        expect: "with the ADC stuck on one reading",
     },
     Mistake {
         name: "ground-reads-the-cell",
@@ -503,32 +445,10 @@ fn hex_checked(copy: &Path) -> Result<(), String> {
     checked(copy).map(drop)
 }
 
-fn own_hex(copy: &Path) -> Result<(), String> {
-    let hex = Command::new(cargo())
-        .current_dir(copy)
-        .args(["xtask", "hex"])
-        .env_remove("CARGO_TARGET_DIR")
-        .output()
-        .map_err(|e| e.to_string())?;
-    if hex.status.success() {
-        return Ok(());
-    }
-    Err(String::from_utf8_lossy(&hex.stderr).into_owned())
-}
-
-/// The simulator is built from the library, so a mistake there only shows in
-/// a simulator built from the copy.
-fn in_library(file: &str) -> bool {
-    file != MAIN && file != HW
-}
-
 fn mistakes() -> Vec<(&'static Mistake, Check)> {
     let whole = MISTAKES
         .iter()
-        .map(|mistake| match in_library(mistake.file) {
-            true => (mistake, own_hex as Check),
-            false => (mistake, hex_checked as Check),
-        });
+        .map(|mistake| (mistake, hex_checked as Check));
     let guards = GUARDS_MISTAKES
         .iter()
         .map(|mistake| (mistake, guards_checked as Check));
@@ -626,6 +546,16 @@ fn every_mistake_has_its_own_name_and_finds_its_text_exactly_once() {
         let source = fs::read_to_string(&path).unwrap();
         substitute(&source, mistake.find, mistake.replace)
             .unwrap_or_else(|e| panic!("{}: {}: {e}", mistake.name, mistake.file));
+    }
+}
+
+// The simulator here is built from the unbroken library, so it would refuse
+// a broken one for disagreeing with it, whatever the mistake.
+#[test]
+fn every_mistake_is_outside_the_library_whose_own_tests_catch_its_mistakes() {
+    for (mistake, _) in mistakes() {
+        let firmware = mistake.file == MAIN || mistake.file.starts_with("src/avr/");
+        assert!(firmware, "{}: {}", mistake.name, mistake.file);
     }
 }
 

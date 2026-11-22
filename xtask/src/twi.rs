@@ -120,7 +120,7 @@ impl Aw2016 {
     }
 
     /// Standby and reset are as "Operating Mode" and "Software Reset" have them.
-    fn write(&mut self, now: u64, at: u8, value: u8) -> Result<(), String> {
+    pub fn write(&mut self, now: u64, at: u8, value: u8) -> Result<(), String> {
         let late = now.saturating_sub(self.woke_at) < WAKE_CLOCKS;
         match at {
             RSTR if value == RESET => self.regs = [0; 0x40],

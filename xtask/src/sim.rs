@@ -4416,6 +4416,17 @@ mod tests {
         assert!(err.contains("TCB0's 16-bit"), "{err}");
     }
 
+    #[test]
+    fn the_aux_wanted_off_want_the_aw2016_in_standby() {
+        let mut twi = Twi::new();
+        AuxWatch::default().tick(&twi, Aux::Off).unwrap();
+        twi.aw2016
+            .write(0, kr1k::aw2016::GCR1, kr1k::aw2016::CHIPEN)
+            .unwrap();
+        let err = AuxWatch::default().tick(&twi, Aux::Off).unwrap_err();
+        assert!(err.contains("isn't in standby"), "{err}");
+    }
+
     use crate::avr::asm::{CLI, NOP, RETI, SEI, SLEEP, bytes as image, jmp, out, sts};
 
     const SEC: u16 = 0x9408;
