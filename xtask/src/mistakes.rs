@@ -1,12 +1,11 @@
-//! `cargo xtask breakages` breaks the firmware on purpose, one mistake at a
-//! time, and checks `cargo xtask hex` refuses each for the reason expected.
+//! A refusal shows one alarm rings for one mistake, not for every mistake of
+//! that kind.
 
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use std::time::Instant;
 
-use crate::{TempDir, at, cargo};
+use crate::{TempDir, at, cargo, checked, firmware_build, root};
 
 const COPIED: [&str; 10] = [
     ".cargo",
@@ -30,13 +29,13 @@ enum Stage {
     Simulator,
 }
 
-struct Breakage {
+struct Mistake {
     name: &'static str,
     file: &'static str,
     find: &'static str,
     replace: &'static str,
     stage: Stage,
-    /// A substring of what `hex` prints.
+    /// A substring of the refusal.
     expect: &'static str,
 }
 
@@ -48,9 +47,9 @@ const BATTERY: &str = "src/battery.rs";
 const SENSORS: &str = "src/sensors.rs";
 const TORCH: &str = "src/torch.rs";
 
-const BREAKAGES: &[Breakage] = &[
-    // DAC0 above 0 with PC1 low is refused first, as close as a breakage gets.
-    Breakage {
+const MISTAKES: &[Mistake] = &[
+    // DAC0 above 0 with PC1 low is refused first, as close as a mistake gets.
+    Mistake {
         name: "dac-live-before-pc1",
         file: HW,
         find: "    just_before();\n    out!(reg::VPORTC_OUT, 1 << ENABLE);\n",
@@ -59,7 +58,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "sets DAC0 to 1 with PC1 low",
     },
-    Breakage {
+    Mistake {
         name: "pc1-down-with-dac-live",
         file: HW,
         find: "pub fn output_off() {\n    write16(reg::DAC0_DATA, 0);\n",
@@ -67,7 +66,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "drops PC1 with DAC0 still at",
     },
-    Breakage {
+    Mistake {
         name: "dac-before-the-boost-starts",
         file: MAIN,
         find: "        if let Some(output) = output_changes.update(torch.output()) {\n            \
@@ -78,7 +77,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the stock firmware gives the boost converter",
     },
-    Breakage {
+    Mistake {
         name: "path-change-with-dac-live",
         file: HW,
         find: "        write16(reg::DAC0_DATA, 0);\n        spin(DAC_FALLS);\n",
@@ -87,7 +86,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "with PC1 high and DAC0 at",
     },
     // How the paths combine is unknown, so they wait for DAC0 coming down too.
-    Breakage {
+    Mistake {
         name: "paths-off-before-dac",
         file: HW,
         find: "pub fn output_off() {\n    write16(reg::DAC0_DATA, 0);\n",
@@ -96,7 +95,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "off with PC1 high and DAC0 at",
     },
-    Breakage {
+    Mistake {
         name: "dac-fall-not-waited",
         file: HW,
         find: "        spin(DAC_FALLS);\n",
@@ -104,7 +103,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "table 38-23",
     },
-    Breakage {
+    Mistake {
         name: "pc1-pull-up",
         file: HW,
         find: "    pin_ctrl(reg::PORTC_PIN0CTRL, ENABLE, 0);\n",
@@ -112,7 +111,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "gives PC1 a pull-up",
     },
-    Breakage {
+    Mistake {
         name: "switch-pull-up",
         file: HW,
         find: "    pin_ctrl(reg::PORTD_PIN0CTRL, SWITCH, regs::PORT_ISC_BOTHEDGES);\n",
@@ -121,7 +120,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "gives PD4 a pull-up",
     },
-    Breakage {
+    Mistake {
         name: "pd6-input-left-on",
         file: HW,
         find: "    pin_ctrl(reg::PORTD_PIN0CTRL, DAC, regs::PORT_ISC_INPUT_DISABLE);\n",
@@ -129,7 +128,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "PD6's input buffer still on",
     },
-    Breakage {
+    Mistake {
         name: "twi-line-driven",
         file: HW,
         find: "const PORTA_OUTPUTS: u8 = PATHS | 1 << BUTTON_LED | 1 << HELD_LOW;\n\
@@ -139,7 +138,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "PA2 and PA3 are the AW2016's TWI lines",
     },
     // PA1 goes to something unknown. This torch's stock build holds it at 0.
-    Breakage {
+    Mistake {
         name: "pa1-pull-up",
         file: HW,
         find: "    pin_ctrl(reg::PORTA_PIN0CTRL, HELD_LOW, 0);\n",
@@ -147,7 +146,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "gives PA1 a pull-up",
     },
-    Breakage {
+    Mistake {
         name: "pa1-driven-high",
         file: HW,
         find: "    out!(reg::VPORTA_OUT, 0);\n    out!(reg::VPORTA_DIR, PORTA_OUTPUTS);\n",
@@ -158,7 +157,7 @@ const BREAKAGES: &[Breakage] = &[
     },
     // Errata 2.2.3. A plain `write` to a VPORT doesn't show it, since LLVM
     // emits `out` itself for any constant address under 64.
-    Breakage {
+    Mistake {
         name: "sts-to-a-vport",
         file: HW,
         find: "                \"out {addr}, {value}\",\n",
@@ -167,7 +166,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "straight after a store to 64 or over",
     },
     // A store at 64 or over stands in for what could precede it with no `nop`.
-    Breakage {
+    Mistake {
         name: "sleep-mode-without-nop",
         file: HW,
         find: "            \"nop\",\n            \"sts {addr}, {value}\",\n",
@@ -176,7 +175,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "SLPCTRL.CTRLA straight after a store to 64 or over",
     },
     // The firmware never asks for it, so examples/guards.rs does.
-    Breakage {
+    Mistake {
         name: "power-down-with-the-light-on",
         file: HW,
         find: "    let mode = if rest && !lit() {\n",
@@ -184,7 +183,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with PC1 high",
     },
-    Breakage {
+    Mistake {
         name: "adc-on-in-power-down",
         file: HW,
         find: "        write(reg::ADC0_CTRLA, 0);\n        regs::SLPCTRL_SMODE_PDOWN\n",
@@ -192,7 +191,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with ADC0 still enabled",
     },
-    Breakage {
+    Mistake {
         name: "tcb0-left-running",
         file: HW,
         find: "        write(reg::TCB0_CTRLA, 0);\n        write(reg::TCB0_INTCTRL, 0);\n",
@@ -200,7 +199,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "powers down with TCB0 running",
     },
-    Breakage {
+    Mistake {
         name: "no-tick-deadline",
         file: HW,
         find: "                if periods == 0 {\n                    break None;\n",
@@ -210,7 +209,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "past the deadline",
     },
     // The datasheet doesn't say `cli` or turning every interrupt off is enough alone.
-    Breakage {
+    Mistake {
         name: "halt-without-cli",
         file: HW,
         find: "    unsafe { asm!(\"cli\", options(nostack)) };\n    set_output(Output::OFF);\n",
@@ -219,7 +218,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "stops for good with SREG.I still set",
     },
     // TCB0's interrupt still goes off, so the chip would take the `sleep`.
-    Breakage {
+    Mistake {
         name: "halt-leaves-the-light-on",
         file: HW,
         find: "    unsafe { asm!(\"cli\", options(nostack)) };\n    set_output(Output::OFF);\n",
@@ -228,7 +227,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "sleeps with TCB0 running and PC1 high",
     },
-    Breakage {
+    Mistake {
         name: "dir-before-out",
         file: HW,
         find: "    out!(reg::VPORTC_OUT, 0);\n    out!(reg::VPORTC_DIR, PORTC_OUTPUTS);\n}\n",
@@ -236,7 +235,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "starting with PC1 high: the first register it writes leaves PC1 set",
     },
-    Breakage {
+    Mistake {
         name: "watchdog-before-reset-flags",
         file: MAIN,
         find: "    let faults = Faults {\n        \
@@ -255,7 +254,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "start-up order: turns the watchdog on before clearing the reset flags",
     },
     // The first pass still finds it missing, so only that pass's delay is refused.
-    Breakage {
+    Mistake {
         name: "vddio2-ignored",
         file: MAIN,
         find: "        supply: !hw::vddio2_ok(),\n",
@@ -263,7 +262,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with VDDIO2 missing: tick",
     },
-    Breakage {
+    Mistake {
         name: "vddio2-not-watched",
         file: MAIN,
         find: "            hw::vddio2_ok(),\n",
@@ -271,7 +270,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
-    Breakage {
+    Mistake {
         name: "vddio2-loss-fades-out",
         file: LIMITS,
         find: "        let fault = self.fault && (cut || self.level <= 1);\n",
@@ -279,7 +278,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "began with MVIO.STATUS.VDDIO2S clear",
     },
-    Breakage {
+    Mistake {
         name: "watchdog-never-fed",
         file: MAIN,
         find: "            hw::feed_watchdog();\n",
@@ -287,7 +286,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "without wdr",
     },
-    Breakage {
+    Mistake {
         name: "watchdog-fed-every-tick",
         file: MAIN,
         find: "        if end.feed {\n",
@@ -295,7 +294,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "closed window",
     },
-    Breakage {
+    Mistake {
         name: "lit-watchdog-never-restored",
         file: MAIN,
         find: "            hw::set_watchdog(setting);\n",
@@ -305,7 +304,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "raises PC1 with WDT.CTRLA at 0x0b",
     },
     // The guard alone changes nothing, so this also lights while the switch is down.
-    Breakage {
+    Mistake {
         name: "unguarded-light-at-rest",
         file: TORCH,
         find: "            let asked = if lit_window {\n                \
@@ -315,7 +314,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the light only comes on with the lit window in force and a wdr since it was written",
     },
-    Breakage {
+    Mistake {
         name: "watchdog-write-not-waited-for",
         file: MAIN,
         find: "        if end.synced {\n            hw::watchdog_synced();\n        }\n",
@@ -324,7 +323,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "powers down with WDT.STATUS.SYNCBUSY still set",
     },
     // The pass that changes the PIT's period can sleep in power-down.
-    Breakage {
+    Mistake {
         name: "fed-as-the-pit-changes",
         file: MAIN,
         find: "        if end.feed {\n",
@@ -332,7 +331,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the library feeds the watchdog 0 times on this tick, but the firmware 1",
     },
-    Breakage {
+    Mistake {
         name: "pit-left-slow",
         file: MAIN,
         find: "        if let Some(pit) = end.pit {\n",
@@ -340,7 +339,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the library has the PIT Fast, but the firmware Slow",
     },
-    Breakage {
+    Mistake {
         name: "switch-wake-dropped",
         file: HW,
         find: "            if switch_wakes {\n",
@@ -348,7 +347,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "the firmware ran 0 passes on this tick, but the library 1",
     },
-    Breakage {
+    Mistake {
         name: "stale-switch-edge",
         file: HW,
         find: "    out!(reg::GPR_GPR2, 0);\n    let pressed = switch_pressed();\n",
@@ -356,7 +355,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "resting, with an edge on every slow tick: tick",
     },
-    Breakage {
+    Mistake {
         name: "high-byte-first",
         file: HW,
         find: "    write(addr, lo);\n    write(addr + 1, hi);\n",
@@ -364,7 +363,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "writes the high byte of DAC0.DATA without its low byte",
     },
-    Breakage {
+    Mistake {
         name: "unlock-apart-from-its-write",
         file: HW,
         find: "            \"out {ccp}, {key}\",\n",
@@ -372,7 +371,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Layout,
         expect: "isn't followed by `st Z`",
     },
-    Breakage {
+    Mistake {
         name: "sleep-apart-from-sei",
         file: HW,
         find: "asm!(\"sei\", \"sleep\", options(nostack))",
@@ -380,7 +379,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Layout,
         expect: "doesn't follow `sei`",
     },
-    Breakage {
+    Mistake {
         name: "handler-races-temp",
         file: HW,
         find: "pub extern \"avr-interrupt\" fn portd_port() {\n",
@@ -388,7 +387,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "share its TEMP byte",
     },
-    Breakage {
+    Mistake {
         name: "handler-clobbers-a-register",
         file: HW,
         find: "    write(reg::RTC_PITINTFLAGS, regs::RTC_PI);\n    out!(reg::GPR_GPR0, TICK);\n",
@@ -399,7 +398,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "the handler for RTC_PIT (vector 6): returns with r2",
     },
     // The check goes by symbol names, so see this one fire on every new nightly.
-    Breakage {
+    Mistake {
         name: "bounds-check",
         file: MAIN,
         find: "        torch.tick(\n            hw::take_switch(),\n            hw::adc_result(),\n",
@@ -410,7 +409,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "panic_bounds_check",
     },
     // Dividing a `u16` by ten turns into a 32-bit multiply.
-    Breakage {
+    Mistake {
         name: "wide-multiply",
         file: HW,
         find: "    Some(u16::from_le_bytes([lo, hi]))\n",
@@ -418,7 +417,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Build,
         expect: "undefined symbol: __mulsi3",
     },
-    Breakage {
+    Mistake {
         name: "twi-unbounded-wait",
         file: HW,
         find: "        match polls.checked_sub(1) {\n            Some(left) => *polls = left,\n            \
@@ -427,7 +426,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with SCL held low: tick",
     },
-    Breakage {
+    Mistake {
         name: "aux-lit-while-lit",
         file: MAIN,
         find: "aux.step(torch.aux())",
@@ -435,7 +434,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "raises PC1 with the aux lit",
     },
-    Breakage {
+    Mistake {
         name: "aux-off-not-standby",
         file: AW2016,
         find: "        data: &[CHGDIS],\n",
@@ -443,7 +442,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "isn't in standby",
     },
-    Breakage {
+    Mistake {
         name: "aux-retried-on-the-next-tick",
         file: MAIN,
         find: "            aux.failed();\n",
@@ -452,7 +451,7 @@ const BREAKAGES: &[Breakage] = &[
         expect: "tries the AW2016 again",
     },
     // Four readings in a row can't put the light out within 12 ticks.
-    Breakage {
+    Mistake {
         name: "collapse-waits",
         file: BATTERY,
         find: "pub const COLLAPSE_READINGS: u8 = 2;\n",
@@ -460,7 +459,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with a collapsing cell: the cell falls on tick",
     },
-    Breakage {
+    Mistake {
         name: "no-quick-readings",
         file: SENSORS,
         find: "        if channel == Channel::Voltage && step >= READING_STEP && lit {\n",
@@ -468,7 +467,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "A cell that collapses: expected Off",
     },
-    Breakage {
+    Mistake {
         name: "ground-ignored",
         file: SENSORS,
         find: "        if raw <= GROUND_MAX {\n",
@@ -476,7 +475,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "with the ADC stuck on one reading",
     },
-    Breakage {
+    Mistake {
         name: "ground-reads-the-cell",
         file: HW,
         find: "        Channel::Ground => (regs::VREF_REFSEL_1V024, regs::ADC_MUXPOS_GND),\n",
@@ -484,7 +483,7 @@ const BREAKAGES: &[Breakage] = &[
         stage: Stage::Simulator,
         expect: "but the library says",
     },
-    Breakage {
+    Mistake {
         name: "aux-retried-after-a-nack",
         file: HW,
         find: "        if !twi_transfer(transfer, &mut polls) {\n",
@@ -494,73 +493,39 @@ const BREAKAGES: &[Breakage] = &[
     },
 ];
 
-pub fn run(root: &Path, names: &[&str]) -> Result<(), String> {
-    let mut chosen = choose(names)?;
-    chosen.sort_by_key(|b| in_library(b.file));
-    let copy = Scratch::of(root)?;
-    let started = Instant::now();
+type Check = fn(&Path) -> Result<(), String>;
 
-    eprintln!("building an unbroken copy in {}", copy.dir.path().display());
-    let (passed, output) = copy.hex()?;
-    if !passed {
-        return Err(format!(
-            "the copy doesn't pass `cargo xtask hex` with nothing broken, so no refusal would \
-             mean anything:\n{output}"
-        ));
-    }
-    eprintln!("it passes, in {} s", started.elapsed().as_secs());
-
-    let mut failed = Vec::new();
-    for breakage in &chosen {
-        let began = Instant::now();
-        match copy.refuses(root, breakage) {
-            Ok(verdict) => eprintln!(
-                "refused {} in {:.1} s: {verdict}",
-                breakage.name,
-                began.elapsed().as_secs_f32()
-            ),
-            Err(e) => {
-                eprintln!("NOT REFUSED {}: {e}", breakage.name);
-                failed.push(breakage.name);
-            }
-        }
-    }
-    if !failed.is_empty() {
-        return Err(format!(
-            "{} of {} breakages got past `cargo xtask hex`, or were refused for some other \
-             reason: {}",
-            failed.len(),
-            chosen.len(),
-            failed.join(", ")
-        ));
-    }
-    println!(
-        "{} breakages, each refused for its own reason, in {} s",
-        chosen.len(),
-        started.elapsed().as_secs()
-    );
-    Ok(())
+fn hex_checked(copy: &Path) -> Result<(), String> {
+    checked(copy).map(drop)
 }
 
-fn choose(names: &[&str]) -> Result<Vec<&'static Breakage>, String> {
-    if let Some(unknown) = names
-        .iter()
-        .find(|name| BREAKAGES.iter().all(|b| b.name != **name))
-    {
-        let known: Vec<&str> = BREAKAGES.iter().map(|b| b.name).collect();
-        return Err(format!(
-            "no breakage called `{unknown}`; there's {}",
-            known.join(", ")
-        ));
+fn own_hex(copy: &Path) -> Result<(), String> {
+    let hex = Command::new(cargo())
+        .current_dir(copy)
+        .args(["xtask", "hex"])
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .map_err(|e| e.to_string())?;
+    if hex.status.success() {
+        return Ok(());
     }
-    Ok(BREAKAGES
-        .iter()
-        .filter(|b| names.is_empty() || names.contains(&b.name))
-        .collect())
+    Err(String::from_utf8_lossy(&hex.stderr).into_owned())
 }
 
+/// The simulator is built from the library, so a mistake there only shows in
+/// a simulator built from the copy.
 fn in_library(file: &str) -> bool {
     file != MAIN && file != HW
+}
+
+fn mistakes() -> Vec<(&'static Mistake, Check)> {
+    MISTAKES
+        .iter()
+        .map(|mistake| match in_library(mistake.file) {
+            true => (mistake, own_hex as Check),
+            false => (mistake, hex_checked as Check),
+        })
+        .collect()
 }
 
 fn substitute(source: &str, find: &str, replace: &str) -> Result<String, String> {
@@ -572,94 +537,6 @@ fn substitute(source: &str, find: &str, replace: &str) -> Result<String, String>
         n => Err(format!(
             "the text to break is there {n} times, not once:\n{find}"
         )),
-    }
-}
-
-fn verdict(output: &str) -> Option<(Stage, &str)> {
-    let line = output
-        .lines()
-        .rev()
-        .find_map(|line| line.strip_prefix("error: "))?;
-    let stage = if line.contains(".elf: simulator: ") {
-        Stage::Simulator
-    } else if line.contains(".elf: ") {
-        Stage::Layout
-    } else {
-        Stage::Build
-    };
-    Some((stage, line))
-}
-
-fn refused<'a>(output: &'a str, stage: Stage, expect: &str) -> Result<&'a str, String> {
-    let Some((stopped, _)) = verdict(output) else {
-        return Err(format!("it failed without saying why:\n{output}"));
-    };
-    if stopped != stage {
-        return Err(format!(
-            "it stopped at {stopped:?}, not {stage:?}:\n{output}"
-        ));
-    }
-    let Some(line) = output.lines().find(|line| line.contains(expect)) else {
-        return Err(format!(
-            "it was refused, but not with `{expect}`:\n{output}"
-        ));
-    };
-    let said = line.split_once(".elf: ").map_or(line, |(_, said)| said);
-    Ok(said.trim())
-}
-
-struct Scratch {
-    dir: TempDir,
-}
-
-impl Scratch {
-    fn of(root: &Path) -> Result<Self, String> {
-        // Made before anything's copied, so a failed copy is cleared up too.
-        let copy = Self {
-            dir: TempDir::new("breakages")?,
-        };
-        for entry in COPIED {
-            copy_tree(&root.join(entry), &copy.dir.path().join(entry))?;
-        }
-        Ok(copy)
-    }
-
-    fn hex(&self) -> Result<(bool, String), String> {
-        let cargo = cargo();
-        let output = Command::new(&cargo)
-            .current_dir(self.dir.path())
-            .args(["xtask", "hex"])
-            // The copy's xtask looks in the copy's own `target`.
-            .env_remove("CARGO_TARGET_DIR")
-            .output()
-            .map_err(|e| format!("couldn't run {cargo}: {e}"))?;
-        let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
-        text.push_str(&String::from_utf8_lossy(&output.stderr));
-        Ok((output.status.success(), text))
-    }
-
-    fn refuses(&self, root: &Path, breakage: &Breakage) -> Result<String, String> {
-        // Written afresh, not copied, and only if it differs. A copy can keep
-        // the old modification time (on macOS it does), so cargo won't rebuild.
-        for other in BREAKAGES {
-            let file = Path::new(other.file);
-            let original = fs::read(root.join(file)).map_err(at(file))?;
-            let copy = self.dir.path().join(file);
-            if fs::read(&copy).map_err(at(&copy))? != original {
-                fs::write(&copy, original).map_err(at(&copy))?;
-            }
-        }
-        let path = self.dir.path().join(breakage.file);
-        let source = fs::read_to_string(&path).map_err(at(&path))?;
-        let broken = substitute(&source, breakage.find, breakage.replace)
-            .map_err(|e| format!("{}: {e}", breakage.file))?;
-        fs::write(&path, broken).map_err(at(&path))?;
-
-        let (passed, output) = self.hex()?;
-        if passed {
-            return Err("`cargo xtask hex` passed it".into());
-        }
-        refused(&output, breakage.stage, breakage.expect).map(str::to_string)
     }
 }
 
@@ -681,144 +558,138 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::root;
+fn stage(refusal: &str) -> Stage {
+    if refusal.contains(".elf: simulator: ") {
+        Stage::Simulator
+    } else if refusal.contains(".elf: ") {
+        Stage::Layout
+    } else {
+        Stage::Build
+    }
+}
 
-    #[test]
-    fn a_substitution_wants_its_text_there_exactly_once() {
-        assert_eq!(substitute("a b c", "b", "x").unwrap(), "a x c");
-        assert_eq!(substitute("a b c", " b", "").unwrap(), "a c");
-        let err = substitute("a b c", "d", "x").unwrap_err();
-        assert!(err.contains("there 0 times"), "{err}");
-        let err = substitute("a b b", "b", "x").unwrap_err();
-        assert!(err.contains("there 2 times"), "{err}");
+/// Cargo's own refusal is kept, since a link error is one of the reasons.
+fn refused(copy: &Path, check: Check) -> Result<(), (Stage, String)> {
+    let built = firmware_build(copy)
+        // The copy builds into its own `target`, where `check` looks.
+        .env_remove("CARGO_TARGET_DIR")
+        .output()
+        .map_err(|e| (Stage::Build, e.to_string()))?;
+    if !built.status.success() {
+        let stderr = String::from_utf8_lossy(&built.stderr).into_owned();
+        return Err((Stage::Build, stderr));
+    }
+    check(copy).map_err(|e| (stage(&e), e))
+}
+
+#[test]
+fn a_substitution_wants_its_text_there_exactly_once_and_has_to_change_it() {
+    assert_eq!(substitute("a b c", "b", "x").unwrap(), "a x c");
+    assert_eq!(substitute("a b c", " b", "").unwrap(), "a c");
+    for (source, find, replace, why) in [
+        ("a b c", "d", "x", "there 0 times"),
+        ("a b b", "b", "x", "there 2 times"),
+        ("a b c", "b", "b", "changes nothing"),
+        ("a b c", "", "x", "changes nothing"),
+    ] {
+        let err = substitute(source, find, replace).unwrap_err();
+        assert!(err.contains(why), "{err}");
+    }
+}
+
+#[test]
+fn every_mistake_has_its_own_name_and_finds_its_text_exactly_once() {
+    let mistakes = mistakes();
+    for (i, (mistake, _)) in mistakes.iter().enumerate() {
+        let twice = mistakes[..i].iter().any(|(m, _)| m.name == mistake.name);
+        assert!(!twice, "two called {}", mistake.name);
+        assert!(!mistake.expect.is_empty(), "{}", mistake.name);
+        let copied = COPIED
+            .iter()
+            .any(|entry| Path::new(mistake.file).starts_with(entry));
+        assert!(copied, "{} isn't copied", mistake.file);
+        let path = root().join(mistake.file);
+        let source = fs::read_to_string(&path).unwrap();
+        substitute(&source, mistake.find, mistake.replace)
+            .unwrap_or_else(|e| panic!("{}: {}: {e}", mistake.name, mistake.file));
+    }
+}
+
+#[test]
+fn every_copied_entry_is_there_to_copy() {
+    for entry in COPIED {
+        assert!(root().join(entry).exists(), "{entry}");
+    }
+}
+
+#[test]
+fn a_refusal_by_the_checks_is_the_simulators_or_the_layouts() {
+    let simulator = "/tmp/copy/target/avr-none/release/kr1k.elf: simulator: start-up order: \
+                     0x0a1c: gives PC1 a pull-up";
+    assert_eq!(stage(simulator), Stage::Simulator);
+    let guards = "/tmp/copy/target/avr-none/release/examples/guards.elf: simulator: 0x01fa: \
+                  powers down with PC1 high";
+    assert_eq!(stage(guards), Stage::Simulator);
+    let layout = "/tmp/copy/target/avr-none/release/kr1k.elf: the CCP unlock at 0x0010 isn't \
+                  followed by `st Z`";
+    assert_eq!(stage(layout), Stage::Layout);
+}
+
+#[test]
+fn a_copy_leaves_out_target_and_git_and_goes_when_its_dropped() {
+    let from = TempDir::new("mistakes-test").unwrap();
+    let from = from.path();
+    for dir in ["src/avr", "target", ".git", "src/target"] {
+        fs::create_dir_all(from.join(dir)).unwrap();
+        fs::write(from.join(dir).join("hw.rs"), "contents").unwrap();
+    }
+    let copy = TempDir::new("mistakes-test-copy").unwrap();
+    let to = copy.path().to_path_buf();
+    copy_tree(from, &to).unwrap();
+    copy_tree(&from.join("src/avr/hw.rs"), &to.join("docs/hw.rs")).unwrap();
+    let copied = fs::read_to_string(to.join("src/avr/hw.rs")).unwrap();
+    assert_eq!(copied, "contents");
+    assert!(to.join("docs/hw.rs").exists());
+    for gone in ["target", ".git", "src/target"] {
+        assert!(!to.join(gone).exists(), "{gone}");
+    }
+    drop(copy);
+    assert!(!to.exists());
+}
+
+#[test]
+#[ignore = "builds the firmware once a mistake, which takes about a minute"]
+fn the_firmware_is_refused_with_any_one_mistake_in_it() {
+    let dir = TempDir::new("mistakes").unwrap();
+    let copy = dir.path();
+    for entry in COPIED {
+        copy_tree(&root().join(entry), &copy.join(entry)).unwrap();
+    }
+    if let Err((_, e)) = refused(copy, hex_checked) {
+        panic!("a copy with nothing broken is refused too, so no refusal means anything:\n{e}");
     }
 
-    #[test]
-    fn a_substitution_has_to_change_something() {
-        assert!(substitute("a b c", "b", "b").is_err());
-        assert!(substitute("a b c", "", "x").is_err());
-    }
-
-    #[test]
-    fn every_breakage_finds_its_text_exactly_once_in_the_source_as_it_is() {
-        for breakage in BREAKAGES {
-            let path = root().join(breakage.file);
-            let source = fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{}: {}: {e}", breakage.name, breakage.file));
-            let broken = substitute(&source, breakage.find, breakage.replace)
-                .unwrap_or_else(|e| panic!("{}: {}: {e}", breakage.name, breakage.file));
-            assert_ne!(broken, source, "{}", breakage.name);
-            assert!(!breakage.expect.is_empty(), "{}", breakage.name);
+    let mut missed = Vec::new();
+    for (mistake, check) in mistakes() {
+        let path = copy.join(mistake.file);
+        let source = fs::read_to_string(&path).unwrap();
+        let broken = substitute(&source, mistake.find, mistake.replace).unwrap();
+        fs::write(&path, broken).unwrap();
+        let refusal = refused(copy, check);
+        // Written rather than copied back, since a copy can keep the old
+        // modified time, and cargo would then keep the broken build.
+        fs::write(&path, source).unwrap();
+        let (name, stage, expect) = (mistake.name, mistake.stage, mistake.expect);
+        match refusal {
+            Err((stopped, e)) if stopped == stage && e.contains(expect) => {}
+            Err((stopped, e)) if stopped != stage => {
+                missed.push(format!(
+                    "{name}: refused at {stopped:?}, not {stage:?}:\n{e}"
+                ));
+            }
+            Err((_, e)) => missed.push(format!("{name}: refused, but not with `{expect}`:\n{e}")),
+            Ok(()) => missed.push(format!("{name}: nothing refused it")),
         }
     }
-
-    #[test]
-    fn every_breakage_has_its_own_name_and_breaks_a_file_thats_copied() {
-        for (i, breakage) in BREAKAGES.iter().enumerate() {
-            let twice = BREAKAGES[..i].iter().any(|b| b.name == breakage.name);
-            assert!(!twice, "two called {}", breakage.name);
-            let copied = COPIED
-                .iter()
-                .any(|entry| Path::new(breakage.file).starts_with(entry));
-            assert!(copied, "{} isn't copied", breakage.file);
-        }
-    }
-
-    #[test]
-    fn every_copied_entry_is_there_to_copy() {
-        for entry in COPIED {
-            assert!(root().join(entry).exists(), "{entry}");
-        }
-    }
-
-    #[test]
-    fn breakages_are_chosen_by_name_and_an_unknown_name_is_refused() {
-        assert_eq!(choose(&[]).unwrap().len(), BREAKAGES.len());
-        let chosen = choose(&["wide-multiply", "pc1-pull-up"]).unwrap();
-        let names: Vec<&str> = chosen.iter().map(|b| b.name).collect();
-        assert_eq!(names, ["pc1-pull-up", "wide-multiply"]);
-        let err = choose(&["pc1-pull-up", "pc2-pull-up"]).err().unwrap();
-        assert!(err.contains("no breakage called `pc2-pull-up`"), "{err}");
-    }
-
-    const SIMULATOR: &str = "\
-   Compiling kr1k v0.0.0 (/tmp/copy)
-    Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
-error: /tmp/copy/target/avr-none/release/kr1k.elf: simulator: startup: 0x0a1c: gives PC1 a pull-up
-";
-    const LAYOUT: &str = "\
-    Finished `release` profile [optimized + debuginfo] target(s) in 4.05s
-error: /tmp/copy/target/avr-none/release/kr1k.elf: the CCP unlock at 0x0010 isn't followed by `st Z`
-";
-    const LINKER: &str = "\
-error: linking with `rust-lld` failed: exit status: 1
-  = note: rust-lld: error: undefined symbol: __mulsi3
-error: could not compile `kr1k` (bin \"kr1k\") due to 1 previous error
-error: cargo failed (exit status: 101)
-";
-    const COMPILER: &str = "\
-error[E0425]: cannot find value `x` in this scope
-error: could not compile `kr1k` (bin \"kr1k\") due to 1 previous error
-error: cargo failed (exit status: 101)
-";
-
-    #[test]
-    fn the_verdict_is_xtasks_last_error_and_says_how_far_hex_got() {
-        let stage = |output| verdict(output).map(|(stage, _)| stage);
-        assert_eq!(stage(SIMULATOR), Some(Stage::Simulator));
-        assert_eq!(stage(LAYOUT), Some(Stage::Layout));
-        assert_eq!(stage(LINKER), Some(Stage::Build));
-        assert_eq!(stage(COMPILER), Some(Stage::Build));
-        assert_eq!(stage("wrote target/noctigon-kr1k.hex\n"), None);
-        let (_, line) = verdict(LINKER).unwrap();
-        assert_eq!(line, "cargo failed (exit status: 101)");
-    }
-
-    #[test]
-    fn a_refusal_counts_only_at_the_stage_and_with_the_text_expected() {
-        let line = refused(SIMULATOR, Stage::Simulator, "gives PC1 a pull-up").unwrap();
-        assert_eq!(line, "simulator: startup: 0x0a1c: gives PC1 a pull-up");
-        let line = refused(LAYOUT, Stage::Layout, "isn't followed by `st Z`").unwrap();
-        assert_eq!(line, "the CCP unlock at 0x0010 isn't followed by `st Z`");
-        let line = refused(LINKER, Stage::Build, "undefined symbol: __mulsi3").unwrap();
-        assert_eq!(line, "= note: rust-lld: error: undefined symbol: __mulsi3");
-
-        let err = refused(SIMULATOR, Stage::Simulator, "without wdr").unwrap_err();
-        assert!(err.contains("not with `without wdr`"), "{err}");
-        let err = refused(COMPILER, Stage::Build, "undefined symbol: __mulsi3").unwrap_err();
-        assert!(err.contains("not with"), "{err}");
-        let err = refused(COMPILER, Stage::Simulator, "x").unwrap_err();
-        assert!(err.contains("stopped at Build, not Simulator"), "{err}");
-        let err = refused(LAYOUT, Stage::Simulator, "st Z").unwrap_err();
-        assert!(err.contains("stopped at Layout, not Simulator"), "{err}");
-        let err = refused("", Stage::Build, "x").unwrap_err();
-        assert!(err.contains("without saying why"), "{err}");
-    }
-
-    #[test]
-    fn a_copy_leaves_out_target_and_git_and_goes_when_its_dropped() {
-        let from = TempDir::new("breakages-test").unwrap();
-        let from = from.path();
-        for dir in ["src/avr", "target", ".git", "src/target"] {
-            fs::create_dir_all(from.join(dir)).unwrap();
-            fs::write(from.join(dir).join("hw.rs"), "contents").unwrap();
-        }
-        let copy = Scratch {
-            dir: TempDir::new("breakages-test-copy").unwrap(),
-        };
-        let to = copy.dir.path().to_path_buf();
-        copy_tree(from, &to).unwrap();
-        copy_tree(&from.join("src/avr/hw.rs"), &to.join("docs/hw.rs")).unwrap();
-        let copied = fs::read_to_string(to.join("src/avr/hw.rs")).unwrap();
-        assert_eq!(copied, "contents");
-        assert!(to.join("docs/hw.rs").exists());
-        for gone in ["target", ".git", "src/target"] {
-            assert!(!to.join(gone).exists(), "{gone}");
-        }
-        drop(copy);
-        assert!(!to.exists());
-    }
+    assert!(missed.is_empty(), "{}", missed.join("\n\n"));
 }

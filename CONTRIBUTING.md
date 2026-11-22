@@ -7,18 +7,14 @@ CI runs these on every pull request, so run them before you push.
 ```sh
 cargo fmt --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo test --workspace --locked -- --include-ignored
 cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings
 cargo xtask hex
 ```
 
-The second clippy is the only place `src/avr/hw.rs` and `src/avr/rt.rs` get linted. `cargo xtask hex` builds the firmware, checks the linked image (`xtask/src/layout.rs`), runs it on a simulated chip (`xtask/src/sim.rs`) and prints flash and RAM use.
+The second clippy is the only place `src/avr/hw.rs` and `src/avr/rt.rs` get linted. `cargo xtask hex` builds the firmware, checks the linked image (`xtask/src/layout.rs`), runs it on a simulated chip (`xtask/src/sim.rs`) and prints flash and RAM use. The files in `examples/` are never flashed. `link.rs` and `guards.rs` exist so xtask can check `link.x` and run `hw.rs`'s guards. `panics.rs` indexes out of bounds and `multiplies.rs` divides a `u16` by ten, and xtask's tests build both for the chip, failing unless the panic check refuses the first and the linker refuses the second.
 
-```sh
-cargo xtask breakages
-```
-
-This one takes about a minute, so CI doesn't run it. It checks that `hex` refuses copies of the firmware broken on purpose (`xtask/src/breakages.rs`). Run it after touching `xtask/src/sim.rs`, `xtask/src/layout.rs`, `src/avr/hw.rs` or `src/avr/rt.rs`, and when bumping the nightly.
+One test is ignored, since it takes about a minute, and `--include-ignored` runs it. It breaks a copy of the firmware in one way at a time (`xtask/src/mistakes.rs`) and wants the checks `hex` runs to refuse each for its own reason, at the stage it names. A mistake in the library is tried with the copy's own `cargo xtask hex`, since the simulator is built from the library. Run it after touching `xtask/src/sim.rs`, `xtask/src/layout.rs`, `src/avr/hw.rs`, `src/avr/rt.rs` or `src/main.rs`, and only add a mistake once you've seen it refused for the reason you meant.
 
 The simulator finds mistakes and proves nothing. It's one reading of the datasheet, run against code written from the same reading. It doesn't model chip resets, anything analogue or real time, so a firmware change still wants reading against the datasheet before it's flashed.
 
@@ -48,4 +44,4 @@ Single-line [Conventional Commits](https://www.conventionalcommits.org), such as
 
 ## Bumping the nightly
 
-AVR is a tier 3 target and nightlies do break it. Change `rust-toolchain.toml`, run every check above including the breakages, and compare `cargo xtask hex` before and after.
+AVR is a tier 3 target and nightlies do break it. Change `rust-toolchain.toml`, run every check above, and compare `cargo xtask hex` before and after. `cargo test` fails if the panic check no longer knows the new nightly's panic symbols, or if a wide multiply has started to link.

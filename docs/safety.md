@@ -134,7 +134,7 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Cover.** `hw::halt` is the panic handler, and `cargo xtask hex` refuses an image with panic machinery linked in (`xtask/src/layout.rs`).
 
-**Unproven.** Simulator at most. The check goes by symbol names, so `cargo xtask breakages` re-proves it after every nightly bump.
+**Unproven.** Simulator at most. The check goes by symbol names, so `cargo test` builds `examples/panics.rs` for the chip and fails if the check stops seeing its panic.
 
 ### H17. A stuck switch
 

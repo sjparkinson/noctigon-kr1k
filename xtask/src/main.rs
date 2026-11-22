@@ -4,13 +4,14 @@
 #[cfg(test)]
 mod atdf;
 mod avr;
-mod breakages;
 mod crc;
 mod elf;
 mod ihex;
 mod layout;
 #[cfg(test)]
 mod lints;
+#[cfg(test)]
+mod mistakes;
 mod serial;
 mod sim;
 mod simulate;
@@ -37,8 +38,6 @@ commands:
   hex                     build the firmware, run it on the simulator, write
                           target/noctigon-kr1k.hex and print flash, RAM,
                           stack, loop and handler use
-  breakages [name...]     check hex refuses copies of the firmware, each broken on
-                          purpose in one way, and leave the checkout alone
   ping <port>           check the programmer can see the chip, writing nothing,
                           though expect it to reset as UPDI turns off
   backup <port> <dir>     save the chip's flash, EEPROM, fuses, lock bits, user
@@ -65,7 +64,6 @@ fn main() -> ExitCode {
 
     let result = match args.as_slice() {
         ["hex"] => hex(),
-        ["breakages", names @ ..] => breakages::run(&root(), names),
         ["ping", port] => ping(port),
         ["backup", port, dir] => backup(port, Path::new(dir)),
         ["flash", port] => build()
@@ -105,7 +103,13 @@ fn cargo() -> String {
 }
 
 fn build() -> Result<(elf::Elf, sim::Report), String> {
-    run(Command::new(cargo()).current_dir(root()).args([
+    run(&mut firmware_build(&root()))?;
+    checked(&root())
+}
+
+fn firmware_build(root: &Path) -> Command {
+    let mut build = Command::new(cargo());
+    build.current_dir(root).args([
         "build",
         "--package",
         "kr1k",
@@ -118,19 +122,23 @@ fn build() -> Result<(elf::Elf, sim::Report), String> {
         "--target",
         "avr-none",
         "-Zbuild-std=core",
-    ]))?;
-    let path = root().join(ELF);
+    ]);
+    build
+}
+
+fn checked(root: &Path) -> Result<(elf::Elf, sim::Report), String> {
+    let path = root.join(ELF);
     let elf = load(&path)?;
     layout::check(&elf).map_err(at(&path))?;
     let report = sim::check(&elf).map_err(|e| format!("{}: simulator: {e}", path.display()))?;
 
-    let probe = root().join(PROBE);
+    let probe = root.join(PROBE);
     let probe_elf = load(&probe)?;
     probe_sections(&probe_elf).map_err(at(&probe))?;
     layout::memory(&probe_elf).map_err(at(&probe))?;
     sim::probe(&probe_elf).map_err(|e| format!("{}: simulator: {e}", probe.display()))?;
 
-    let guards = root().join(GUARDS);
+    let guards = root.join(GUARDS);
     let guards_elf = load(&guards)?;
     layout::check(&guards_elf).map_err(at(&guards))?;
     sim::guards(&guards_elf).map_err(|e| format!("{}: simulator: {e}", guards.display()))?;
@@ -455,8 +463,10 @@ fn at<E: Display>(path: &Path) -> impl Fn(E) -> String + '_ {
     move |e| format!("{}: {e}", path.display())
 }
 
+#[cfg(test)]
 struct TempDir(PathBuf);
 
+#[cfg(test)]
 impl TempDir {
     fn new(name: &str) -> Result<Self, String> {
         let dir = env::temp_dir().join(format!("kr1k-{name}-{}", std::process::id()));
@@ -472,6 +482,7 @@ impl TempDir {
     }
 }
 
+#[cfg(test)]
 impl Drop for TempDir {
     fn drop(&mut self) {
         _ = fs::remove_dir_all(&self.0);
@@ -494,14 +505,52 @@ fn run(command: &mut Command) -> Result<(), String> {
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::updi::tests::fake::Dd20;
     use super::updi::tests::images;
     use super::updi::{Programmer, SerialNumber};
     use super::{
-        TempDir, backup_from, commas, crc, ihex, program, read_hex, restore_onto, row, signed,
-        stamp, this_boards_hex, write,
+        TempDir, backup_from, cargo, commas, crc, ihex, layout, load, program, read_hex,
+        restore_onto, root, row, signed, stamp, this_boards_hex, write,
     };
+
+    /// Built for the chip the way `firmware_build` builds the firmware.
+    fn build_example(name: &str) -> (bool, String) {
+        let output = Command::new(cargo())
+            .current_dir(root())
+            .args([
+                "build",
+                "--package",
+                "kr1k",
+                "--example",
+                name,
+                "--release",
+                "--target",
+                "avr-none",
+                "-Zbuild-std=core",
+            ])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        (output.status.success(), stderr)
+    }
+
+    #[test]
+    fn a_build_that_indexes_out_of_bounds_is_one_the_panic_check_refuses() {
+        let (built, stderr) = build_example("panics");
+        assert!(built, "{stderr}");
+        let elf = load(&root().join("target/avr-none/release/examples/panics.elf")).unwrap();
+        let err = layout::no_panics(elf.symbols()).unwrap_err();
+        assert!(err.contains("panic_bounds_check"), "{err}");
+    }
+
+    #[test]
+    fn a_u16_divided_by_ten_fails_to_link_for_want_of_mulsi3() {
+        let (built, stderr) = build_example("multiplies");
+        assert!(!built, "a wide multiply links now");
+        assert!(stderr.contains("undefined symbol: __mulsi3"), "{stderr}");
+    }
 
     struct Scratch(TempDir);
 

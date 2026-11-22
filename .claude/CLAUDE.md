@@ -10,12 +10,12 @@ cargo test --workspace --locked -q                         # host tests, run the
 cargo clippy --workspace --all-targets --locked -- -D warnings   # host lints
 cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings   # firmware lints: the only place hw.rs and rt.rs get linted
 cargo xtask hex                                            # firmware ELF and hex, plus flash/RAM use, after any firmware change
-cargo xtask breakages                                      # about a minute: hex refuses each deliberately broken copy, after touching sim.rs, layout.rs or a breakage's lines
+cargo test --package xtask --locked -q -- --ignored        # about a minute: the checks refuse each deliberately broken copy, after touching sim.rs, layout.rs, hw.rs, rt.rs, main.rs or a mistake's lines
 ```
 
 CONTRIBUTING.md lists every check CI runs. Plain `cargo test` only tests the root package, so always pass `--workspace`.
 
-The firmware clippy and the xtask commands rebuild `core` with `-Zbuild-std`. The first run on a machine fetches crates from crates.io and writes to `~/.cargo` and `~/.rustup`, which the sandbox may block. If it does, rerun outside the sandbox; nothing else in this repo needs that.
+The firmware clippy, the xtask commands and xtask's tests rebuild `core` with `-Zbuild-std`, the tests because they build `examples/panics.rs` and `examples/multiplies.rs` for the chip. The first run on a machine fetches crates from crates.io and writes to `~/.cargo` and `~/.rustup`, which the sandbox may block. If it does, rerun outside the sandbox; nothing else in this repo needs that.
 
 ## Agents
 
