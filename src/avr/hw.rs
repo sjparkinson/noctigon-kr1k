@@ -262,8 +262,6 @@ fn prepare_sleep(rest: bool) {
 
 /// `None` means the light's on and no tick came in the deadline. With PC1 low
 /// there's none on purpose, so a dead 32 kHz oscillator leaves the driver off.
-/// `sei` and `sleep` stay back to back, since the instruction after `sei` runs
-/// before a pending interrupt, so a late one still wakes the `sleep`.
 pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
     prepare_sleep(rest);
     let mut periods = TICK_DEADLINE_PERIODS;
