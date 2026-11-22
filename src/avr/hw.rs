@@ -318,19 +318,16 @@ pub fn halt() -> ! {
     }
 }
 
-#[unsafe(no_mangle)]
 pub extern "avr-interrupt" fn rtc_pit() {
     write(reg::RTC_PITINTFLAGS, regs::RTC_PI);
     out!(reg::GPR_GPR0, TICK);
 }
 
-#[unsafe(no_mangle)]
 pub extern "avr-interrupt" fn tcb0_int() {
     write(reg::TCB0_INTFLAGS, regs::TCB_CAPT);
     out!(reg::GPR_GPR1, PERIOD);
 }
 
-#[unsafe(no_mangle)]
 pub extern "avr-interrupt" fn portd_port() {
     out!(reg::VPORTD_INTFLAGS, 1 << SWITCH);
     out!(reg::GPR_GPR2, SWITCHED);
