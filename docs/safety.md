@@ -68,9 +68,9 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** A press on the switch under pressure.
 
-**Cover.** 3C locks and unlocks. In lockout `ui::Ui` never lights, and four presses are a 4C, which does nothing.
+**Cover.** 3C with the light on puts it out at the first click and locks it, and 3C in lockout unlocks it to off. In lockout `ui::Ui` never lights, and four presses are a 4C, which does nothing.
 
-**Unproven.** Seen, for locking and unlocking. Unlocked, a click lights it, and so does a press held past `button::HOLD_TICKS`, which lights `ui::FLOOR`. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
+**Unproven.** Unlocking has been seen on this torch, and locking with the light on hasn't. A torch that's off only locks by lighting it first. Unlocked, a click lights it as it's let go, and so does a press held past `button::HOLD_TICKS`, which lights `ui::FLOOR`. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
 
 ### H9. Corrupt or half-written flash
 
