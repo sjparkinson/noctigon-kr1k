@@ -2,18 +2,9 @@
 
 Firmware for the Noctigon KR1K torch with the Lume X1-C boost driver (AVR32DD20, DAC into a current amplifier, three power paths, AW2016 aux), in Rust, with zero crate dependencies, and deliberately small. Its history starts as firmware for the Wurkkos TS26 (ATtiny1616). Read README.md for what it is, CONTRIBUTING.md for the checks and rules, and docs/ for the hardware, the hazard log and the toolchain. The full firmware runs on the torch, and docs/hardware.md lists what's been seen there and what hasn't been measured. The stock firmware and fuses are backed up in `backup/stock/` and `backup/torch/` (gitignored).
 
-## Commands
+## Checks
 
-```sh
-cargo fmt --check                                          # formatting, as CI runs it
-cargo test --workspace --locked -q                         # host tests, run these constantly
-cargo clippy --workspace --all-targets --locked -- -D warnings   # host lints
-cargo clippy --package kr1k --lib --bins --examples --release --target avr-none -Zbuild-std=core -- -D warnings   # firmware lints: the only place hw.rs and rt.rs get linted
-cargo xtask hex                                            # firmware ELF and hex, plus flash/RAM use, after any firmware change
-cargo test --package xtask --locked -q -- --ignored        # about twenty seconds: the checks refuse each deliberately broken copy, after touching sim.rs, layout.rs, hw.rs, rt.rs, main.rs or a mistake's lines
-```
-
-CONTRIBUTING.md lists every check CI runs. Plain `cargo test` only tests the root package, so always pass `--workspace`.
+CONTRIBUTING.md has the commands, every one CI runs, and it's the only copy. Plain `cargo test` only tests the root package, so always pass `--workspace`.
 
 The firmware clippy, the xtask commands and xtask's tests rebuild `core` with `-Zbuild-std`, the tests because they build `examples/panics.rs` and `examples/multiplies.rs` for the chip. The first run on a machine fetches crates from crates.io and writes to `~/.cargo` and `~/.rustup`, which the sandbox may block. If it does, rerun outside the sandbox; nothing else in this repo needs that.
 
