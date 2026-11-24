@@ -31,12 +31,14 @@ pub struct Step {
     pub unloaded: Option<u16>,
 }
 
+/// `repr(C)` holds `thermal` last, since it's the biggest field and the
+/// firmware's loop never reads it.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Limits {
     schedule: Schedule,
     calibration: Calibration,
     protection: Protection,
-    thermal: Thermal,
     ground: Ground,
     /// What the UI asked for last tick.
     asked: u8,
@@ -51,6 +53,7 @@ pub struct Limits {
     fault: bool,
     failing: Ceiling,
     fade: Fade,
+    thermal: Thermal,
 }
 
 impl Limits {
