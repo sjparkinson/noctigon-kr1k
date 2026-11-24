@@ -34,12 +34,14 @@ const _: () = assert!(
 );
 const _: () = assert!(crate::battery::FORGET_TICKS <= CHECK_TICKS);
 
+/// `repr(C)` holds `limits` last, since the firmware's loop keeps a `Torch` on
+/// its stack and `ldd` and `std` only reach 63 bytes up it.
 #[derive(Clone, Debug)]
+#[repr(C)]
 pub struct Torch {
     switch: Debounce,
     clicks: Clicks,
     ui: Ui,
-    limits: Limits,
     /// Ticks left of [`SHOW_TICKS`] or [`LOCKED_TICKS`].
     showing: u16,
     /// Ticks of rest left until the next check of the cell, `0` meaning due.
@@ -47,6 +49,7 @@ pub struct Torch {
     /// Reading the cell with the switch up and the light off.
     checking: bool,
     cell_low: bool,
+    limits: Limits,
 }
 
 impl Torch {
