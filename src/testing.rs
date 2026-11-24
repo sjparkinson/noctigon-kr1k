@@ -351,22 +351,23 @@ fn ticks(duration: &str) -> Result<u16, Error> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each is a script word that sets one thing in the scene, in any combination"
-)]
+pub enum AdcFault {
+    /// Never finishes a conversion. No script word sets it.
+    Dead,
+    /// Raw reading for every channel, ground included.
+    Stuck(u16),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Scene {
     /// Centivolts.
     pub cell: u16,
     pub kelvin: u16,
     pub fault: bool,
     pub corrupt_flash: bool,
-    /// The ADC never finishes a conversion. No script word sets it.
-    pub adc_dead: bool,
     /// MVIO's bit.
     pub vddio2: bool,
-    /// Raw reading for every channel, ground included.
-    pub adc_stuck: Option<u16>,
+    pub adc: Option<AdcFault>,
 }
 
 impl Scene {
@@ -375,9 +376,8 @@ impl Scene {
         kelvin: thermal::celsius(25),
         fault: false,
         corrupt_flash: false,
-        adc_dead: false,
         vddio2: true,
-        adc_stuck: None,
+        adc: None,
     };
 
     #[must_use]
@@ -392,7 +392,7 @@ impl Scene {
 
     #[must_use]
     pub fn reading(&self, channel: Channel) -> u16 {
-        if let Some(raw) = self.adc_stuck {
+        if let Some(AdcFault::Stuck(raw)) = self.adc {
             return raw;
         }
         match channel {
@@ -442,7 +442,7 @@ pub fn samples(actions: impl IntoIterator<Item = Action>) -> impl Iterator<Item 
                 (0, 0, 0)
             }
             Action::AdcStuck => {
-                scene.adc_stuck = Some(voltage_reading(scene.cell));
+                scene.adc = Some(AdcFault::Stuck(voltage_reading(scene.cell)));
                 (0, 0, 0)
             }
         };
@@ -502,7 +502,10 @@ impl Rig {
         let event = self
             .torch
             .tick(pressed, self.adc.result(), scene.vddio2, self.lit_window);
-        let convert = self.torch.convert().filter(|_| !scene.adc_dead);
+        let convert = self
+            .torch
+            .convert()
+            .filter(|_| scene.adc != Some(AdcFault::Dead));
         self.adc
             .start_with(convert, |channel| scene.reading(channel));
         event
@@ -944,9 +947,8 @@ mod tests {
             kelvin: thermal::celsius(80),
             fault: true,
             corrupt_flash: false,
-            adc_dead: false,
             vddio2: true,
-            adc_stuck: None,
+            adc: None,
         };
         let mut samples = samples(script).peekable();
         assert!(samples.peek().is_some());

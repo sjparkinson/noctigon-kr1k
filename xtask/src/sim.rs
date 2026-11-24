@@ -21,7 +21,7 @@ use kr1k::battery::COLLAPSE_BELOW;
 use kr1k::board;
 use kr1k::ramp::{CEILING, Output, Vref};
 use kr1k::sensors::{CYCLE_TICKS, Channel};
-use kr1k::testing::{self, Action, EXAMPLES, Example, Paced, PitPhase, Sample, Scene};
+use kr1k::testing::{self, Action, AdcFault, EXAMPLES, Example, Paced, PitPhase, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{
     CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, TICK_DEADLINE_PERIODS,
@@ -423,7 +423,7 @@ fn adc_never_answers(sim: Sim, report: &mut Report) -> Result<(), String> {
     let mut levels = Vec::new();
     let samples = script("1C wait:10s 1C wait:2s")?.map(|sample| Sample {
         scene: Scene {
-            adc_dead: true,
+            adc: Some(AdcFault::Dead),
             ..sample.scene
         },
         ..sample
@@ -534,7 +534,8 @@ fn adc_stuck(sim: Sim, report: &mut Report) -> Result<(), String> {
     let samples = script("1C wait:1s adc:stuck wait:5s 1C wait:2s")?;
     let end = in_step_with(&mut sim, samples, report, |sample, rig| {
         let fault = rig.health() == kr1k::limits::Health::Fault;
-        ticks.push((sample.scene.adc_stuck.is_some(), rig.level(), fault));
+        let stuck = matches!(sample.scene.adc, Some(AdcFault::Stuck(_)));
+        ticks.push((stuck, rig.level(), fault));
     })?;
     ends_off(end)?;
     let stuck = ticks
@@ -3343,7 +3344,7 @@ impl Bus for Chip {
             reg::RSTCTRL_RSTFR => Ok(self.rstfr),
             reg::ADC0_INTFLAGS => {
                 let ready = self.adc.ready_at.is_some_and(|at| self.now >= at);
-                Ok(if ready && !self.world.scene.adc_dead {
+                Ok(if ready && self.world.scene.adc != Some(AdcFault::Dead) {
                     ADC_RESRDY
                 } else {
                     0
@@ -4112,7 +4113,7 @@ mod tests {
     fn a_stuck_adc_reads_one_value_for_every_input() {
         for muxpos in [ADC_MUXPOS_VDDDIV10, ADC_MUXPOS_TEMPSENSE, ADC_MUXPOS_GND] {
             let mut chip = adc_ready(muxpos);
-            chip.world.scene.adc_stuck = Some(6140);
+            chip.world.scene.adc = Some(AdcFault::Stuck(6140));
             convert(&mut chip);
             assert_eq!(convert(&mut chip), 6140, "{muxpos:#04x}");
         }
