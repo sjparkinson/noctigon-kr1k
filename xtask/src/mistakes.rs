@@ -310,8 +310,8 @@ const MISTAKES: &[Mistake] = &[
     Mistake {
         name: "switch-wake-dropped",
         file: HW,
-        find: "            if switch_wakes {\n",
-        replace: "            if switch_wakes && false {\n",
+        find: "            if sleep == Sleep::SwitchWakes {\n",
+        replace: "            if sleep == Sleep::SwitchWakes && false {\n",
         stage: Stage::Simulator,
         expect: "the firmware ran 0 passes on this tick, but the library 1",
     },

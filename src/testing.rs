@@ -28,7 +28,7 @@ use crate::sensors::{Channel, Convert};
 use crate::temp::Calibration;
 use crate::thermal;
 use crate::torch::Torch;
-use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Wake};
+use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Sleep, Wake};
 use crate::{TICKS_PER_SECOND, u32_from};
 
 pub use crate::sensors::FULL_SCALE;
@@ -620,7 +620,7 @@ impl Paced {
                 Pit::Slow => next_slow(at),
             };
             Wake::Tick
-        } else if moved && self.end.switch_wakes {
+        } else if moved && self.end.sleep == Sleep::SwitchWakes {
             Wake::Switch
         } else {
             return None;
@@ -631,9 +631,7 @@ impl Paced {
     /// A switch wake with no switch movement, on the last sample's grid point.
     pub fn bounce(&mut self, scene: &Scene) -> Option<End> {
         let last = self.grid.checked_sub(1)?;
-        self.end
-            .switch_wakes
-            .then(|| self.pass(Wake::Switch, last, scene))
+        (self.end.sleep == Sleep::SwitchWakes).then(|| self.pass(Wake::Switch, last, scene))
     }
 
     fn pass(&mut self, wake: Wake, at: u32, scene: &Scene) -> End {

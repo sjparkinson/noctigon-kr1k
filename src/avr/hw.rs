@@ -17,7 +17,9 @@ use kr1k::ramp::{DAC_MAX, Output, Vref};
 use kr1k::selftest::Fuses;
 use kr1k::sensors::{Channel, Convert};
 use kr1k::temp::Calibration;
-use kr1k::watchdog::{CLOCK_HZ, Pit, Setting, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS, Wake};
+use kr1k::watchdog::{
+    CLOCK_HZ, Pit, Setting, Sleep, TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS, Wake,
+};
 
 use crate::regs::{self, addr as reg};
 
@@ -262,8 +264,8 @@ fn prepare_sleep(rest: bool) {
 
 /// `None` means the light's on and no tick came in the deadline. With PC1 low
 /// there's none on purpose, so a dead 32 kHz oscillator leaves the driver off.
-pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
-    prepare_sleep(rest);
+pub fn wait_for_tick(sleep: Sleep) -> Option<Wake> {
+    prepare_sleep(sleep != Sleep::Idle);
     let mut periods = TICK_DEADLINE_PERIODS;
     let woke = loop {
         // SAFETY: `cli` only clears SREG.I. No `nomem`, so the reads stay
@@ -275,7 +277,7 @@ pub fn wait_for_tick(rest: bool, switch_wakes: bool) -> Option<Wake> {
         }
         if read(reg::GPR_GPR2) != 0 {
             out!(reg::GPR_GPR2, 0);
-            if switch_wakes {
+            if sleep == Sleep::SwitchWakes {
                 break Some(Wake::Switch);
             }
         }

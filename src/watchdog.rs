@@ -167,20 +167,28 @@ pub struct Begin {
     pub watchdog: Option<Setting>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Sleep {
+    Idle,
+    PowerDown,
+    /// A power-down the switch wakes too. Only with the PIT slow.
+    SwitchWakes,
+}
+
+impl Sleep {
+    const fn power_down_if(resting: bool) -> Self {
+        if resting { Self::PowerDown } else { Self::Idle }
+    }
+}
+
 /// What a pass does last, after the output, in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "each step of a pass's end is taken or skipped on its own"
-)]
 pub struct End {
     /// Wait for [`Begin::watchdog`]'s write to sync.
     pub synced: bool,
     pub feed: bool,
     pub pit: Option<Pit>,
-    pub power_down: bool,
-    /// Only with the PIT slow.
-    pub switch_wakes: bool,
+    pub sleep: Sleep,
 }
 
 impl End {
@@ -190,8 +198,7 @@ impl End {
             synced: false,
             feed: false,
             pit: None,
-            power_down: resting,
-            switch_wakes: false,
+            sleep: Sleep::power_down_if(resting),
         }
     }
 
@@ -200,8 +207,7 @@ impl End {
             synced: false,
             feed: true,
             pit: None,
-            power_down: false,
-            switch_wakes: false,
+            sleep: Sleep::Idle,
         }
     }
 
@@ -210,8 +216,7 @@ impl End {
             synced: false,
             feed: false,
             pit: Some(Pit::Slow),
-            power_down: true,
-            switch_wakes: true,
+            sleep: Sleep::SwitchWakes,
         }
     }
 }
@@ -297,8 +302,7 @@ impl Pacer {
                     synced: false,
                     feed,
                     pit: None,
-                    power_down: self.feeder.power_down(resting),
-                    switch_wakes: false,
+                    sleep: Sleep::power_down_if(self.feeder.power_down(resting)),
                 };
                 (
                     if feed && settled {
@@ -340,8 +344,7 @@ impl Pacer {
                             synced: false,
                             feed: false,
                             pit: Some(Pit::Fast),
-                            power_down: resting,
-                            switch_wakes: false,
+                            sleep: Sleep::power_down_if(resting),
                         },
                     )
                 }
@@ -459,7 +462,7 @@ mod tests {
                     Some(Setting::Rest),
                     "writes the rest setting"
                 );
-                assert!(end.synced && !end.feed && end.power_down && end.switch_wakes);
+                assert!(end.synced && !end.feed && end.sleep == Sleep::SwitchWakes);
                 assert!(feeds > 0);
                 assert!(pacer.slow() && !pacer.lit());
                 return;
@@ -502,7 +505,7 @@ mod tests {
             ends.push(pass(&mut pacer, Wake::Tick, true, true).1);
         }
         for end in &ends {
-            assert!(!(end.feed && end.power_down), "{end:?}");
+            assert!(!end.feed || end.sleep == Sleep::Idle, "{end:?}");
             assert!(!end.synced, "nothing's written at rest");
         }
         let pattern: std::vec::Vec<(bool, Option<Pit>)> =
@@ -560,7 +563,7 @@ mod tests {
         }
         assert_eq!(pacer.state, State::Entering);
         let (_, end) = pass(&mut pacer, Wake::Tick, false, false);
-        assert!(end.synced && end.feed && end.pit.is_none() && !end.power_down);
+        assert!(end.synced && end.feed && end.pit.is_none() && end.sleep == Sleep::Idle);
         let (begin, end) = pass(&mut pacer, Wake::Tick, false, false);
         assert_eq!(begin.watchdog, Some(Setting::Lit));
         assert!(end.synced && end.feed);
@@ -573,7 +576,11 @@ mod tests {
         to_slow(&mut pacer);
         let (_, end) = pass(&mut pacer, Wake::Switch, true, true);
         assert_eq!(end.pit, Some(Pit::Fast));
-        assert!(end.power_down, "nothing to do, and no feed this pass");
+        assert_eq!(
+            end.sleep,
+            Sleep::PowerDown,
+            "nothing to do, and no feed this pass"
+        );
         let n = to_slow(&mut pacer);
         assert!(n > u16::from(SETTLE_TICKS), "{n}");
     }
