@@ -24,10 +24,11 @@ cargo xtask restore /dev/cu.usbserial-XXXX backup/torch
 
 ## Using it
 
-- **Off.** 1C turns it on, at the same level each time, and 1H turns it on at the lowest level. The aux glows dim blue, and goes dark once the cell's under 3.30 V.
-- **On.** 1C turns it off, and 1H ramps, each 1H going the other way from the last. Every click acts as it's let go, so quick clicks flash it on and off.
-- **Lockout.** 2H locks it from on or off, and 2H again unlocks it to off. Nothing else lights it, and the aux shows bright red for five seconds after a press.
-- **Yellow** for three seconds after a press means the cell's flat, and it won't light until the cell's charged. **White** means a fault, and it won't light again until the cell's taken out.
+- **Off.** 1C turns it on, at the same level each time, and 1H turns it on at the lowest level.
+- **On.** 1C turns it off, and 1H ramps, each 1H going the other way from the last.
+- **Lockout.** 2H locks it from on or off, confirmed with red aux for five seconds, and 2H again unlocks it to off.
+- **Yellow** aux for five seconds after a press means the cell's flat.
+- **White** aux means a fault, and it won't light again until the cell's taken out.
 
 ## Acknowledgements
 
