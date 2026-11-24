@@ -37,7 +37,9 @@ const _: () = {
 };
 
 /// Split into bytes because `reading × SLOPE` needs 24 bits, and the chip has
-/// no runtime 32-bit multiply.
+/// no runtime 32-bit multiply. Never inlined, since `Limits::tick` would get a
+/// copy for each kind of reading.
+#[inline(never)]
 #[expect(
     clippy::arithmetic_side_effects,
     reason = "reading is at most FULL_SCALE here, and the asserts on HIGH and LOW bound \
