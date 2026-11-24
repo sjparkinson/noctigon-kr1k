@@ -1,6 +1,11 @@
 //! Checks on the linked firmware that no compiler or linker error would
 //! catch. Opcode encodings are from Microchip's AVR Instruction Set Manual.
 
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) says an item is for other xtask modules, which pub inside a private module hides"
+)]
+
 use kr1k::regs::{VECTORS, addr};
 
 use crate::avr::{io_address, is_two_words, long_target};

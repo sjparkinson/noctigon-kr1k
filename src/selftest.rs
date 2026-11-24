@@ -18,6 +18,7 @@ impl Fuses {
     /// Sections are DS40002413B. A non-zero `WDTCFG` PERIOD starts the watchdog
     /// locked (§22.3.1), `CRCSEL` also picks the CRC for a scan the firmware
     /// starts (§8.8.2.4), and a whole-flash scan wants one boot section (§11.3.1.1).
+    #[must_use]
     pub const fn ok(self) -> bool {
         let supply = self.syscfg1 & regs::FUSE_MVSYSCFG;
         self.wdtcfg == 0
@@ -31,11 +32,16 @@ impl Fuses {
 }
 
 /// `flags` is `RSTCTRL.RSTFR` as this boot found it.
+#[must_use]
 pub const fn hung(flags: u8) -> bool {
     flags & regs::RSTCTRL_WDRF != 0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each check passes or fails on its own, in any combination"
+)]
 pub struct Faults {
     pub flash: bool,
     pub fuses: bool,
@@ -53,6 +59,7 @@ impl Faults {
         supply: false,
     };
 
+    #[must_use]
     pub const fn any(self) -> bool {
         self.flash || self.fuses || self.hang || self.supply
     }

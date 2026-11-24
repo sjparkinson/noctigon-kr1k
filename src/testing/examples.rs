@@ -12,6 +12,7 @@ pub enum Expect {
 }
 
 impl Expect {
+    #[must_use]
     pub const fn holds(self, level: u8) -> bool {
         match self {
             Self::Off => level == 0,
@@ -29,7 +30,11 @@ pub struct Example {
 }
 
 impl Example {
-    #[expect(clippy::expect_used, reason = "a test parses every script in EXAMPLES")]
+    #[expect(
+        clippy::expect_used,
+        clippy::missing_panics_doc,
+        reason = "a test parses every script in EXAMPLES"
+    )]
     pub fn actions(&self) -> impl Iterator<Item = Action> + use<> {
         parse(self.script.split_whitespace())
             .map(|action| action.expect("every script in EXAMPLES parses"))
@@ -240,6 +245,11 @@ pub const EXAMPLES: &[Example] = &[
 
 /// The example called `name`.
 #[cfg(test)]
+#[must_use]
+#[expect(
+    clippy::missing_panics_doc,
+    reason = "tests only, where a name with no example should fail the test"
+)]
 pub fn example(name: &str) -> &'static Example {
     EXAMPLES
         .iter()

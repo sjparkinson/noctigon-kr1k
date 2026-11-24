@@ -204,6 +204,10 @@ fn hex() -> Result<(), String> {
     Ok(())
 }
 
+#[expect(
+    clippy::option_if_let_else,
+    reason = "a match reads better than map_or_else with two closures"
+)]
 fn row(label: &str, used: u64, of: Option<u64>, unit: &str) -> String {
     let (of, percent) = match of {
         Some(of) => (

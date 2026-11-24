@@ -10,6 +10,7 @@ pub struct Calibration {
 }
 
 impl Calibration {
+    #[must_use]
     pub fn sixteenths(self, sum: u16) -> u16 {
         sixteenths(sum, self.offset, self.slope)
     }
@@ -21,6 +22,7 @@ impl Calibration {
     reason = "each byte product is at most 65,025, and the sum of the shifted products is \
               a × b, which is under 2^32"
 )]
+#[must_use]
 pub fn multiply(a: u16, b: u16) -> u32 {
     let [al, ah] = a.to_le_bytes();
     let [bl, bh] = b.to_le_bytes();
@@ -32,6 +34,7 @@ pub fn multiply(a: u16, b: u16) -> u32 {
     clippy::arithmetic_side_effects,
     reason = "the product is at most 65,535 squared, so adding 512 stays under 2^32"
 )]
+#[must_use]
 pub fn sixteenths(sum: u16, offset: u16, slope: u16) -> u16 {
     let Some(difference) = (u32::from(offset) << 2).checked_sub(u32::from(sum)) else {
         return 0;

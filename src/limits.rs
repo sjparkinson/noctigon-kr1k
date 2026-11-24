@@ -54,6 +54,7 @@ pub struct Limits {
 }
 
 impl Limits {
+    #[must_use]
     pub const fn new(calibration: Calibration, faults: Faults) -> Self {
         Self {
             schedule: Schedule::new(),
@@ -72,24 +73,29 @@ impl Limits {
         }
     }
 
+    #[must_use]
     pub const fn convert(&self) -> Option<Convert> {
         self.convert
     }
 
+    #[must_use]
     pub const fn level(&self) -> u8 {
         self.level
     }
 
+    #[must_use]
     pub const fn starting(&self) -> bool {
         self.lit_for == 1
     }
 
+    #[must_use]
     pub const fn position(&self) -> u16 {
         self.fade.position()
     }
 
     /// The lower of the battery's ceiling and a fault's, then the thermal one.
     #[cfg(test)]
+    #[must_use]
     pub fn ceilings(&self) -> (u8, u8) {
         (
             self.protection.ceiling().min(self.failing.level()),
@@ -97,6 +103,7 @@ impl Limits {
         )
     }
 
+    #[must_use]
     pub const fn health(&self) -> Health {
         if self.fault {
             Health::Fault
@@ -144,13 +151,13 @@ impl Limits {
         self.asked = ui;
         let ui = ui.min(CEILING);
         // The level the light's at this tick, before the ceilings move.
-        let level = match on {
-            true => ui
-                .min(self.thermal.ceiling())
+        let level = if on {
+            ui.min(self.thermal.ceiling())
                 .min(self.protection.ceiling())
                 .min(self.failing.level())
-                .max(self.level),
-            false => 0,
+                .max(self.level)
+        } else {
+            0
         };
 
         let (reading, convert) = self.schedule.tick(result, on);

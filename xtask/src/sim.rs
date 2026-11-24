@@ -813,6 +813,10 @@ fn in_step(
     in_step_with(sim, samples, report, |_, _| {})
 }
 
+#[expect(
+    clippy::too_many_lines,
+    reason = "the firmware and the library step side by side, and each check needs both"
+)]
 fn in_step_with(
     sim: &mut Sim,
     samples: impl IntoIterator<Item = Sample>,
@@ -1740,6 +1744,10 @@ impl Temp {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "the chip's state flags, which change independently"
+)]
 struct Chip {
     flash: Vec<u8>,
     sram: Vec<u8>,
@@ -2155,13 +2163,11 @@ impl Chip {
     }
 
     fn wdt_periods_left(&self) -> u64 {
-        match self.wdt_bite_at() {
-            None => DOWN_PERIODS,
-            Some(bite) => bite
-                .saturating_sub(self.next_pit)
+        self.wdt_bite_at().map_or(DOWN_PERIODS, |bite| {
+            bite.saturating_sub(self.next_pit)
                 .div_ceil(self.tick_cycles.get())
-                .min(DOWN_PERIODS),
-        }
+                .min(DOWN_PERIODS)
+        })
     }
 
     /// The watchdog runs in every sleep mode (§22.3.4).
@@ -2766,7 +2772,7 @@ impl Chip {
     }
 }
 
-/// CLK_PER's divisor for ADC0.CTRLC.PRESC (§33.5.3).
+/// `CLK_PER`'s divisor for ADC0.CTRLC.PRESC (§33.5.3).
 const fn adc_prescaler(presc: u8) -> Option<NonZeroU32> {
     NonZeroU32::new(match presc {
         regs::ADC_PRESC_DIV2 => 2,
@@ -3009,6 +3015,10 @@ impl Bus for Chip {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per register the simulator models"
+    )]
     fn read(&mut self, addr: u16) -> Result<u8, String> {
         let a = usize::from(addr);
         self.temp_undisturbed(a)?;
@@ -3122,6 +3132,10 @@ impl Bus for Chip {
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per register the simulator models"
+    )]
     fn write(&mut self, addr: u16, value: u8) -> Result<(), String> {
         let a = usize::from(addr);
         self.temp_undisturbed(a)?;

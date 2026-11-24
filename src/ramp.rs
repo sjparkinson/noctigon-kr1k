@@ -17,6 +17,7 @@ pub enum Vref {
 }
 
 impl Vref {
+    #[must_use]
     pub const fn millivolts(self) -> u16 {
         match self {
             Self::V1024 => 1024,
@@ -35,6 +36,7 @@ pub enum Paths {
 }
 
 impl Paths {
+    #[must_use]
     pub const fn mask(self) -> u8 {
         match self {
             Self::None => 0,
@@ -91,6 +93,7 @@ impl Output {
         clippy::arithmetic_side_effects,
         reason = "1023 × 2500 × 20,000 is about 5e10, far inside a u64"
     )]
+    #[must_use]
     pub const fn modelled(self) -> u64 {
         if !self.enable {
             return 0;
@@ -147,6 +150,7 @@ const PATHS_SHIFT: u8 = 11;
 const _: () = assert!(DAC_MAX < VREF_BIT);
 const _: () = assert!(CEILING > 0);
 
+#[must_use]
 pub fn output(level: u8) -> Output {
     let Some(index) = level.min(CEILING).checked_sub(1) else {
         return Output::OFF;
@@ -167,6 +171,7 @@ const _: () = assert!(FRACTION.is_power_of_two());
     clippy::arithmetic_side_effects,
     reason = "a gap of DAC_MAX at most times a part under FRACTION is 15,345 at most"
 )]
+#[must_use]
 pub fn output_between(sixteenths: u16) -> Output {
     let level = u8::try_from(sixteenths / FRACTION).unwrap_or(CEILING);
     let low = output(level);

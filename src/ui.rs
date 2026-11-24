@@ -27,6 +27,7 @@ pub enum Aux {
 }
 
 impl Aux {
+    #[must_use]
     pub const fn bright(self) -> bool {
         matches!(self, Self::Red)
     }
@@ -49,6 +50,7 @@ impl Default for Ui {
 }
 
 impl Ui {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             mode: Mode::Off,
@@ -58,10 +60,12 @@ impl Ui {
         }
     }
 
+    #[must_use]
     pub const fn mode(&self) -> Mode {
         self.mode
     }
 
+    #[must_use]
     pub const fn output_level(&self) -> u8 {
         match self.mode {
             Mode::On => self.level,
@@ -71,6 +75,7 @@ impl Ui {
 
     /// Lockout has no limit on purpose, so a fourth press in a pocket makes a
     /// 4C, which does nothing, rather than a 3C that unlocks it.
+    #[must_use]
     pub const fn most_clicks(&self) -> Option<u8> {
         match self.mode {
             Mode::On | Mode::Off => Some(1),
@@ -78,6 +83,7 @@ impl Ui {
         }
     }
 
+    #[must_use]
     pub const fn aux(&self) -> Aux {
         match self.mode {
             Mode::On => Aux::Off,

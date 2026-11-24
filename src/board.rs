@@ -49,6 +49,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[expect(
+        clippy::similar_names,
+        reason = "the ports' names, as the datasheet writes them"
+    )]
     fn each_port_uses_each_pin_once() {
         let porta = [
             FET, HELD_LOW, TWI_SDA, TWI_SCL, BUTTON_LED, PATH3, PATH2, PATH1,

@@ -137,7 +137,7 @@ const RESET_REQ_APPLY: u8 = 0x59;
 
 const KEY_NVMPROG: &[u8; 8] = b"NVMProg ";
 
-/// SIB bytes 8 to 10, NVM_VERSION (DS figure 36-20). A tinyAVR reads `P:0`.
+/// SIB bytes 8 to 10, `NVM_VERSION` (DS figure 36-20). A tinyAVR reads `P:0`.
 const SIB_NVM_P2: &[u8; 3] = b"P:2";
 
 /// The most one REPEAT covers, in bytes on a read and words on a write.
@@ -154,14 +154,13 @@ pub struct SerialNumber([u8; map::SERIAL_SIZE]);
 
 impl SerialNumber {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        match bytes.try_into() {
-            Ok(bytes) => Ok(Self(bytes)),
-            Err(_) => Err(format!(
+        bytes.try_into().map(Self).map_err(|_| {
+            format!(
                 "a serial number is {} bytes, not {}",
                 map::SERIAL_SIZE,
                 bytes.len()
-            )),
-        }
+            )
+        })
     }
 
     pub const fn bytes(&self) -> &[u8] {
@@ -575,6 +574,10 @@ fn hex(bytes: &[u8]) -> String {
     hex.join(" ")
 }
 
+#[expect(
+    clippy::needless_pass_by_value,
+    reason = "map_err hands the error over by value"
+)]
 fn io_error(error: io::Error) -> String {
     match error.kind() {
         io::ErrorKind::TimedOut => "no reply from the chip. Check the probe's contact, \
@@ -585,6 +588,10 @@ fn io_error(error: io::Error) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) says the fake is for other xtask modules' tests, which pub inside a private module hides"
+)]
 pub(crate) mod tests {
     use super::*;
     use fake::Dd20;
@@ -1567,6 +1574,10 @@ pub(crate) mod tests {
             StIncWord(usize, Option<u8>),
         }
 
+        #[expect(
+            clippy::struct_excessive_bools,
+            reason = "the fake chip's state flags, which change independently"
+        )]
         pub struct Dd20 {
             pub flash: Vec<u8>,
             pub eeprom: Vec<u8>,

@@ -63,7 +63,7 @@ pub struct Write {
 pub type Update = &'static [Write];
 
 /// A step of its own, with the settings a tick later. The datasheet gives no
-/// wait after CHIPEN rises, PebbleOS's driver found writes in the first
+/// wait after `CHIPEN` rises, `PebbleOS`'s driver found writes in the first
 /// millisecond are dropped, and Linux's waits 2 ms.
 pub const WAKE: Update = &[Write {
     register: GCR1,
@@ -153,6 +153,7 @@ macro_rules! show {
 }
 
 /// Only for a chip that's awake.
+#[must_use]
 pub const fn show(colour: Aux) -> Update {
     match colour {
         Aux::Off => STANDBY,
@@ -186,6 +187,7 @@ impl Default for Aw2016 {
 }
 
 impl Aw2016 {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             state: State::Unknown,
@@ -212,6 +214,7 @@ impl Aw2016 {
 
     /// Whether [`Aw2016::step`] would send nothing for `want`. Written out
     /// rather than by calling `step`, which is bigger.
+    #[must_use]
     pub fn settled(&self, want: Aux) -> bool {
         match self.state {
             State::Standby => matches!(want, Aux::Off),
@@ -227,6 +230,7 @@ impl Aw2016 {
     }
 
     #[cfg(test)]
+    #[must_use]
     pub const fn shown(&self) -> Option<Aux> {
         match self.state {
             State::Standby => Some(Aux::Off),

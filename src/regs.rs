@@ -2,6 +2,11 @@
 //! from the ATDF in `vendor/`. Its reset values are left out, since some
 //! disagree with the datasheet.
 
+#![expect(
+    clippy::doc_markdown,
+    reason = "the generated docs are the ATDF's names and captions as Microchip wrote them"
+)]
+
 include!(concat!(env!("OUT_DIR"), "/regs.rs"));
 
 /// The ATDF gives `SAMPLEN` no named values. `2 + SAMPLEN` ADC clocks, 34 µs at 1 MHz

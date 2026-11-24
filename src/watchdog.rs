@@ -49,6 +49,7 @@ pub struct Feeder {
 }
 
 impl Feeder {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             wait: 0,
@@ -56,6 +57,7 @@ impl Feeder {
         }
     }
 
+    #[must_use]
     pub const fn just_fed() -> Self {
         Self {
             wait: FEED_TICKS - 1,
@@ -78,12 +80,13 @@ impl Feeder {
     }
 
     #[cfg(test)]
-    const fn fed(&self) -> bool {
+    const fn fed(self) -> bool {
         self.fed
     }
 
     /// Never straight after a feed. A `wdr` takes two or three WDT clocks to sync
     /// (§22.3.6), and the datasheet doesn't say it does with the peripheral clock stopped.
+    #[must_use]
     pub const fn power_down(&self, resting: bool) -> bool {
         resting && !self.fed
     }
@@ -166,6 +169,10 @@ pub struct Begin {
 
 /// What a pass does last, after the output, in this order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each step of a pass's end is taken or skipped on its own"
+)]
 pub struct End {
     /// Wait for [`Begin::watchdog`]'s write to sync.
     pub synced: bool,
@@ -177,6 +184,7 @@ pub struct End {
 }
 
 impl End {
+    #[must_use]
     pub const fn start(resting: bool) -> Self {
         Self {
             synced: false,
@@ -236,6 +244,7 @@ impl Default for Pacer {
 }
 
 impl Pacer {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             state: State::First,
@@ -244,11 +253,13 @@ impl Pacer {
         }
     }
 
+    #[must_use]
     pub const fn lit(&self) -> bool {
         matches!(self.state, State::Fast)
     }
 
     #[cfg(test)]
+    #[must_use]
     pub const fn slow(&self) -> bool {
         matches!(self.state, State::Slow { .. })
     }
