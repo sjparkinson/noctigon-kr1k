@@ -12,7 +12,7 @@ use crate::ui::{Aux, Mode, Ui};
 use crate::watchdog;
 
 /// Ticks the aux say why the light won't come on. Unmeasured.
-pub const SHOW_TICKS: u16 = 3 * TICKS_PER_SECOND;
+pub const SHOW_TICKS: u16 = 5 * TICKS_PER_SECOND;
 
 /// Ticks the aux shows red after a press that leaves it locked. Unmeasured.
 pub const LOCKED_TICKS: u16 = 5 * TICKS_PER_SECOND;
@@ -1253,7 +1253,7 @@ mod tests {
     }
 
     #[test]
-    fn going_flat_shows_yellow_for_the_three_seconds_after() {
+    fn going_flat_shows_yellow_for_the_five_seconds_after() {
         let mut torch = Rig::default();
         click(&mut torch);
         torch.adc.voltage = voltage_reading(280);
@@ -1404,11 +1404,11 @@ mod tests {
     }
 
     #[test]
-    fn the_aux_says_why_for_three_seconds_to_the_tick() {
-        const THREE_SECONDS: u16 = 3 * 64;
+    fn the_aux_says_why_for_five_seconds_to_the_tick() {
+        const FIVE_SECONDS: u16 = 5 * 64;
         assert_eq!(TICKS_PER_SECOND, 64);
         let mut torch = Rig::new(HUNG);
-        for tick in 1..THREE_SECONDS {
+        for tick in 1..FIVE_SECONDS {
             torch.tick(false);
             assert_eq!(torch.aux(), Aux::White, "tick {tick}");
         }
@@ -1423,11 +1423,11 @@ mod tests {
         torch.tick(false);
         assert_eq!(torch.aux(), Aux::Off, "not before the click counts");
         assert_eq!(torch.tick(false), Some(Event::Click(1)));
-        shows_for(&mut torch, Aux::Yellow, THREE_SECONDS);
+        shows_for(&mut torch, Aux::Yellow, FIVE_SECONDS);
     }
 
     #[test]
-    fn a_fault_that_fades_out_shows_white_for_the_three_seconds_after() {
+    fn a_fault_that_fades_out_shows_white_for_the_five_seconds_after() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
@@ -1443,7 +1443,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fault_clicked_off_mid_fade_shows_white_for_the_three_seconds_after() {
+    fn a_fault_clicked_off_mid_fade_shows_white_for_the_five_seconds_after() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
