@@ -89,7 +89,7 @@ impl From<Scene> for World {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr1k::testing::temperature_reading;
+    use kr1k::testing::{AdcFault, temperature_reading};
 
     #[test]
     fn factory_fuses_pass_and_a_bad_one_is_a_fault() {
@@ -105,9 +105,8 @@ mod tests {
             kelvin: 353,
             fault: true,
             corrupt_flash: true,
-            adc_dead: true,
             vddio2: false,
-            adc_stuck: Some(6140),
+            adc: Some(AdcFault::Stuck(6140)),
         };
         let world = World::from(scene);
         assert_eq!(world.scene, scene);
