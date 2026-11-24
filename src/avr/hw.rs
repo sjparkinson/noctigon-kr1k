@@ -243,7 +243,7 @@ fn sleep_mode(value: u8) {
             addr = const reg::SLPCTRL_CTRLA,
             value = in(reg) value,
             options(nostack, preserves_flags),
-        )
+        );
     }
 }
 
@@ -427,8 +427,8 @@ pub fn flash_ok() -> bool {
             "nop",
             "nop",
             options(nostack, preserves_flags)
-        )
-    };
+        );
+    }
     while read(reg::CRCSCAN_STATUS) & regs::CRCSCAN_BUSY != 0 {}
     read(reg::CRCSCAN_STATUS) & regs::CRCSCAN_OK != 0
 }
@@ -560,8 +560,8 @@ fn spin(loops: u8) {
             "brne 1b",
             n = inout(reg) loops => _,
             options(nostack),
-        )
-    };
+        );
+    }
 }
 
 /// Loops of [`spin`] for DAC0's output to fall to 0, about 20 µs, against a

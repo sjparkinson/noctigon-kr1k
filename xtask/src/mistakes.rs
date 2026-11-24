@@ -655,7 +655,7 @@ fn try_mistakes(
                 format!("{name}: refused at {stopped:?}, not {stage:?}:\n{e}"),
             )),
             Err((_, e)) => {
-                missed.push((i, format!("{name}: refused, but not with `{expect}`:\n{e}")))
+                missed.push((i, format!("{name}: refused, but not with `{expect}`:\n{e}")));
             }
             Ok(()) => missed.push((i, format!("{name}: nothing refused it"))),
         }
