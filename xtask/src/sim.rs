@@ -813,10 +813,6 @@ fn in_step(
     in_step_with(sim, samples, report, |_, _| {})
 }
 
-#[expect(
-    clippy::too_many_lines,
-    reason = "the firmware and the library step side by side, and each check needs both"
-)]
 fn in_step_with(
     sim: &mut Sim,
     samples: impl IntoIterator<Item = Sample>,
@@ -825,27 +821,7 @@ fn in_step_with(
 ) -> Result<Option<u8>, String> {
     // The fuses are read before the first tick.
     let mut samples = samples.into_iter().peekable();
-    let power_on = World::from(samples.peek().map_or(Scene::NORMAL, |s| s.scene));
-    sim.chip.set_world(power_on)?;
-    if power_on.scene.corrupt_flash {
-        // The checksum's high byte, which is never code.
-        let byte = sim
-            .chip
-            .flash
-            .get_mut(crc::CHECKSUM_AT)
-            .ok_or("can't corrupt flash: the image isn't padded to all of flash")?;
-        *byte ^= 0x01;
-    }
-    sim.tick(false).map_err(|e| format!("hw::init: {e}"))?;
-    sim.chip
-        .clocked_as_modelled()
-        .map_err(|e| format!("hw::init: {e}"))?;
-    if sim.chip.wdt_open() == 0 {
-        return Err("hw::start_watchdog never turned the watchdog on".into());
-    }
-    let mut rig = Paced::new(power_on.faults(), sim.chip.grid);
-    rig.phase = sim.chip.pit_phase;
-    rig.bus_fails = sim.chip.twi.fault != Fault::None;
+    let mut rig = power_on(sim, samples.peek().map_or(Scene::NORMAL, |s| s.scene))?;
     let mut was_resting = false;
     let mut finished = true;
     let mut aux = AuxWatch::default();
@@ -889,13 +865,13 @@ fn in_step_with(
             )));
         }
         each(&sample, &rig);
-        let Some(&end) = ends.last() else {
+        if ends.is_empty() {
             if sim.chip.wdt.feeds != feeds {
                 return Err(at("fed the watchdog with no pass to run".into()));
             }
             sim.chip.shows(rig.output()).map_err(at)?;
             continue;
-        };
+        }
         if !landing {
             report.loop_instructions = report.loop_instructions.max(took);
         }
@@ -908,35 +884,72 @@ fn in_step_with(
             aux.tick(&sim.chip.twi, rig.aux()).map_err(at)?;
         }
         was_resting = rig.resting();
-        // A firmware that never feeds at all is the bite's to catch.
-        let fed = ends.iter().filter(|end| end.feed).count();
-        let wdrs = sim.chip.wdt.feeds.abs_diff(feeds);
-        if sim.chip.wdt.feeds > 0 && wdrs != fed {
-            return Err(at(format!(
-                "the library feeds the watchdog {fed} times on this tick, but the firmware {wdrs}"
-            )));
-        }
-        if sim.chip.pit() != rig.pit() {
-            return Err(at(format!(
-                "the library has the PIT {:?}, but the firmware {:?}",
-                rig.pit(),
-                sim.chip.pit()
-            )));
-        }
-        if powered_down != end.power_down {
-            return Err(at(format!(
-                "the library says {}, but the firmware {}",
-                if end.power_down { "power down" } else { "idle" },
-                if powered_down {
-                    "powered down"
-                } else {
-                    "idled"
-                },
-            )));
-        }
+        pass_ends_agree(sim, &rig, &ends, feeds, powered_down).map_err(at)?;
     }
     report.take(sim);
     Ok(finished.then(|| rig.level()))
+}
+
+fn power_on(sim: &mut Sim, scene: Scene) -> Result<Paced, String> {
+    let power_on = World::from(scene);
+    sim.chip.set_world(power_on)?;
+    if power_on.scene.corrupt_flash {
+        // The checksum's high byte, which is never code.
+        let byte = sim
+            .chip
+            .flash
+            .get_mut(crc::CHECKSUM_AT)
+            .ok_or("can't corrupt flash: the image isn't padded to all of flash")?;
+        *byte ^= 0x01;
+    }
+    sim.tick(false).map_err(|e| format!("hw::init: {e}"))?;
+    sim.chip
+        .clocked_as_modelled()
+        .map_err(|e| format!("hw::init: {e}"))?;
+    if sim.chip.wdt_open() == 0 {
+        return Err("hw::start_watchdog never turned the watchdog on".into());
+    }
+    let mut rig = Paced::new(power_on.faults(), sim.chip.grid);
+    rig.phase = sim.chip.pit_phase;
+    rig.bus_fails = sim.chip.twi.fault != Fault::None;
+    Ok(rig)
+}
+
+fn pass_ends_agree(
+    sim: &Sim,
+    rig: &Paced,
+    ends: &[End],
+    feeds: usize,
+    powered_down: bool,
+) -> Result<(), String> {
+    // A firmware that never feeds at all is the bite's to catch.
+    let fed = ends.iter().filter(|end| end.feed).count();
+    let wdrs = sim.chip.wdt.feeds.abs_diff(feeds);
+    if sim.chip.wdt.feeds > 0 && wdrs != fed {
+        return Err(format!(
+            "the library feeds the watchdog {fed} times on this tick, but the firmware {wdrs}"
+        ));
+    }
+    if sim.chip.pit() != rig.pit() {
+        return Err(format!(
+            "the library has the PIT {:?}, but the firmware {:?}",
+            rig.pit(),
+            sim.chip.pit()
+        ));
+    }
+    let power_down = ends.last().is_some_and(|end| end.power_down);
+    if powered_down != power_down {
+        return Err(format!(
+            "the library says {}, but the firmware {}",
+            if power_down { "power down" } else { "idle" },
+            if powered_down {
+                "powered down"
+            } else {
+                "idled"
+            },
+        ));
+    }
+    Ok(())
 }
 
 /// Ticks the aux may stay dark after the torch wants a colour.
@@ -2752,6 +2765,262 @@ impl Chip {
         }
     }
 
+    // The real IN stops following the pin in power-down (§18.3.5), and how
+    // soon after a wake it catches up isn't stated.
+    fn read_switch(&mut self) -> Result<u8, String> {
+        if self.io(SWITCH_CTRL) & PORT_ISC == ISC_INPUT_DISABLE {
+            return Err(
+                "reads PD4 with its input buffer off, so VPORTD.IN never changes (section \
+                 18.3.2.3)"
+                    .into(),
+            );
+        }
+        if !self.in_handler {
+            self.switch_reads = self.switch_reads.saturating_add(1);
+            self.switch_read_at = self.now;
+        }
+        Ok(if self.pressed { !SWITCH } else { 0xFF })
+    }
+
+    // §8.10.3, §33.5.12
+    fn read_adc_result(&mut self) -> Result<u8, String> {
+        if self.adc.ready_at.is_none_or(|at| self.now < at) {
+            return Err("reads ADC0.RES with no result ready".into());
+        }
+        self.adc.ready_at = None;
+        let [lo, hi] = self.adc.result.to_le_bytes();
+        self.temp.latch(Wide::Adc0, reg::ADC0_RES, hi);
+        Ok(lo)
+    }
+
+    fn write_ccp(&mut self, value: u8) -> Result<(), String> {
+        if value != CCP_IOREG {
+            return Err(format!(
+                "writes {value:#04x} to CPU.CCP, which isn't the IOREG key"
+            ));
+        }
+        self.unlocked_until = Some(self.now.saturating_add(4));
+        self.ccp_hold = true;
+        Ok(())
+    }
+
+    fn write_tcb_ctrlb(&mut self, value: u8) -> Result<(), String> {
+        if value != regs::TCB_CNTMODE_INT {
+            return Err(only_models(
+                reg::TCB0_CTRLB,
+                value,
+                "periodic interrupt mode with no output",
+            ));
+        }
+        *self.io_mut(reg::TCB0_CTRLB) = value;
+        Ok(())
+    }
+
+    const fn write_pit_flags(&mut self, value: u8) {
+        if value & RTC_PI != 0 {
+            if self.pit_flag {
+                self.tick_taken_at = self.now;
+            }
+            self.pit_flag = false;
+        }
+    }
+
+    fn write_crcscan_ctrla(&mut self, value: u8) -> Result<(), String> {
+        if value != CRCSCAN_ENABLE {
+            return Err(only_models(
+                reg::CRCSCAN_CTRLA,
+                value,
+                "ENABLE, with STATUS polled (NMIEN can't be undone without a reset)",
+            ));
+        }
+        self.start_crc()?;
+        *self.io_mut(reg::CRCSCAN_CTRLA) = value;
+        Ok(())
+    }
+
+    fn write_clock(&mut self, a: usize, value: u8) -> Result<(), String> {
+        self.take_protected_write(a)?;
+        let want = if a == reg::CLKCTRL_OSCHFCTRLA {
+            OSCHF_4MHZ
+        } else {
+            0
+        };
+        if value != want {
+            return Err(format!(
+                "writes {value:#04x} to {}: the firmware runs on the internal oscillator at \
+                 4 MHz, undivided, and every timing here assumes it",
+                name(a)
+            ));
+        }
+        *self.io_mut(a) = value;
+        Ok(())
+    }
+
+    fn write_dac_ctrla(&mut self, value: u8) -> Result<(), String> {
+        match value {
+            0 if self.enabled_high() => {
+                return Err(
+                    "turns DAC0 off with PC1 high, leaving the amplifier's setpoint to PORT".into(),
+                );
+            }
+            0 => {}
+            DAC_DRIVING => {
+                if self.io(DAC_PIN_CTRL) & PORT_ISC != ISC_INPUT_DISABLE {
+                    return Err(
+                        "turns DAC0's output on with PD6's input buffer still on, which section \
+                         34.3.1 wants off first"
+                            .into(),
+                    );
+                }
+            }
+            _ => {
+                return Err(only_models(
+                    reg::DAC0_CTRLA,
+                    value,
+                    "it off, or on and driving PD6",
+                ));
+            }
+        }
+        *self.io_mut(reg::DAC0_CTRLA) = value;
+        Ok(())
+    }
+
+    fn write_dac_low(&mut self, value: u8) -> Result<(), String> {
+        let [data, _] = regs::DAC_DATA.to_le_bytes();
+        if value & !data != 0 {
+            return Err(format!(
+                "writes {value:#04x} to DAC0.DATAL, whose bits 5:0 aren't DATA (section 34.5.2) \
+                 and get written 0 (section 8.10)"
+            ));
+        }
+        self.temp
+            .low(Wide::Dac0, reg::DAC0_DATA, value)
+            .map_err(|_| "writes DAC0.DATAL while the last DATAL is still waiting for DATAH".into())
+    }
+
+    fn write_tcb_intctrl(&mut self, value: u8) -> Result<(), String> {
+        if value & !TCB_CAPT != 0 {
+            return Err(only_models(reg::TCB0_INTCTRL, value, "CAPT"));
+        }
+        // A flag left up from before fires at once (§24.3.5).
+        if value != 0
+            && self.io(reg::TCB0_INTCTRL) == 0
+            && self.tcb.capt
+            && self.since(self.tcb.capt_up_at)? >= self.tcb.period()
+        {
+            return Err(
+                "turns TCB0's interrupt on with INTFLAGS.CAPT still up from before, so the \
+                 handler runs at once and counts a period that never was"
+                    .into(),
+            );
+        }
+        *self.io_mut(reg::TCB0_INTCTRL) = value;
+        self.update_enabled();
+        Ok(())
+    }
+
+    fn write_pit_ctrla(&mut self, value: u8) -> Result<(), String> {
+        let a = reg::RTC_PITCTRLA;
+        if self.pit_busy > 0 {
+            return Err(format!(
+                "writes {} while RTC.PITSTATUS.CTRLBUSY is set, which section 26.13.12 doesn't \
+                 allow",
+                name(a)
+            ));
+        }
+        if value != PIT_FAST && value != PIT_SLOW {
+            return Err(only_models(
+                a,
+                value,
+                "the PIT on at 512 cycles, 64 Hz, or 32,768, 1 Hz",
+            ));
+        }
+        if value == PIT_SLOW && self.enabled_high() {
+            return Err(
+                "slows the PIT with PC1 high, so the light's protection runs once a second and \
+                 the tick deadline's sums don't hold"
+                    .into(),
+            );
+        }
+        let was_on = self.io(a) & RTC_PITEN != 0;
+        let old = self.pit();
+        *self.io_mut(a) = value;
+        let pit = self.pit();
+        if !was_on {
+            self.pit_next = self.grid.saturating_add(1);
+        } else if pit != old {
+            self.pit_next = self.pit_phase.first(self.grid, pit);
+        }
+        self.pit_busy = PIT_SYNC_READS;
+        Ok(())
+    }
+
+    fn write_wdt_ctrla(&mut self, value: u8) -> Result<(), String> {
+        self.take_protected_write(reg::WDT_CTRLA)?;
+        if self.wdt.pending.is_some() {
+            return Err(
+                "writes WDT.CTRLA while WDT.STATUS.SYNCBUSY is set, which the datasheet doesn't \
+                 allow (section 22.3.6)"
+                    .into(),
+            );
+        }
+        if value & WDT_PERIOD > WDT_PERIOD_MAX || (value & WDT_WINDOW) >> 4 > WDT_PERIOD_MAX {
+            return Err(format!(
+                "writes {value:#04x} to WDT.CTRLA: a reserved WDT period or window"
+            ));
+        }
+        if value & WDT_PERIOD == 0 {
+            return Err(format!(
+                "writes {value:#04x} to WDT.CTRLA, which turns the watchdog off, and the \
+                 firmware never does"
+            ));
+        }
+        if let Some(fed) = self.wdt.fed_at
+            && self.now < fed.saturating_add(self.wdt_time(WDR_SYNC_CLOCKS))
+        {
+            return Err(
+                "writes WDT.CTRLA within three WDT clocks of a wdr, which may still be syncing, \
+                 and the datasheet doesn't say SYNCBUSY covers that"
+                    .into(),
+            );
+        }
+        if !self.wdt_on() {
+            self.wdt.since = self.now;
+        }
+        let synced = self.now.saturating_add(self.wdt_time(WDT_SYNC_CLOCKS));
+        self.wdt.pending = Some((value, synced));
+        self.plan_next_event();
+        Ok(())
+    }
+
+    fn write_adc_reference(&mut self, value: u8) -> Result<(), String> {
+        if value != VREF_REFSEL_1V024 && value != VREF_REFSEL_2V048 {
+            return Err(only_models(
+                reg::VREF_ADC0REF,
+                value,
+                "1.024 V and 2.048 V, with ALWAYSON clear",
+            ));
+        }
+        *self.io_mut(reg::VREF_ADC0REF) = value;
+        Ok(())
+    }
+
+    fn write_adc_ctrla(&mut self, value: u8) -> Result<(), String> {
+        if value != 0 && value != ADC_ON {
+            return Err(only_models(
+                reg::ADC0_CTRLA,
+                value,
+                "it off, or on for single 12-bit conversions",
+            ));
+        }
+        if value & ADC_ENABLE == 0 {
+            // The next conversion catches the ADC starting up.
+            self.adc.last_setup = None;
+        }
+        *self.io_mut(reg::ADC0_CTRLA) = value;
+        Ok(())
+    }
+
     fn temp_undisturbed(&self, a: usize) -> Result<(), String> {
         let wide = [
             (Wide::Tcb0, reg::TCB0_CNT..reg::TCB0_CCMP + 2, "TCB0"),
@@ -2804,6 +3073,27 @@ const fn adc_initdly(initdly: u8) -> Option<u32> {
         regs::ADC_INITDLY_DLY256 => 256,
         _ => return None,
     })
+}
+
+fn wdt_status_refused(value: u8) -> String {
+    if value & WDT_LOCK != 0 {
+        "sets WDT.STATUS.LOCK, which only debug mode can clear".into()
+    } else {
+        "writes WDT.STATUS, whose only writable bit is LOCK".into()
+    }
+}
+
+// §8.6.2.2
+fn temperature_calibration(addr: usize) -> Option<u8> {
+    let (from, value) = if (reg::SIGROW_TEMPSENSE0..reg::SIGROW_TEMPSENSE0 + 2).contains(&addr) {
+        (reg::SIGROW_TEMPSENSE0, CALIBRATION.slope)
+    } else if (reg::SIGROW_TEMPSENSE1..reg::SIGROW_TEMPSENSE1 + 2).contains(&addr) {
+        (reg::SIGROW_TEMPSENSE1, CALIBRATION.offset)
+    } else {
+        return None;
+    };
+    let [low, high] = value.to_le_bytes();
+    Some(if addr == from { low } else { high })
 }
 
 fn plain(addr: usize) -> bool {
@@ -3015,10 +3305,6 @@ impl Bus for Chip {
         Ok(())
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per register the simulator models"
-    )]
     fn read(&mut self, addr: u16) -> Result<u8, String> {
         let a = usize::from(addr);
         self.temp_undisturbed(a)?;
@@ -3030,22 +3316,7 @@ impl Bus for Chip {
             return Ok(byte.copied().unwrap_or(0xFF));
         }
         match a {
-            // The real IN stops following the pin in power-down (§18.3.5), and
-            // how soon after a wake it catches up isn't stated.
-            reg::VPORTD_IN => {
-                if self.io(SWITCH_CTRL) & PORT_ISC == ISC_INPUT_DISABLE {
-                    return Err(
-                        "reads PD4 with its input buffer off, so VPORTD.IN never changes \
-                         (section 18.3.2.3)"
-                            .into(),
-                    );
-                }
-                if !self.in_handler {
-                    self.switch_reads = self.switch_reads.saturating_add(1);
-                    self.switch_read_at = self.now;
-                }
-                Ok(if self.pressed { !SWITCH } else { 0xFF })
-            }
+            reg::VPORTD_IN => self.read_switch(),
             reg::VPORTD_INTFLAGS => Ok(self.portd_flags),
             reg::MVIO_STATUS => {
                 self.boot.supply_read.get_or_insert(self.now);
@@ -3078,16 +3349,7 @@ impl Bus for Chip {
                     0
                 })
             }
-            reg::ADC0_RES => {
-                // §8.10.3, §33.5.12
-                if self.adc.ready_at.is_none_or(|at| self.now < at) {
-                    return Err("reads ADC0.RES with no result ready".into());
-                }
-                self.adc.ready_at = None;
-                let [lo, hi] = self.adc.result.to_le_bytes();
-                self.temp.latch(Wide::Adc0, a, hi);
-                Ok(lo)
-            }
+            reg::ADC0_RES => self.read_adc_result(),
             _ if a == reg::ADC0_RES + 1 => {
                 self.temp.take(Wide::Adc0, reg::ADC0_RES).ok_or_else(|| {
                     "reads ADC0.RES's high byte without its low byte just before, so it gets \
@@ -3095,23 +3357,7 @@ impl Bus for Chip {
                         .into()
                 })
             }
-            // §8.6.2.2
-            _ if (reg::SIGROW_TEMPSENSE0..reg::SIGROW_TEMPSENSE0 + 2).contains(&a) => {
-                let [low, high] = CALIBRATION.slope.to_le_bytes();
-                Ok(if a == reg::SIGROW_TEMPSENSE0 {
-                    low
-                } else {
-                    high
-                })
-            }
-            _ if (reg::SIGROW_TEMPSENSE1..reg::SIGROW_TEMPSENSE1 + 2).contains(&a) => {
-                let [low, high] = CALIBRATION.offset.to_le_bytes();
-                Ok(if a == reg::SIGROW_TEMPSENSE1 {
-                    low
-                } else {
-                    high
-                })
-            }
+            _ if let Some(byte) = temperature_calibration(a) => Ok(byte),
             _ if self.world.fuse(a).is_some() => {
                 self.boot.fuses_read.get_or_insert(self.now);
                 Ok(self.world.fuse(a).unwrap_or(0xFF))
@@ -3132,10 +3378,6 @@ impl Bus for Chip {
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per register the simulator models"
-    )]
     fn write(&mut self, addr: u16, value: u8) -> Result<(), String> {
         let a = usize::from(addr);
         self.temp_undisturbed(a)?;
@@ -3152,31 +3394,8 @@ impl Bus for Chip {
         self.register_writes = self.register_writes.saturating_add(1);
         self.boot.write(self.now, a, value);
         match a {
-            reg::CPU_CCP => {
-                if value != CCP_IOREG {
-                    return Err(format!(
-                        "writes {value:#04x} to CPU.CCP, which isn't the IOREG key"
-                    ));
-                }
-                self.unlocked_until = Some(self.now.saturating_add(4));
-                self.ccp_hold = true;
-            }
-            reg::CLKCTRL_OSCHFCTRLA | reg::CLKCTRL_MCLKCTRLB => {
-                self.take_protected_write(a)?;
-                let want = if a == reg::CLKCTRL_OSCHFCTRLA {
-                    OSCHF_4MHZ
-                } else {
-                    0
-                };
-                if value != want {
-                    return Err(format!(
-                        "writes {value:#04x} to {}: the firmware runs on the internal \
-                         oscillator at 4 MHz, undivided, and every timing here assumes it",
-                        name(a)
-                    ));
-                }
-                *self.io_mut(a) = value;
-            }
+            reg::CPU_CCP => self.write_ccp(value)?,
+            reg::CLKCTRL_OSCHFCTRLA | reg::CLKCTRL_MCLKCTRLB => self.write_clock(a, value)?,
             reg::VPORTA_DIR | reg::VPORTA_OUT => self.write_porta(a, value)?,
             reg::VPORTC_DIR | reg::VPORTC_OUT => self.write_portc(a, value)?,
             reg::VPORTD_DIR | reg::VPORTD_OUT => self.write_portd(a, value)?,
@@ -3194,79 +3413,16 @@ impl Bus for Chip {
                 self.twi.write(self.now, a, value, pc1_high)?;
             }
             reg::VREF_DAC0REF => self.write_dac_reference(value)?,
-            reg::DAC0_CTRLA => match value {
-                0 if self.enabled_high() => {
-                    return Err(
-                        "turns DAC0 off with PC1 high, leaving the amplifier's setpoint to PORT"
-                            .into(),
-                    );
-                }
-                0 => *self.io_mut(a) = 0,
-                DAC_DRIVING => {
-                    if self.io(DAC_PIN_CTRL) & PORT_ISC != ISC_INPUT_DISABLE {
-                        return Err(
-                            "turns DAC0's output on with PD6's input buffer still on, which \
-                             section 34.3.1 wants off first"
-                                .into(),
-                        );
-                    }
-                    *self.io_mut(a) = value;
-                }
-                _ => {
-                    return Err(only_models(a, value, "it off, or on and driving PD6"));
-                }
-            },
-            reg::DAC0_DATA => {
-                let [data, _] = regs::DAC_DATA.to_le_bytes();
-                if value & !data != 0 {
-                    return Err(format!(
-                        "writes {value:#04x} to DAC0.DATAL, whose bits 5:0 aren't DATA \
-                         (section 34.5.2) and get written 0 (section 8.10)"
-                    ));
-                }
-                self.temp.low(Wide::Dac0, a, value).map_err(
-                    |_| "writes DAC0.DATAL while the last DATAL is still waiting for DATAH",
-                )?;
-            }
+            reg::DAC0_CTRLA => self.write_dac_ctrla(value)?,
+            reg::DAC0_DATA => self.write_dac_low(value)?,
             _ if a == reg::DAC0_DATA + 1 => {
                 let data = self.temp.high(Wide::Dac0, reg::DAC0_DATA, value)?;
                 self.set_dac(data >> DAC_SHIFT)?;
             }
             reg::TCB0_CTRLA => self.write_tcb_ctrla(value)?,
-            reg::TCB0_CTRLB => {
-                if value != regs::TCB_CNTMODE_INT {
-                    return Err(only_models(
-                        a,
-                        value,
-                        "periodic interrupt mode with no output",
-                    ));
-                }
-                *self.io_mut(a) = value;
-            }
-            reg::TCB0_INTCTRL => {
-                if value & !TCB_CAPT != 0 {
-                    return Err(only_models(a, value, "CAPT"));
-                }
-                // A flag left up from before fires at once (§24.3.5).
-                if value != 0
-                    && self.io(a) == 0
-                    && self.tcb.capt
-                    && self.since(self.tcb.capt_up_at)? >= self.tcb.period()
-                {
-                    return Err(
-                        "turns TCB0's interrupt on with INTFLAGS.CAPT still up from before, so \
-                         the handler runs at once and counts a period that never was"
-                            .into(),
-                    );
-                }
-                *self.io_mut(a) = value;
-                self.update_enabled();
-            }
-            reg::TCB0_INTFLAGS => {
-                if value & TCB_CAPT != 0 {
-                    self.tcb.capt = false;
-                }
-            }
+            reg::TCB0_CTRLB => self.write_tcb_ctrlb(value)?,
+            reg::TCB0_INTCTRL => self.write_tcb_intctrl(value)?,
+            reg::TCB0_INTFLAGS => self.tcb.capt &= value & TCB_CAPT == 0,
             reg::TCB0_CNT | reg::TCB0_CCMP => self.temp.low(Wide::Tcb0, a, value)?,
             _ if a == reg::TCB0_CNT + 1 => self.write_tcb_high(reg::TCB0_CNT, value)?,
             _ if a == reg::TCB0_CCMP + 1 => self.write_tcb_high(reg::TCB0_CCMP, value)?,
@@ -3274,101 +3430,12 @@ impl Bus for Chip {
                 *self.io_mut(a) = value;
                 self.update_enabled();
             }
-            reg::RTC_PITCTRLA => {
-                if self.pit_busy > 0 {
-                    return Err(format!(
-                        "writes {} while RTC.PITSTATUS.CTRLBUSY is set, which section 26.13.12 \
-                         doesn't allow",
-                        name(a)
-                    ));
-                }
-                if value != PIT_FAST && value != PIT_SLOW {
-                    return Err(only_models(
-                        a,
-                        value,
-                        "the PIT on at 512 cycles, 64 Hz, or 32,768, 1 Hz",
-                    ));
-                }
-                if value == PIT_SLOW && self.enabled_high() {
-                    return Err(
-                        "slows the PIT with PC1 high, so the light's protection runs once a \
-                         second and the tick deadline's sums don't hold"
-                            .into(),
-                    );
-                }
-                let was_on = self.io(a) & RTC_PITEN != 0;
-                let old = self.pit();
-                *self.io_mut(a) = value;
-                let pit = self.pit();
-                if !was_on {
-                    self.pit_next = self.grid.saturating_add(1);
-                } else if pit != old {
-                    self.pit_next = self.pit_phase.first(self.grid, pit);
-                }
-                self.pit_busy = PIT_SYNC_READS;
-            }
-            reg::RTC_PITINTFLAGS => {
-                if value & RTC_PI != 0 {
-                    if self.pit_flag {
-                        self.tick_taken_at = self.now;
-                    }
-                    self.pit_flag = false;
-                }
-            }
-            reg::WDT_CTRLA => {
-                self.take_protected_write(a)?;
-                if self.wdt.pending.is_some() {
-                    return Err("writes WDT.CTRLA while WDT.STATUS.SYNCBUSY is set, which \
-                                the datasheet doesn't allow (section 22.3.6)"
-                        .into());
-                }
-                if value & WDT_PERIOD > WDT_PERIOD_MAX || (value & WDT_WINDOW) >> 4 > WDT_PERIOD_MAX
-                {
-                    return Err(format!(
-                        "writes {value:#04x} to WDT.CTRLA: a reserved WDT period or window"
-                    ));
-                }
-                if value & WDT_PERIOD == 0 {
-                    return Err(format!(
-                        "writes {value:#04x} to WDT.CTRLA, which turns the watchdog off, and \
-                         the firmware never does"
-                    ));
-                }
-                if let Some(fed) = self.wdt.fed_at
-                    && self.now < fed.saturating_add(self.wdt_time(WDR_SYNC_CLOCKS))
-                {
-                    return Err(
-                        "writes WDT.CTRLA within three WDT clocks of a wdr, which may still be \
-                         syncing, and the datasheet doesn't say SYNCBUSY covers that"
-                            .into(),
-                    );
-                }
-                if !self.wdt_on() {
-                    self.wdt.since = self.now;
-                }
-                let synced = self.now.saturating_add(self.wdt_time(WDT_SYNC_CLOCKS));
-                self.wdt.pending = Some((value, synced));
-                self.plan_next_event();
-            }
-            reg::WDT_STATUS => {
-                return Err(if value & WDT_LOCK != 0 {
-                    "sets WDT.STATUS.LOCK, which only debug mode can clear".into()
-                } else {
-                    "writes WDT.STATUS, whose only writable bit is LOCK".into()
-                });
-            }
+            reg::RTC_PITCTRLA => self.write_pit_ctrla(value)?,
+            reg::RTC_PITINTFLAGS => self.write_pit_flags(value),
+            reg::WDT_CTRLA => self.write_wdt_ctrla(value)?,
+            reg::WDT_STATUS => return Err(wdt_status_refused(value)),
             reg::RSTCTRL_RSTFR => self.rstfr &= !value,
-            reg::CRCSCAN_CTRLA => {
-                if value != CRCSCAN_ENABLE {
-                    return Err(only_models(
-                        a,
-                        value,
-                        "ENABLE, with STATUS polled (NMIEN can't be undone without a reset)",
-                    ));
-                }
-                self.start_crc()?;
-                *self.io_mut(a) = value;
-            }
+            reg::CRCSCAN_CTRLA => self.write_crcscan_ctrla(value)?,
             reg::ADC0_COMMAND => match value {
                 0 => {}
                 ADC_STCONV => self.start_conversion()?,
@@ -3383,30 +3450,8 @@ impl Bus for Chip {
             _ if ADC_SETUP.contains(&a) && self.converting() => {
                 return Err(format!("writes {} mid-conversion", name(a)));
             }
-            reg::VREF_ADC0REF => {
-                if value != VREF_REFSEL_1V024 && value != VREF_REFSEL_2V048 {
-                    return Err(only_models(
-                        a,
-                        value,
-                        "1.024 V and 2.048 V, with ALWAYSON clear",
-                    ));
-                }
-                *self.io_mut(a) = value;
-            }
-            reg::ADC0_CTRLA => {
-                if value != 0 && value != ADC_ON {
-                    return Err(only_models(
-                        a,
-                        value,
-                        "it off, or on for single 12-bit conversions",
-                    ));
-                }
-                if value & ADC_ENABLE == 0 {
-                    // The next conversion catches the ADC starting up.
-                    self.adc.last_setup = None;
-                }
-                *self.io_mut(a) = value;
-            }
+            reg::VREF_ADC0REF => self.write_adc_reference(value)?,
+            reg::ADC0_CTRLA => self.write_adc_ctrla(value)?,
             _ if fuse_or_lock(a) => {
                 return Err(format!(
                     "writes {value:#04x} to {}: the firmware never writes the fuses",
