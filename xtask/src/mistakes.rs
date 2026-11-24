@@ -588,7 +588,7 @@ fn a_copy_leaves_out_target_and_git_keeps_modified_times_and_goes_when_its_dropp
         fs::write(from.join(dir).join("hw.rs"), "contents").unwrap();
     }
     let original = from.join("src/avr/hw.rs");
-    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(86_400);
+    let long_ago = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_hours(24);
     let file = File::options().write(true).open(&original).unwrap();
     file.set_modified(long_ago).unwrap();
 

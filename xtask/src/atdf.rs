@@ -215,10 +215,19 @@ impl Consts {
         self.0
             .iter()
             .map(|(name, (value, doc))| {
-                let kind = kind(*value);
-                format!("/// {doc}\npub const {name}: {kind} = {value:#04X};\n")
+                let (kind, value) = (kind(*value), hex(*value));
+                format!("/// {doc}\npub const {name}: {kind} = {value};\n")
             })
             .collect()
+    }
+}
+
+// Six digits and up are grouped, as clippy::unreadable_literal asks.
+fn hex(value: u32) -> String {
+    if value > 0xF_FFFF {
+        format!("0x{:X}_{:04X}", value >> 16, value & 0xFFFF)
+    } else {
+        format!("{value:#04X}")
     }
 }
 
@@ -418,7 +427,7 @@ mod tests {
         for line in [
             "pub const ADC0_RES: usize = 0x610;",
             "pub const TCD_CMPASET: u16 = 0xFFF;",
-            "pub const LOCK_KEY: u32 = 0xFFFFFFFF;",
+            "pub const LOCK_KEY: u32 = 0xFFFF_FFFF;",
             "pub const MAPPED_PROGMEM_END: u32 = 0x10000;",
             "pub const MAPPED_PROGMEM_SIZE: usize = 0x8000;",
             "pub const RTC_PI: u8 = 0x01;",

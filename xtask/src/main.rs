@@ -241,8 +241,7 @@ fn ping(port: &str) -> Result<(), String> {
 fn this_boards_hex(path: &Path) -> Result<(), String> {
     let name = path
         .file_name()
-        .map(|name| name.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
+        .map_or_default(|name| name.to_string_lossy().to_lowercase());
     if name.contains("kr1k") {
         return Ok(());
     }

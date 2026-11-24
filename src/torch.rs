@@ -1669,7 +1669,7 @@ mod tests {
         assert_eq!(torch.health(), Health::Fault, "at the press");
         assert_eq!(torch.aux(), Aux::White);
         run(&mut torch, true, 3);
-        for _ in 0..RELEASE_TICKS + 1 {
+        for _ in 0..=RELEASE_TICKS {
             torch.tick(false);
             assert_eq!(torch.output(), Output::OFF);
         }
