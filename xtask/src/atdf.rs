@@ -49,16 +49,12 @@ impl Element {
     }
 }
 
-#[expect(
-    clippy::option_if_let_else,
-    reason = "a match reads better than map_or_else with two closures"
-)]
 fn num(s: &str) -> Result<u32, String> {
-    let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        Some(hex) => u32::from_str_radix(hex, 16),
-        None => s.parse(),
-    };
-    parsed.map_err(|_| format!("{s:?} isn't a number"))
+    let (digits, radix) = s
+        .strip_prefix("0x")
+        .or_else(|| s.strip_prefix("0X"))
+        .map_or((s, 10), |hex| (hex, 16));
+    u32::from_str_radix(digits, radix).map_err(|_| format!("{s:?} isn't a number"))
 }
 
 fn parse(xml: &str) -> Result<Element, String> {
@@ -602,10 +598,6 @@ mod tests {
 
     /// Each MEMORY region as (name, origin, length), then every hex number
     /// after MEMORY.
-    #[expect(
-        clippy::option_if_let_else,
-        reason = "a match reads better than map_or_else with two closures"
-    )]
     fn linker_script(script: &str) -> (Vec<(String, u32, u32)>, Vec<u32>) {
         let mut text = String::new();
         let mut rest = script;
@@ -633,10 +625,8 @@ mod tests {
                         .and_then(|f| f.trim().strip_prefix('='))
                         .unwrap_or_else(|| panic!("{name} has no {key}"))
                         .trim();
-                    match value.strip_suffix('K') {
-                        Some(k) => num(k).unwrap() * 1024,
-                        None => num(value).unwrap(),
-                    }
+                    let (digits, scale) = value.strip_suffix('K').map_or((value, 1), |k| (k, 1024));
+                    num(digits).unwrap() * scale
                 };
                 (name.to_string(), field("ORIGIN"), field("LENGTH"))
             })
