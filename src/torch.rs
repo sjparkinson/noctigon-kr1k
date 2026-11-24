@@ -82,8 +82,11 @@ impl Torch {
                 if press && self.ui.mode() == Mode::Lockout {
                     self.showing = LOCKED_TICKS;
                 }
-            } else if press {
-                self.showing = SHOW_TICKS;
+            } else {
+                self.ui.handle_unlit(event);
+                if press {
+                    self.showing = SHOW_TICKS;
+                }
             }
         }
         let before = self.limits.health();
@@ -1453,6 +1456,35 @@ mod tests {
     }
 
     #[test]
+    fn three_clicks_lock_a_fault_thats_fading_though_it_is_out_by_the_third() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.voltage = 0;
+        until_fault(&mut torch);
+        run(&mut torch, false, TICKS_PER_SECOND);
+        clicks(&mut torch, 3);
+        assert_eq!(torch.level(), 0);
+        assert_eq!(torch.health(), Health::Fault);
+        run(&mut torch, false, RELEASE_TICKS + 1);
+        assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
+    }
+
+    #[test]
+    fn a_click_a_fault_ignores_still_ends_the_chance_to_lock() {
+        let mut torch = Rig::default();
+        at_the_top(&mut torch);
+        torch.adc.voltage = 0;
+        until_fault(&mut torch);
+        run(&mut torch, false, TICKS_PER_SECOND);
+        click(&mut torch);
+        assert_eq!(torch.level(), 0);
+        click(&mut torch);
+        let mut ui = torch.torch.ui.clone();
+        ui.handle(Event::Click(3));
+        assert_eq!(ui.mode(), Mode::Off);
+    }
+
+    #[test]
     fn heat_lowers_the_light_and_leaves_the_ui_where_it_was() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
@@ -1855,7 +1887,6 @@ mod tests {
         sagging: u8,
         /// The last plausible reading with the light off was under 3.00 V.
         weak: bool,
-        /// The last event handled was the click that put the light out.
         clicked_off: bool,
     }
 
@@ -2090,9 +2121,15 @@ mod tests {
                     if press && model.mode == Mode::Lockout {
                         model.red_until = t + u32::from(LOCKED_TICKS);
                     }
-                } else if press {
-                    model.dark_at = t + u32::from(SHOW_TICKS);
-                    ignored = true;
+                } else {
+                    if model.clicked_off && (model.mode, event) == (Mode::Off, Event::Click(3)) {
+                        model.mode = Mode::Lockout;
+                    }
+                    model.clicked_off = false;
+                    if press {
+                        model.dark_at = t + u32::from(SHOW_TICKS);
+                        ignored = true;
+                    }
                 }
             }
             let voltage = Some(Channel::Voltage);
