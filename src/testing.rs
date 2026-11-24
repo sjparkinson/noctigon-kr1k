@@ -11,14 +11,15 @@
 
 mod examples;
 
-pub use examples::{EXAMPLES, Example, Expect, example};
+#[cfg(test)]
+pub use examples::example;
+pub use examples::{EXAMPLES, Example, Expect};
 
 use core::fmt;
 use core::iter;
 use core::ops::Deref;
 use core::str::FromStr;
 
-use crate::TICKS_PER_SECOND;
 use crate::aw2016::Aw2016;
 use crate::battery;
 use crate::button::{Event, HOLD_TICKS, RELEASE_TICKS};
@@ -28,6 +29,7 @@ use crate::temp::Calibration;
 use crate::thermal;
 use crate::torch::Torch;
 use crate::watchdog::{End, Pacer, Pit, SLOW_TICKS, Wake};
+use crate::{TICKS_PER_SECOND, u32_from};
 
 pub use crate::sensors::FULL_SCALE;
 
@@ -68,8 +70,8 @@ pub fn voltage_reading(cell: u16) -> u16 {
 }
 
 pub fn temperature_reading(kelvin: u16) -> u16 {
-    let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE - raw);
-    FULL_SCALE - closest(kelvin.saturating_mul(16), backwards)
+    let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE.abs_diff(raw));
+    FULL_SCALE.abs_diff(closest(kelvin.saturating_mul(16), backwards))
 }
 
 pub fn celsius_reading(degrees: u8) -> u16 {
@@ -82,9 +84,9 @@ fn closest(target: u16, read: impl Fn(u16) -> u16) -> u16 {
     let first_at_least = |value: u16| {
         let (mut low, mut high) = (0, FULL_SCALE + 1);
         while low < high {
-            let mid = low + (high - low) / 2;
+            let mid = low.midpoint(high);
             if read(mid) < value {
-                low = mid + 1;
+                low = mid.saturating_add(1);
             } else {
                 high = mid;
             }
@@ -92,11 +94,11 @@ fn closest(target: u16, read: impl Fn(u16) -> u16) -> u16 {
         low
     };
     let above = first_at_least(target);
-    if above == 0 {
+    let Some(under) = above.checked_sub(1) else {
         return 0;
-    }
-    let below = read(above - 1);
-    if above > FULL_SCALE || target - below <= read(above) - target {
+    };
+    let below = read(under);
+    if above > FULL_SCALE || target.abs_diff(below) <= read(above).abs_diff(target) {
         first_at_least(below)
     } else {
         above
@@ -198,8 +200,8 @@ impl fmt::Display for Error {
             Self::Kind => "expected C (clicks), H (hold) or wait:",
             Self::TimedClick => "clicks don't take a duration; holds do (1H:2s)",
             Self::ShortHold => {
-                let ms = u32::from(HOLD_TICKS) * 1000 / u32::from(TICKS_PER_SECOND);
-                return write!(f, "that's a click; a hold needs longer than {ms} ms");
+                const MS: u32 = u32_from(HOLD_TICKS) * 1000 / u32_from(TICKS_PER_SECOND);
+                return write!(f, "that's a click; a hold needs longer than {MS} ms");
             }
             Self::Duration => "expected a duration like 500ms, 2s or 1.5s",
             Self::UnderATick => "that's shorter than a tick",
@@ -267,7 +269,7 @@ impl FromStr for Action {
                     return Err(Error::ShortHold);
                 }
                 Ok(Self::Hold {
-                    clicks: count - 1,
+                    clicks: count.checked_sub(1).ok_or(Error::Count)?,
                     ticks,
                 })
             }
@@ -306,14 +308,16 @@ pub fn parse<'a>(
 /// `whole.fraction` times ten to the `places`.
 fn decimal(text: &str, places: u32) -> Option<u32> {
     let (whole, fraction) = text.split_once('.').unwrap_or((text, ""));
-    if fraction.len() > places as usize || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+    let fits = u32::try_from(fraction.len()).is_ok_and(|digits| digits <= places);
+    if !fits || !fraction.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     let mut unit = 10u32.pow(places);
     let mut value = whole.parse::<u32>().ok()?.checked_mul(unit)?;
     for digit in fraction.bytes() {
         unit /= 10;
-        value = value.checked_add(u32::from(digit - b'0') * unit)?;
+        let digit = char::from(digit).to_digit(10)?;
+        value = value.checked_add(digit.checked_mul(unit)?)?;
     }
     Some(value)
 }
@@ -335,8 +339,11 @@ fn ticks(duration: &str) -> Result<u16, Error> {
         None
     };
     let ms = ms.ok_or(Error::Duration)?;
-    let ticks = (u64::from(ms) * u64::from(TICKS_PER_SECOND) + 500) / 1000;
-    match u16::try_from(ticks) {
+    let rounded = u64::from(ms)
+        .checked_mul(u64::from(TICKS_PER_SECOND))
+        .and_then(|scaled| scaled.checked_add(500))
+        .ok_or(Error::TooLong)?;
+    match u16::try_from(rounded / 1000) {
         Ok(0) => Err(Error::UnderATick),
         Ok(ticks) => Ok(ticks),
         Err(_) => Err(Error::TooLong),
@@ -535,18 +542,20 @@ pub enum PitPhase {
 impl PitPhase {
     pub const fn first(self, at: u32, pit: Pit) -> u32 {
         match (self, pit) {
-            (Self::Aligned | Self::Early, Pit::Fast) | (Self::Early, Pit::Slow) => at + 1,
-            (Self::Late, Pit::Fast) => at + 2,
+            (Self::Aligned | Self::Early, Pit::Fast) | (Self::Early, Pit::Slow) => {
+                at.saturating_add(1)
+            }
+            (Self::Late, Pit::Fast) => at.saturating_add(2),
             (Self::Aligned, Pit::Slow) => next_slow(at),
-            (Self::Late, Pit::Slow) => next_slow(at) + SLOW_GRID,
+            (Self::Late, Pit::Slow) => next_slow(at).saturating_add(SLOW_GRID),
         }
     }
 }
 
-const SLOW_GRID: u32 = SLOW_TICKS as u32;
+const SLOW_GRID: u32 = u32_from(SLOW_TICKS);
 
 pub const fn next_slow(at: u32) -> u32 {
-    (at / SLOW_GRID + 1) * SLOW_GRID
+    (at / SLOW_GRID).saturating_add(1).saturating_mul(SLOW_GRID)
 }
 
 /// The firmware's whole loop from `src/main.rs`, one sample per point of the 64 Hz grid.
@@ -588,12 +597,12 @@ impl Paced {
 
     pub fn sample(&mut self, pressed: bool, scene: &Scene) -> Option<End> {
         let at = self.grid;
-        self.grid += 1;
+        self.grid = at.saturating_add(1);
         let moved = pressed != self.pressed;
         self.pressed = pressed;
         let wake = if at == self.next_tick {
             self.next_tick = match self.pit {
-                Pit::Fast => at + 1,
+                Pit::Fast => at.saturating_add(1),
                 Pit::Slow => next_slow(at),
             };
             Wake::Tick
@@ -607,9 +616,10 @@ impl Paced {
 
     /// A switch wake with no switch movement, on the last sample's grid point.
     pub fn bounce(&mut self, scene: &Scene) -> Option<End> {
+        let last = self.grid.checked_sub(1)?;
         self.end
             .switch_wakes
-            .then(|| self.pass(Wake::Switch, self.grid - 1, scene))
+            .then(|| self.pass(Wake::Switch, last, scene))
     }
 
     fn pass(&mut self, wake: Wake, at: u32, scene: &Scene) -> End {
@@ -667,11 +677,20 @@ impl Rng {
 
     /// The top bits, the better end of xorshift's state.
     pub const fn next_u16(&mut self) -> u16 {
-        (self.next_u32() >> 16) as u16
+        let [_, _, low, high] = self.next_u32().to_le_bytes();
+        u16::from_le_bytes([low, high])
     }
 
     pub const fn between(&mut self, low: u16, high: u16) -> u16 {
-        low + self.next_u16() % (high - low + 1)
+        let draw = self.next_u16();
+        let Some(span) = high.abs_diff(low).checked_add(1) else {
+            return draw;
+        };
+        match draw.checked_rem(span) {
+            Some(offset) if low <= high => low.wrapping_add(offset),
+            Some(offset) => high.wrapping_add(offset),
+            None => low,
+        }
     }
 }
 

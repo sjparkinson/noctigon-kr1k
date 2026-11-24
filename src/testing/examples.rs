@@ -29,6 +29,7 @@ pub struct Example {
 }
 
 impl Example {
+    #[expect(clippy::expect_used, reason = "a test parses every script in EXAMPLES")]
     pub fn actions(&self) -> impl Iterator<Item = Action> + use<> {
         parse(self.script.split_whitespace())
             .map(|action| action.expect("every script in EXAMPLES parses"))
@@ -238,6 +239,7 @@ pub const EXAMPLES: &[Example] = &[
 ];
 
 /// The example called `name`.
+#[cfg(test)]
 pub fn example(name: &str) -> &'static Example {
     EXAMPLES
         .iter()
