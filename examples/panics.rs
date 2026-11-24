@@ -17,6 +17,10 @@ mod rt;
 mod panics {
     use crate::hw;
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "the index that can run off the end is the panic the check has to find"
+    )]
     #[allow(unsafe_code)]
     #[unsafe(no_mangle)]
     extern "C" fn main() -> ! {
