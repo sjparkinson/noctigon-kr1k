@@ -333,10 +333,104 @@ impl Twi {
             | self.state)
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one arm per TWI0 register the simulator models"
-    )]
+    fn write_mctrla(&mut self, value: u8) -> Result<(), String> {
+        match value {
+            0 => {
+                if self.stopping.is_some() {
+                    return Err("turns the TWI host off while its STOP is still going out".into());
+                }
+                // Off leaves the bus state unknown again (§29.3.2.2.2).
+                let stranded = u32::from(self.sending.is_some());
+                *self = Self {
+                    fault: self.fault,
+                    aw2016: std::mem::replace(&mut self.aw2016, Aw2016::new()),
+                    baud: self.baud,
+                    sessions: self.sessions,
+                    failures: self.failures.saturating_add(stranded),
+                    ..Self::new()
+                };
+            }
+            TWI_ENABLE => {
+                let ns = |clocks: u32| u64::from(clocks) * 1_000_000_000 / CLK_PER;
+                let scl_hz = CLK_PER
+                    .checked_div(u64::from(self.period()))
+                    .unwrap_or(u64::MAX);
+                // SCL low is by equation 3.2, less the fall time.
+                if scl_hz > SCL_MAX_HZ
+                    || ns(u32::from(self.baud) + 6).saturating_sub(T_OF_MAX_NS) < T_LOW_MIN_NS
+                {
+                    return Err(format!(
+                        "turns the TWI host on with MBAUD {}, an SCL of {} kHz, too quick for \
+                         the AW2016's 400 kHz and 1.3 µs low",
+                        self.baud,
+                        scl_hz / 1000
+                    ));
+                }
+                if !self.on {
+                    self.sessions = self.sessions.saturating_add(1);
+                }
+                self.on = true;
+            }
+            _ => {
+                return Err(format!(
+                    "writes {value:#04x} to TWI0.MCTRLA; the simulator only models the host off, \
+                     or on with no interrupt, smart mode, quick command or time-out"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn write_maddr(&mut self, now: u64, value: u8) -> Result<(), String> {
+        if !self.on {
+            return Err("writes TWI0.MADDR with the host off".into());
+        }
+        if self.sending.is_some() || self.stopping.is_some() {
+            return Err("writes TWI0.MADDR with the bus busy".into());
+        }
+        if self.gave_up {
+            return Err(
+                "addresses the bus again after a NACK or a bus error in the same update, rather \
+                 than giving up"
+                    .into(),
+            );
+        }
+        match self.state {
+            TWI_BUSSTATE_IDLE => {}
+            TWI_BUSSTATE_UNKNOWN => {
+                return Err(
+                    "writes TWI0.MADDR with the bus state unknown: it's forced idle after the \
+                     host's turned on (section 29.3.2.1.1)"
+                        .into(),
+                );
+            }
+            _ => {
+                return Err(
+                    "writes TWI0.MADDR with the bus still owned or busy, a repeated start the \
+                     simulator doesn't model"
+                        .into(),
+                );
+            }
+        }
+        if value & 1 != 0 {
+            return Err(format!(
+                "addresses {:#04x} for a read, which the simulator doesn't model",
+                value >> 1
+            ));
+        }
+        self.clear_flags();
+        self.state = TWI_BUSSTATE_OWNER;
+        self.pointer = None;
+        // A start and nine SCL periods, and nine for a data byte
+        // (§29.3.2.2.3, §29.3.2.2.4).
+        let done = match self.fault {
+            Fault::SclLow => u64::MAX,
+            _ => now.saturating_add(10 * u64::from(self.period())),
+        };
+        self.sending = Some((done, Byte::Address(value)));
+        Ok(())
+    }
+
     pub fn write(&mut self, now: u64, a: usize, value: u8, pc1_high: bool) -> Result<(), String> {
         self.catch_up(now, pc1_high)?;
         match a {
@@ -349,52 +443,7 @@ impl Twi {
                 }
                 self.baud = value;
             }
-            reg::TWI0_MCTRLA => match value {
-                0 => {
-                    if self.stopping.is_some() {
-                        return Err(
-                            "turns the TWI host off while its STOP is still going out".into()
-                        );
-                    }
-                    // Off leaves the bus state unknown again (§29.3.2.2.2).
-                    let stranded = u32::from(self.sending.is_some());
-                    *self = Self {
-                        fault: self.fault,
-                        aw2016: std::mem::replace(&mut self.aw2016, Aw2016::new()),
-                        baud: self.baud,
-                        sessions: self.sessions,
-                        failures: self.failures.saturating_add(stranded),
-                        ..Self::new()
-                    };
-                }
-                TWI_ENABLE => {
-                    let ns = |clocks: u32| u64::from(clocks) * 1_000_000_000 / CLK_PER;
-                    let scl_hz = CLK_PER
-                        .checked_div(u64::from(self.period()))
-                        .unwrap_or(u64::MAX);
-                    // SCL low is by equation 3.2, less the fall time.
-                    if scl_hz > SCL_MAX_HZ
-                        || ns(u32::from(self.baud) + 6).saturating_sub(T_OF_MAX_NS) < T_LOW_MIN_NS
-                    {
-                        return Err(format!(
-                            "turns the TWI host on with MBAUD {}, an SCL of {} kHz, too quick \
-                             for the AW2016's 400 kHz and 1.3 µs low",
-                            self.baud,
-                            scl_hz / 1000
-                        ));
-                    }
-                    if !self.on {
-                        self.sessions = self.sessions.saturating_add(1);
-                    }
-                    self.on = true;
-                }
-                _ => {
-                    return Err(format!(
-                        "writes {value:#04x} to TWI0.MCTRLA; the simulator only models the host \
-                         off, or on with no interrupt, smart mode, quick command or time-out"
-                    ));
-                }
-            },
+            reg::TWI0_MCTRLA => self.write_mctrla(value)?,
             reg::TWI0_MSTATUS => {
                 if !self.on {
                     return Err("writes TWI0.MSTATUS with the host off".into());
@@ -407,54 +456,7 @@ impl Twi {
                 self.arblost &= value & TWI_ARBLOST == 0;
                 self.buserr &= value & TWI_BUSERR == 0;
             }
-            reg::TWI0_MADDR => {
-                if !self.on {
-                    return Err("writes TWI0.MADDR with the host off".into());
-                }
-                if self.sending.is_some() || self.stopping.is_some() {
-                    return Err("writes TWI0.MADDR with the bus busy".into());
-                }
-                if self.gave_up {
-                    return Err(
-                        "addresses the bus again after a NACK or a bus error in the same \
-                         update, rather than giving up"
-                            .into(),
-                    );
-                }
-                match self.state {
-                    TWI_BUSSTATE_IDLE => {}
-                    TWI_BUSSTATE_UNKNOWN => {
-                        return Err(
-                            "writes TWI0.MADDR with the bus state unknown: it's forced idle \
-                             after the host's turned on (section 29.3.2.1.1)"
-                                .into(),
-                        );
-                    }
-                    _ => {
-                        return Err(
-                            "writes TWI0.MADDR with the bus still owned or busy, a repeated \
-                             start the simulator doesn't model"
-                                .into(),
-                        );
-                    }
-                }
-                if value & 1 != 0 {
-                    return Err(format!(
-                        "addresses {:#04x} for a read, which the simulator doesn't model",
-                        value >> 1
-                    ));
-                }
-                self.clear_flags();
-                self.state = TWI_BUSSTATE_OWNER;
-                self.pointer = None;
-                // A start and nine SCL periods, and nine for a data byte
-                // (§29.3.2.2.3, §29.3.2.2.4).
-                let done = match self.fault {
-                    Fault::SclLow => u64::MAX,
-                    _ => now.saturating_add(10 * u64::from(self.period())),
-                };
-                self.sending = Some((done, Byte::Address(value)));
-            }
+            reg::TWI0_MADDR => self.write_maddr(now, value)?,
             reg::TWI0_MDATA => {
                 self.ready("TWI0.MDATA")?;
                 if self.rxack {
