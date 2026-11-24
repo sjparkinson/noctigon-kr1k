@@ -77,7 +77,7 @@ impl Torch {
     ) -> Option<Event> {
         self.showing = self.showing.saturating_sub(1);
         let down = self.switch.sample(pressed);
-        let event = self.clicks.tick_up_to(down, self.ui.most_clicks());
+        let event = self.clicks.tick_counting(down, self.ui.count());
         if let Some(event) = event {
             let press = matches!(event, Event::Click(_) | Event::Hold { ticks: 0, .. });
             if self.limits.health() == Health::Good || self.level() > 0 {
@@ -245,7 +245,7 @@ mod tests {
 
     use super::*;
     use crate::battery;
-    use crate::button::{HOLD_TICKS, RELEASE_TICKS};
+    use crate::button::{GUARD_TICKS, HOLD_TICKS, RELEASE_TICKS};
     use crate::ramp::CEILING;
     use crate::sensors::{Channel, FULL_SCALE};
     use crate::testing::{
@@ -253,7 +253,7 @@ mod tests {
         celsius_reading, example, temperature_reading, voltage_reading,
     };
     use crate::thermal;
-    use crate::ui::{self, Mode, ON_LEVEL};
+    use crate::ui::{self, Mode, ON_LEVEL, TWO_H};
     use std::vec::Vec;
 
     /// The cell's two conversions.
@@ -571,11 +571,17 @@ mod tests {
         panic!("no {event:?}");
     }
 
+    /// Ends on the tick the hold is sent, with the switch still down.
+    fn two_h(torch: &mut Rig) {
+        clicks(torch, 1);
+        let held = (0..2 * HOLD_TICKS).any(|_| torch.tick(true) == Some(TWO_H));
+        assert!(held, "no 2H");
+    }
+
     fn lock(torch: &mut Rig) {
-        tap(torch, 1, Event::Click(1));
-        run(torch, false, RELEASE_TICKS + 1);
-        tap(torch, 3, Event::Click(3));
+        two_h(torch);
         assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
+        run(torch, false, RELEASE_TICKS + 1);
     }
 
     fn shows_for(torch: &mut Rig, aux: Aux, ticks: u16) {
@@ -593,19 +599,16 @@ mod tests {
     }
 
     #[test]
-    fn three_clicks_with_the_light_on_put_it_out_at_the_first_and_lock_it_after_the_third() {
+    fn a_2h_with_the_light_on_puts_it_out_at_the_click_and_locks_it_at_the_hold() {
         let mut torch = Rig::default();
         click(&mut torch);
         run(&mut torch, true, 4);
         torch.tick(false);
         assert_eq!(torch.tick(false), Some(Event::Click(1)), "off, from on");
         assert_eq!(torch.level(), 0);
-        run(&mut torch, false, 2);
-        clicks(&mut torch, 2);
-        assert_eq!(torch.torch.ui.mode(), Mode::Off);
-        assert!(!torch.resting(), "the count's still to come");
-        let event = (0..RELEASE_TICKS).find_map(|_| torch.tick(false));
-        assert_eq!(event, Some(Event::Click(3)));
+        run(&mut torch, false, GUARD_TICKS);
+        let event = (0..2 * HOLD_TICKS).find_map(|_| torch.tick(true));
+        assert_eq!(event, Some(TWO_H));
         assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
         assert_eq!(torch.level(), 0);
     }
@@ -616,59 +619,55 @@ mod tests {
         click(&mut torch);
         run(&mut torch, true, 4);
         run(&mut torch, false, 2);
-        for _ in 0..2 {
-            for pressed in [true, false] {
-                for _ in 0..4 {
-                    torch.tick(pressed);
-                    assert_eq!(torch.torch.ui.output_level(), 0);
-                }
+        for (pressed, ticks) in [
+            (false, 2),
+            (true, 2 * HOLD_TICKS),
+            (false, TICKS_PER_SECOND),
+        ] {
+            for _ in 0..ticks {
+                torch.tick(pressed);
+                assert_eq!(torch.torch.ui.output_level(), 0);
             }
-        }
-        for _ in 0..TICKS_PER_SECOND {
-            torch.tick(false);
-            assert_eq!(torch.torch.ui.output_level(), 0);
         }
         assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
     }
 
     #[test]
-    fn three_clicks_from_off_light_it_at_the_first_and_do_not_lock_it() {
+    fn a_2h_from_off_lights_it_until_the_hold_and_then_locks_it() {
         let mut torch = Rig::default();
         run(&mut torch, true, 4);
         run(&mut torch, false, 4);
         assert_eq!(torch.level(), ON_LEVEL);
-        clicks(&mut torch, 2);
-        run(&mut torch, false, TICKS_PER_SECOND);
-        assert_eq!(torch.level(), ON_LEVEL);
-        assert_eq!(torch.torch.ui.mode(), Mode::On);
+        let event = (0..2 * HOLD_TICKS).find_map(|_| torch.tick(true));
+        assert_eq!(event, Some(TWO_H));
+        assert_eq!(torch.level(), 0);
+        assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
     }
 
     #[test]
-    fn two_or_four_clicks_with_the_light_on_only_put_it_out() {
-        for n in [2, 4, 5] {
+    fn each_click_turns_it_on_or_off_however_quick() {
+        for n in 1..=6u8 {
             let mut torch = Rig::default();
-            click(&mut torch);
             clicks(&mut torch, n);
+            let on = !n.is_multiple_of(2);
+            assert_eq!(torch.level(), if on { ON_LEVEL } else { 0 }, "{n}C");
             run(&mut torch, false, TICKS_PER_SECOND);
-            assert_eq!(torch.torch.ui.mode(), Mode::Off, "{n}C");
-            click(&mut torch);
-            assert_eq!(torch.level(), ON_LEVEL, "{n}C");
+            let mode = if on { Mode::On } else { Mode::Off };
+            assert_eq!(torch.torch.ui.mode(), mode, "{n}C");
         }
     }
 
     #[test]
-    fn a_click_read_twice_turns_it_off_and_leaves_it_off() {
-        for up in 2..=RELEASE_TICKS {
-            for again in 1..=HOLD_TICKS + 8 {
-                let mut torch = Rig::default();
-                click(&mut torch);
-                run(&mut torch, true, 4);
-                run(&mut torch, false, up);
-                run(&mut torch, true, again);
-                run(&mut torch, false, TICKS_PER_SECOND);
-                assert_eq!(torch.level(), 0, "{up} up, then {again} down");
-                assert_eq!(torch.torch.ui.mode(), Mode::Off);
-            }
+    fn a_click_read_twice_inside_the_guard_turns_it_off_and_leaves_it_off() {
+        for again in 1..=3 * HOLD_TICKS {
+            let mut torch = Rig::default();
+            click(&mut torch);
+            run(&mut torch, true, 4);
+            run(&mut torch, false, GUARD_TICKS - 1);
+            run(&mut torch, true, again);
+            run(&mut torch, false, TICKS_PER_SECOND);
+            assert_eq!(torch.level(), 0, "{again} down");
+            assert_eq!(torch.torch.ui.mode(), Mode::Off, "{again} down");
         }
     }
 
@@ -719,15 +718,15 @@ mod tests {
     #[test]
     fn lockout_shows_bright_red_for_five_seconds_after_each_press() {
         let mut torch = Rig::default();
-        lock(&mut torch);
-        assert_eq!(torch.aux(), Aux::Red, "as 3C locks it");
+        two_h(&mut torch);
+        assert_eq!(torch.aux(), Aux::Red, "as 2H locks it");
         shows_for(&mut torch, Aux::Red, LOCKED_TICKS);
         tap(&mut torch, 1, Event::Click(1));
         assert_eq!(torch.aux(), Aux::Red, "a press that does nothing");
         run(&mut torch, false, LOCKED_TICKS);
         assert_eq!(torch.aux(), Aux::Off);
-        tap(&mut torch, 3, Event::Click(3));
-        assert_eq!(torch.aux(), Aux::Blue, "3C unlocks it");
+        two_h(&mut torch);
+        assert_eq!(torch.aux(), Aux::Blue, "2H unlocks it");
     }
 
     #[test]
@@ -952,7 +951,7 @@ mod tests {
         }
         torch.tick(false);
         assert_eq!(torch.aux(), Aux::Off);
-        tap(&mut torch, 3, Event::Click(3));
+        two_h(&mut torch);
         run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.torch.ui.mode(), Mode::Off);
         assert_eq!(torch.aux(), Aux::Off);
@@ -1218,7 +1217,7 @@ mod tests {
         lock(&mut torch);
         torch.adc.voltage = voltage_reading(battery::LIGHT_FROM - 1);
         run(&mut torch, false, LOCKED_TICKS);
-        clicks(&mut torch, 3);
+        two_h(&mut torch);
         run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.torch.ui.mode(), Mode::Off);
         assert_eq!(torch.health(), Health::Good);
@@ -1459,21 +1458,21 @@ mod tests {
     }
 
     #[test]
-    fn three_clicks_lock_a_fault_thats_fading_though_it_is_out_by_the_third() {
+    fn a_2h_locks_a_fault_thats_fading_though_the_click_puts_it_out() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
         until_fault(&mut torch);
         run(&mut torch, false, TICKS_PER_SECOND);
-        clicks(&mut torch, 3);
+        assert!(torch.level() > 0, "still fading");
+        two_h(&mut torch);
         assert_eq!(torch.level(), 0);
         assert_eq!(torch.health(), Health::Fault);
-        run(&mut torch, false, RELEASE_TICKS + 1);
         assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
     }
 
     #[test]
-    fn a_click_a_fault_ignores_still_ends_the_chance_to_lock() {
+    fn a_2h_locks_a_fault_that_ignores_clicks() {
         let mut torch = Rig::default();
         at_the_top(&mut torch);
         torch.adc.voltage = 0;
@@ -1482,9 +1481,9 @@ mod tests {
         click(&mut torch);
         assert_eq!(torch.level(), 0);
         click(&mut torch);
-        let mut ui = torch.torch.ui.clone();
-        ui.handle(Event::Click(3));
-        assert_eq!(ui.mode(), Mode::Off);
+        assert_eq!(torch.torch.ui.mode(), Mode::Off);
+        two_h(&mut torch);
+        assert_eq!(torch.torch.ui.mode(), Mode::Lockout);
     }
 
     #[test]
@@ -1868,10 +1867,6 @@ mod tests {
     }
 
     #[derive(Debug)]
-    #[expect(
-        clippy::struct_excessive_bools,
-        reason = "the model tracks independent facts, the same way the torch does"
-    )]
     struct Model {
         mode: Mode,
         asked: u8,
@@ -1890,7 +1885,6 @@ mod tests {
         sagging: u8,
         /// The last plausible reading with the light off was under 3.00 V.
         weak: bool,
-        clicked_off: bool,
     }
 
     impl Model {
@@ -1926,9 +1920,8 @@ mod tests {
 
     impl Model {
         fn handle(&mut self, event: Event) {
-            let clicked_off = self.clicked_off;
-            self.clicked_off = (self.mode, event) == (Mode::On, Event::Click(1));
             match (self.mode, event) {
+                (Mode::Off | Mode::On, TWO_H) => self.mode = Mode::Lockout,
                 (Mode::Off, Event::Click(1)) => {
                     self.mode = Mode::On;
                     self.asked = ON_LEVEL;
@@ -1945,8 +1938,7 @@ mod tests {
                     self.asked = ui::FLOOR;
                     self.up = false;
                 }
-                (Mode::Off, Event::Click(3)) if clicked_off => self.mode = Mode::Lockout,
-                (Mode::Lockout, Event::Click(3)) | (Mode::On, Event::Click(1)) => {
+                (Mode::Lockout, TWO_H) | (Mode::On, Event::Click(1)) => {
                     self.mode = Mode::Off;
                 }
                 (Mode::On, Event::Hold { clicks: 0, ticks }) => {
@@ -2038,7 +2030,6 @@ mod tests {
             lit_for: 0,
             sagging: 0,
             weak: false,
-            clicked_off: false,
         };
         let start_up = pace == Pace::Slow && rng.next_u16().is_multiple_of(2);
         let (mut pressed, mut switch_left) = (start_up, 0);
@@ -2125,10 +2116,9 @@ mod tests {
                         model.red_until = t + u32::from(LOCKED_TICKS);
                     }
                 } else {
-                    if model.clicked_off && (model.mode, event) == (Mode::Off, Event::Click(3)) {
+                    if matches!(model.mode, Mode::Off | Mode::On) && event == TWO_H {
                         model.mode = Mode::Lockout;
                     }
-                    model.clicked_off = false;
                     if press {
                         model.dark_at = t + u32::from(SHOW_TICKS);
                         ignored = true;
@@ -2212,6 +2202,7 @@ mod tests {
             check!(t, !failed || level == 0, "lit after a failed check");
             let moved = level.abs_diff(level_before);
             let click = event == Some(Event::Click(1));
+            let locked = event == Some(TWO_H);
             let held = event
                 == Some(Event::Hold {
                     clicks: 0,
@@ -2230,8 +2221,8 @@ mod tests {
             } else if level_before > 0 && level == 0 {
                 check!(
                     t,
-                    click || health != Health::Good,
-                    "went out with nothing wrong and no click"
+                    click || locked || health != Health::Good,
+                    "went out with nothing wrong and no click or 2H"
                 );
             } else {
                 check!(t, moved <= 1, "{level_before} to {level}");
@@ -2272,7 +2263,7 @@ mod tests {
                 if level > 0 {
                     check!(t, moved == 1, "{level_before} to {level}");
                 } else if level_before > 0 {
-                    let out = click || level_before == 1 || !vddio2 || collapsed;
+                    let out = click || locked || level_before == 1 || !vddio2 || collapsed;
                     check!(t, out, "out from {level_before}");
                     seen.clicked_off_mid_fade += u32::from(click);
                 }
@@ -2284,7 +2275,7 @@ mod tests {
             let expected = match (health, model.mode) {
                 _ if level > 0 => Aux::Off,
                 (Health::Good, Mode::Off) if !model.cell_low => Aux::Blue,
-                (Health::Good, Mode::Lockout) if t < model.red_until => Aux::Red,
+                (Health::Good, Mode::Lockout) if t < model.red_until || showing => Aux::Red,
                 (Health::Flat, _) if showing => Aux::Yellow,
                 (Health::Fault, _) if showing => Aux::White,
                 _ => Aux::Off,

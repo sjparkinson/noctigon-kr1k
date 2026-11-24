@@ -68,9 +68,9 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** A press on the switch under pressure.
 
-**Cover.** 3C with the light on puts it out at the first click and locks it, and 3C in lockout unlocks it to off. In lockout `ui::Ui` never lights, and four presses are a 4C, which does nothing.
+**Cover.** 2H locks it from off or on, and the light is out by the time the hold counts. 2H in lockout unlocks it to off. In lockout `ui::Ui` never lights, and quick clicks count as one, so a press before the 2H makes a 3H, which does nothing.
 
-**Unproven.** Unlocking has been seen on this torch, and locking with the light on hasn't. A torch that's off only locks by lighting it first. Unlocked, a click lights it as it's let go, and so does a press held past `button::HOLD_TICKS`, which lights `ui::FLOOR`. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
+**Unproven.** Simulator only, since neither locking nor unlocking with 2H has been seen on this torch. A 2H from off lights it at `ui::ON_LEVEL` until the hold counts. Unlocked, a click lights it as it's let go, and so does a press held past `button::HOLD_TICKS`, which lights `ui::FLOOR`. A tap and then a long press, which a pocket can make, unlocks it, though only to off. A cell swap unlocks it, and nothing limits how long a lit light stays lit.
 
 ### H9. Corrupt or half-written flash
 
@@ -140,9 +140,9 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** Dirt, a pressed-in tail cap or a jammed button.
 
-**Cover.** `ui::Ui` bounds every hold. Locked, a hold does nothing. Off, 1H lights `ui::FLOOR` and the rest of that hold moves nothing. Lit, 1H stops at `ramp::CEILING` or `ui::FLOOR`.
+**Cover.** `ui::Ui` bounds every hold. Locked, a hold does nothing, and 2H unlocks it to off. Off, 1H lights `ui::FLOOR` and the rest of that hold moves nothing. Lit, 1H stops at `ramp::CEILING` or `ui::FLOOR`.
 
-**Unproven.** Seen, for ordinary holds while lit. 1H from off and a stuck switch are simulator only. A stuck switch lights the floor from off or from power-on and stays there, does nothing if it sticks within `button::RELEASE_TICKS` of a click that acted, can leave a lit light at the level it reached, and keeps the tick at 64 Hz. What the floor draws is unmeasured.
+**Unproven.** Seen, for ordinary holds while lit. 1H from off and a stuck switch are simulator only. A stuck switch lights the floor from off or from power-on and stays there, does nothing if it sticks within `button::GUARD_TICKS` of a click that acted, locks it or unlocks it to off if it sticks within `button::RELEASE_TICKS` of a click, can leave a lit light at the level it reached, and keeps the tick at 64 Hz. What the floor draws is unmeasured.
 
 ### H18. A wrong clock
 
@@ -164,9 +164,9 @@ Each way found so far that this torch could hurt someone or itself, what covers 
 
 **Hazard.** A switch that chatters, or that actuates twice on one press. Lit, a 1C then reads as off and on again, at `ui::ON_LEVEL` whatever the level was.
 
-**Cover.** `button::Debounce` counts a change of the switch once two samples in a row show it. After a click that acts as it's let go, `button::Clicks` ignores the switch until it has been up for `button::RELEASE_TICKS`.
+**Cover.** `button::Debounce` counts a change of the switch once two samples in a row show it. After a click that acts as it's let go, `button::Clicks` ignores a press that starts before the switch has been up for `button::GUARD_TICKS`, however long it's held.
 
-**Unproven.** Simulator only. Seen without the cover, at `ui::FLOOR` on 2026-11-18, and not reproduced since, so which of the two it was is unknown. How long this switch bounces is unmeasured, and chatter longer than a sample can still end a hold or split a click from off into two. The first two samples after a switch wake can be less than a tick apart, so a short glitch at rest can still count as a press.
+**Unproven.** Simulator only. Seen without the cover, at `ui::FLOOR` on 2026-11-18, and not reproduced since, so which of the two it was is unknown. `button::GUARD_TICKS` is a guess, since how long this switch bounces is unmeasured. Chatter that outlasts the guard is a second click, or a 2H if it's held, and chatter longer than a sample can still end a hold. The first two samples after a switch wake can be less than a tick apart, so a short glitch at rest can still count as a press.
 
 ## What's left
 
