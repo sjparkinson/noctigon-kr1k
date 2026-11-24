@@ -374,7 +374,7 @@ mod tests {
                 let mut asleep = 0;
                 for _ in 0..10 * TICKS_PER_SECOND {
                     let pass = paced.sample(false, &Scene::NORMAL);
-                    let slept = pass.is_none() && paced.end.switch_wakes;
+                    let slept = pass.is_none() && paced.end.sleep == watchdog::Sleep::SwitchWakes;
                     asleep = if slept { asleep + 1 } else { 0 };
                     if asleep == 5 {
                         break;

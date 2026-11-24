@@ -20,6 +20,7 @@ mod rt;
 mod guards {
     use crate::hw;
     use kr1k::ramp::{self, Output};
+    use kr1k::watchdog::Sleep;
 
     /// `sim::guards` counts on this.
     const LIT_TICKS: u8 = 4;
@@ -30,17 +31,17 @@ mod guards {
         hw::hold_enable_low();
         hw::init();
         hw::set_output(Output::STARTING);
-        if hw::wait_for_tick(false, false).is_none() {
+        if hw::wait_for_tick(Sleep::Idle).is_none() {
             hw::halt();
         }
         hw::set_output(ramp::output(ramp::CEILING));
         for _ in 0..LIT_TICKS {
-            if hw::wait_for_tick(true, false).is_none() {
+            if hw::wait_for_tick(Sleep::PowerDown).is_none() {
                 hw::halt();
             }
         }
         hw::set_output(Output::OFF);
-        if hw::wait_for_tick(true, false).is_none() {
+        if hw::wait_for_tick(Sleep::PowerDown).is_none() {
             hw::halt();
         }
         guards_done()

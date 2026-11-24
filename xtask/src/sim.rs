@@ -24,8 +24,8 @@ use kr1k::sensors::{CYCLE_TICKS, Channel};
 use kr1k::testing::{self, Action, AdcFault, EXAMPLES, Example, Paced, PitPhase, Sample, Scene};
 use kr1k::ui::Aux;
 use kr1k::watchdog::{
-    CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, TICK_DEADLINE_PERIODS,
-    TIMER_PERIOD_CLOCKS,
+    CLOCK_HZ, CLOSED_CLOCKS, End, FEED_TICKS, OPEN_CLOCKS, Pit, SYNC_CLOCKS, Sleep,
+    TICK_DEADLINE_PERIODS, TIMER_PERIOD_CLOCKS,
 };
 
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_call, is_two_words, ldi, ldi_operands};
@@ -938,7 +938,7 @@ fn pass_ends_agree(
             sim.chip.pit()
         ));
     }
-    let power_down = ends.last().is_some_and(|end| end.power_down);
+    let power_down = ends.last().is_some_and(|end| end.sleep != Sleep::Idle);
     if powered_down != power_down {
         return Err(format!(
             "the library says {}, but the firmware {}",

@@ -45,7 +45,7 @@ extern "C" fn main() -> ! {
 
     loop {
         // Most likely a stopped 32 kHz oscillator with the light on.
-        let Some(wake) = hw::wait_for_tick(end.power_down, end.switch_wakes) else {
+        let Some(wake) = hw::wait_for_tick(end.sleep) else {
             hw::halt();
         };
 
