@@ -7,6 +7,7 @@ mod avr;
 mod crc;
 mod elf;
 mod ihex;
+mod int;
 mod layout;
 #[cfg(test)]
 mod lints;
@@ -94,8 +95,7 @@ fn main() -> ExitCode {
 fn root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .expect("xtask has a parent directory")
-        .to_path_buf()
+        .map_or_default(Path::to_path_buf)
 }
 
 fn cargo() -> String {
@@ -167,6 +167,7 @@ fn probe_sections(elf: &elf::Elf) -> Result<(), String> {
 }
 
 fn hex() -> Result<(), String> {
+    const FLASH_SIZE: u64 = int::u64_from_usize(map::FLASH_SIZE);
     let (elf, sim) = build()?;
     let firmware = elf.flash_image();
     let image = crc::sign(&firmware, &stamp::current(&root()))?;
@@ -174,14 +175,14 @@ fn hex() -> Result<(), String> {
     eprintln!("wrote {HEX}");
     println!("stamp {}", stamp::read(&image).unwrap_or_default());
 
-    let flash = firmware.len() as u64;
+    let flash = int::u64_from_usize(firmware.len());
     let ram = elf.ram_bytes().into();
     let ram_size = (elf::RAM.end - elf::RAM.start).into();
     let (tick, handler) = (Some(sim::TICK_BUDGET), Some(sim::HANDLER_BUDGET));
     let per_tick = "instructions per 64 Hz tick";
     let per_handler = "instructions per handler, against a TCB0 period";
     for (label, used, of, unit) in [
-        ("flash", flash, Some(map::FLASH_SIZE as u64), "bytes"),
+        ("flash", flash, Some(FLASH_SIZE), "bytes"),
         ("ram", ram, Some(ram_size), "bytes"),
         ("stack", sim.stack.into(), None, "bytes"),
         ("loop", sim.loop_instructions, tick, per_tick),
@@ -197,7 +198,10 @@ fn row(label: &str, used: u64, of: Option<u64>, unit: &str) -> String {
     let (of, percent) = match of {
         Some(of) => (
             format!("/ {:>6}", commas(of)),
-            format!("{:>3}%", used * 100 / of),
+            format!(
+                "{:>3}%",
+                used.saturating_mul(100).checked_div(of).unwrap_or(0)
+            ),
         ),
         None => (String::new(), String::new()),
     };
@@ -211,7 +215,7 @@ fn commas(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::new();
     for (i, digit) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && digits.len().abs_diff(i) % 3 == 0 {
             out.push(',');
         }
         out.push(digit);
