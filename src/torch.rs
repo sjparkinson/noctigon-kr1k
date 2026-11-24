@@ -50,6 +50,7 @@ pub struct Torch {
 }
 
 impl Torch {
+    #[must_use]
     pub const fn new(calibration: Calibration, faults: Faults) -> Self {
         Self {
             switch: Debounce::new(),
@@ -136,11 +137,13 @@ impl Torch {
     }
 
     /// The firmware powers down between ticks while this holds.
+    #[must_use]
     pub const fn resting(&self) -> bool {
         self.quiet() && !self.checking
     }
 
     /// How many resting ticks in a row would change nothing but counters.
+    #[must_use]
     pub const fn quiet_for(&self) -> Option<u16> {
         if !self.resting() || self.showing > 0 || !self.clicks.idle() {
             None
@@ -151,12 +154,17 @@ impl Torch {
         }
     }
 
+    #[must_use]
     pub fn can_slow(&self) -> bool {
         self.quiet_for()
             .is_some_and(|ticks| ticks > watchdog::SLOW_TICKS)
     }
 
     pub fn rest_for(&mut self, ticks: u16) {
+        #[expect(
+            clippy::option_if_let_else,
+            reason = "map_or here costs the firmware 8 more instructions a tick on AVR"
+        )]
         let ticks = match self.quiet_for() {
             Some(quiet) => ticks.min(quiet),
             None => 0,
@@ -168,20 +176,24 @@ impl Torch {
         self.check_in = self.check_in.saturating_sub(ticks);
     }
 
+    #[must_use]
     pub const fn level(&self) -> u8 {
         self.limits.level()
     }
 
+    #[must_use]
     pub const fn health(&self) -> Health {
         self.limits.health()
     }
 
+    #[must_use]
     pub const fn convert(&self) -> Option<Convert> {
         self.limits.convert()
     }
 
     /// PC1 up with the DAC at 0 for a tick first is the stock firmware's
     /// order. Whether the other order would be safer is unknown.
+    #[must_use]
     pub fn output(&self) -> Output {
         match self.level() {
             0 => Output::OFF,
@@ -190,6 +202,7 @@ impl Torch {
         }
     }
 
+    #[must_use]
     pub const fn aux(&self) -> Aux {
         match self.limits.health() {
             Health::Good => match self.ui.aux() {
@@ -210,6 +223,7 @@ pub struct Changes<T> {
 }
 
 impl<T: Copy + PartialEq> Changes<T> {
+    #[must_use]
     pub const fn new() -> Self {
         Self { last: None }
     }
@@ -1823,6 +1837,10 @@ mod tests {
     }
 
     #[derive(Debug)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "the model tracks independent facts, the same way the torch does"
+    )]
     struct Model {
         mode: Mode,
         asked: u8,
@@ -1903,9 +1921,10 @@ mod tests {
                 }
                 (Mode::On, Event::Hold { clicks: 0, ticks }) => {
                     self.up ^= ticks == 0;
-                    self.asked = match self.up {
-                        true => (self.asked + 1).min(CEILING),
-                        false => (self.asked - 1).max(ui::FLOOR),
+                    self.asked = if self.up {
+                        (self.asked + 1).min(CEILING)
+                    } else {
+                        (self.asked - 1).max(ui::FLOOR)
                     };
                 }
                 _ => {}
@@ -1956,6 +1975,11 @@ mod tests {
     }
 
     /// `supply` is its own generator so VDDIO2 doesn't reshuffle the rest.
+    #[expect(
+        clippy::too_many_lines,
+        clippy::similar_names,
+        reason = "one walk of the torch beside its model, tick by tick, whose names pair up"
+    )]
     fn live(
         rng: &mut Rng,
         supply: &mut Rng,
@@ -2274,9 +2298,10 @@ mod tests {
                     seen.charged_at_a_check += 1;
                 }
             }
-            model.check_in = match resting {
-                true => model.check_in.saturating_sub(1),
-                false => CHECK_TICKS,
+            model.check_in = if resting {
+                model.check_in.saturating_sub(1)
+            } else {
+                CHECK_TICKS
             };
             if resting_before && pressed {
                 check!(t, rig.convert().is_some(), "a press that reads nothing");
@@ -2321,6 +2346,10 @@ mod tests {
         ticks
     }
 
+    #[expect(
+        clippy::similar_names,
+        reason = "the seed it starts from and what it has seen"
+    )]
     fn throw_noise_at_torches(seed: u32, pace: Pace, ticks: u32, seen: &mut Seen) {
         let mut rng = Rng::new(seed);
         let mut supply = Rng::new(seed ^ 0x00AA_0000);

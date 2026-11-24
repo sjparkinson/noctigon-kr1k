@@ -60,7 +60,7 @@ pub const EACH_FAULT: [Faults; 4] = [
     },
 ];
 
-/// Worst in-spec offset error, 5 LSb a conversion over four (DS40002413B table 38-24).
+/// Worst in-spec offset error, 5 `LSb` a conversion over four (DS40002413B table 38-24).
 pub const GROUND_READING: u16 = 4 * 5;
 pub const CELL_READING: u16 = 6140;
 pub const ROOM_READING: u16 = 8603;
@@ -69,11 +69,13 @@ pub fn voltage_reading(cell: u16) -> u16 {
     closest(cell, battery::centivolts)
 }
 
+#[must_use]
 pub fn temperature_reading(kelvin: u16) -> u16 {
     let backwards = |raw: u16| CALIBRATION.sixteenths(FULL_SCALE.abs_diff(raw));
     FULL_SCALE.abs_diff(closest(kelvin.saturating_mul(16), backwards))
 }
 
+#[must_use]
 pub fn celsius_reading(degrees: u8) -> u16 {
     temperature_reading(thermal::celsius(degrees))
 }
@@ -122,6 +124,7 @@ impl Default for Adc {
 
 impl Adc {
     /// 3.8 V and 25 °C.
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             voltage: CELL_READING,
@@ -330,6 +333,10 @@ fn centivolts(volts: &str) -> Result<u16, Error> {
         .ok_or(Error::Voltage)
 }
 
+#[expect(
+    clippy::option_if_let_else,
+    reason = "two suffixes to try in turn read better as if let than as nested map_or_else"
+)]
 fn ticks(duration: &str) -> Result<u16, Error> {
     let ms = if let Some(ms) = duration.strip_suffix("ms") {
         ms.parse().ok()
@@ -351,6 +358,10 @@ fn ticks(duration: &str) -> Result<u16, Error> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each is a script word that sets one thing in the scene, in any combination"
+)]
 pub struct Scene {
     /// Centivolts.
     pub cell: u16,
@@ -376,6 +387,7 @@ impl Scene {
         adc_stuck: None,
     };
 
+    #[must_use]
     pub const fn faults(&self) -> Faults {
         Faults {
             fuses: self.fault,
@@ -385,6 +397,7 @@ impl Scene {
         }
     }
 
+    #[must_use]
     pub fn reading(&self, channel: Channel) -> u16 {
         if let Some(raw) = self.adc_stuck {
             return raw;
@@ -474,6 +487,7 @@ impl Default for Rig {
 }
 
 impl Rig {
+    #[must_use]
     pub const fn new(faults: Faults) -> Self {
         Self {
             torch: Torch::new(CALIBRATION, faults),
@@ -540,6 +554,7 @@ pub enum PitPhase {
 }
 
 impl PitPhase {
+    #[must_use]
     pub const fn first(self, at: u32, pit: Pit) -> u32 {
         match (self, pit) {
             (Self::Aligned | Self::Early, Pit::Fast) | (Self::Early, Pit::Slow) => {
@@ -554,6 +569,7 @@ impl PitPhase {
 
 const SLOW_GRID: u32 = u32_from(SLOW_TICKS);
 
+#[must_use]
 pub const fn next_slow(at: u32) -> u32 {
     (at / SLOW_GRID).saturating_add(1).saturating_mul(SLOW_GRID)
 }
@@ -575,6 +591,7 @@ pub struct Paced {
 }
 
 impl Paced {
+    #[must_use]
     pub const fn new(faults: Faults, grid: u32) -> Self {
         let rig = Rig::new(faults);
         Self {
@@ -591,6 +608,7 @@ impl Paced {
         }
     }
 
+    #[must_use]
     pub const fn pit(&self) -> Pit {
         self.pit
     }
@@ -664,6 +682,7 @@ impl Deref for Paced {
 pub struct Rng(u32);
 
 impl Rng {
+    #[must_use]
     pub const fn new(seed: u32) -> Self {
         Self(if seed == 0 { 1 } else { seed })
     }

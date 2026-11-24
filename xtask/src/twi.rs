@@ -20,7 +20,7 @@ const T_LOW_MIN_NS: u64 = 1300;
 /// The longest fall time table 38-22 allows at 400 kHz.
 const T_OF_MAX_NS: u64 = 250;
 /// Main clocks after CHIPEN rises before registers past GCR1 take a write.
-/// Likely, from PebbleOS's driver. The datasheet gives no wait.
+/// Likely, from `PebbleOS`'s driver. The datasheet gives no wait.
 pub const WAKE_CLOCKS: u64 = CLK_PER / 1000;
 
 /// Besides RSTR and GCR1.
@@ -198,6 +198,10 @@ impl Aw2016 {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "TWI0's status bits, which the datasheet keeps separate"
+)]
 pub struct Twi {
     pub fault: Fault,
     pub aw2016: Aw2016,
@@ -214,6 +218,7 @@ pub struct Twi {
     stopping: Option<u64>,
     /// `Some` once the address is acknowledged, and `Some(Some(_))` once the
     /// first byte has set the register pointer ("Write Cycle").
+    #[expect(clippy::option_option, reason = "the three states the doc above names")]
     pointer: Option<Option<u8>>,
     gave_up: bool,
     /// Times the host's been turned on.
@@ -328,6 +333,10 @@ impl Twi {
             | self.state)
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per TWI0 register the simulator models"
+    )]
     pub fn write(&mut self, now: u64, a: usize, value: u8, pc1_high: bool) -> Result<(), String> {
         self.catch_up(now, pc1_high)?;
         match a {

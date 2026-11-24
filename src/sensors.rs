@@ -38,7 +38,7 @@ const GROUND_AT: u8 = TEMPERATURE_AT + READING_STEP + 1;
 
 const _: () = assert!(GROUND_AT + READING_STEP < CYCLE_TICKS);
 
-/// In counts of four accumulated conversions. Three times the ±5 LSb offset
+/// In counts of four accumulated conversions. Three times the ±5 `LSb` offset
 /// error in DS40002413B table 38-24, since figure 39-112 has it growing as
 /// the reference falls. Unmeasured.
 pub const GROUND_MAX: u16 = 64;
@@ -54,6 +54,7 @@ pub struct Ground {
 }
 
 impl Ground {
+    #[must_use]
     pub const fn new() -> Self {
         Self { misses: 0 }
     }
@@ -91,6 +92,7 @@ pub struct Schedule {
 }
 
 impl Schedule {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             phase: 0,

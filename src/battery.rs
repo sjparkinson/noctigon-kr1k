@@ -43,6 +43,7 @@ const _: () = {
     reason = "reading is at most FULL_SCALE here, and the asserts on HIGH and LOW bound \
               every step for that"
 )]
+#[must_use]
 pub const fn centivolts(reading: u16) -> u16 {
     if reading > FULL_SCALE {
         return u16::MAX;
@@ -117,6 +118,7 @@ pub const FORGET_TICKS: u16 = TICKS_PER_SECOND * 60 * 5;
 /// drag a dying cell far below anything sensible. Unmeasured.
 pub const PLAUSIBLE: core::ops::RangeInclusive<u16> = 100..=440;
 
+#[must_use]
 pub fn plausible(centivolts: u16) -> bool {
     PLAUSIBLE.contains(&centivolts)
 }
@@ -167,6 +169,7 @@ impl Default for Protection {
 }
 
 impl Protection {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             filtered: 0,
@@ -182,10 +185,12 @@ impl Protection {
         }
     }
 
+    #[must_use]
     pub const fn ceiling(&self) -> u8 {
         self.ceiling.level()
     }
 
+    #[must_use]
     pub const fn flat(&self) -> bool {
         self.flat
     }
@@ -223,6 +228,7 @@ impl Protection {
         }
     }
 
+    #[must_use]
     pub const fn centivolts(&self) -> Option<u16> {
         match self.filtered {
             0 => None,
@@ -301,9 +307,10 @@ impl Protection {
             (self.low_samples, self.flat_samples) = (0, 0);
             return Verdict::Ceiling(ceiling);
         }
-        self.low_samples = match voltage < STEP_DOWN_BELOW {
-            true => self.low_samples.saturating_add(1),
-            false => 0,
+        self.low_samples = if voltage < STEP_DOWN_BELOW {
+            self.low_samples.saturating_add(1)
+        } else {
+            0
         };
         self.flat_samples = match voltage < OFF_BELOW {
             true if level > ceiling => 0,
@@ -912,6 +919,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::similar_names, reason = "the names pair up on purpose")]
     fn every_reading_twice_running_is_a_collapse_only_under_the_floor() {
         let mut collapses = 0_u32;
         for raw in 0..=FULL_SCALE {

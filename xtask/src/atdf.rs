@@ -5,6 +5,7 @@
 //! the tests may name `crate::` or `kr1k::`.
 
 use std::collections::BTreeMap;
+use std::fmt::Write;
 
 struct Element {
     name: String,
@@ -48,6 +49,10 @@ impl Element {
     }
 }
 
+#[expect(
+    clippy::option_if_let_else,
+    reason = "a match reads better than map_or_else with two closures"
+)]
 fn num(s: &str) -> Result<u32, String> {
     let parsed = match s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         Some(hex) => u32::from_str_radix(hex, 16),
@@ -107,10 +112,7 @@ fn parse(xml: &str) -> Result<Element, String> {
                 .ok_or("unterminated start tag")?;
             let tag = &rest[1..end];
             rest = chars.as_str();
-            let (tag, empty) = match tag.strip_suffix('/') {
-                Some(t) => (t, true),
-                None => (tag, false),
-            };
+            let (tag, empty) = tag.strip_suffix('/').map_or((tag, false), |t| (t, true));
             let element = parse_tag(tag)?;
             if empty {
                 stack
@@ -209,6 +211,10 @@ fn registers(document: &Element) -> Result<Vec<Register<'_>>, String> {
 struct Consts(BTreeMap<String, (u32, String)>);
 
 impl Consts {
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "doc moves into the map when the name is new"
+    )]
     fn add(&mut self, name: String, value: u32, doc: String) {
         let name = name.to_ascii_uppercase();
         if let Some((theirs, first)) = self.0.get(&name) {
@@ -224,11 +230,11 @@ impl Consts {
     fn render(&self, kind: fn(u32) -> &'static str) -> String {
         self.0
             .iter()
-            .map(|(name, (value, doc))| {
+            .fold(String::new(), |mut out, (name, (value, doc))| {
                 let (kind, value) = (kind(*value), hex(*value));
-                format!("/// {doc}\npub const {name}: {kind} = {value};\n")
+                let _ = writeln!(out, "/// {doc}\npub const {name}: {kind} = {value};");
+                out
             })
-            .collect()
     }
 }
 
@@ -249,10 +255,10 @@ fn doc(path: String, element: &Element) -> String {
 }
 
 fn names(name: &str, rows: &[(u32, String)]) -> String {
-    let rows: String = rows
-        .iter()
-        .map(|(value, name)| format!("    ({value:#04X}, \"{name}\"),\n"))
-        .collect();
+    let rows = rows.iter().fold(String::new(), |mut out, (value, name)| {
+        let _ = writeln!(out, "    ({value:#04X}, \"{name}\"),");
+        out
+    });
     format!(
         "#[cfg(any(test, feature = \"testing\"))]\n\
          pub const {name}: &[(usize, &str)] = &[\n{rows}];\n"
@@ -261,6 +267,10 @@ fn names(name: &str, rows: &[(u32, String)]) -> String {
 
 /// The ATDF's `initval`s stay out on purpose, because they disagree with the
 /// datasheet on ADC0.CALIB and the factory OSCCFG and SYSCFG0.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one pass over the ATDF, in the order regs.rs is laid out"
+)]
 pub fn generate(xml: &str) -> Result<String, String> {
     let document = parse(xml)?;
     let file = document.child("avr-tools-device-file")?;
@@ -577,6 +587,10 @@ mod tests {
 
     /// Each MEMORY region as (name, origin, length), then every hex number
     /// after MEMORY.
+    #[expect(
+        clippy::option_if_let_else,
+        reason = "a match reads better than map_or_else with two closures"
+    )]
     fn linker_script(script: &str) -> (Vec<(String, u32, u32)>, Vec<u32>) {
         let mut text = String::new();
         let mut rest = script;

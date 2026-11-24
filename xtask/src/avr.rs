@@ -1,5 +1,10 @@
-//! The AVRxt CPU the simulator runs firmware on, from DS40002198's AVRxt column
+//! The `AVRxt` CPU the simulator runs firmware on, from DS40002198's `AVRxt` column
 //! and DS40002413B. Counts instructions, not cycles, and models level 0 only.
+
+#![expect(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) says an item is for other xtask modules, which pub inside a private module hides"
+)]
 
 use std::ops::Range;
 
@@ -63,6 +68,10 @@ pub trait Bus {
     }
 }
 
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "CPU state the datasheet describes as separate bits, each set and cleared on its own"
+)]
 pub struct Cpu {
     pub r: [u8; 32],
     /// A word address.
@@ -135,6 +144,11 @@ impl Cpu {
             .map_err(|e| format!("{address:#06x}: {e}"))
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        reason = "one arm per opcode group, with the instruction set manual's operand names"
+    )]
     fn execute(&mut self, bus: &mut impl Bus, w: u16) -> Result<(), String> {
         let d = usize::from((w >> 4) & 0x1F);
         let r = usize::from(w & 0x0F | (w >> 5) & 0x10);
@@ -270,6 +284,11 @@ impl Cpu {
         Ok(())
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        clippy::many_single_char_names,
+        reason = "one arm per opcode in the 0x9 group, with the instruction set manual's operand names"
+    )]
     fn execute_9(&mut self, bus: &mut impl Bus, w: u16, d: usize) -> Result<(), String> {
         let rd = self.reg(d);
         match (w >> 9) & 7 {
@@ -288,7 +307,7 @@ impl Cpu {
                         if w & 1 != 0 {
                             self.set_pair(30, z.wrapping_add(1));
                         }
-                        self.program_byte(bus, z)?
+                        Self::program_byte(bus, z)?
                     }
                     0xF => self.pop(bus)?,
                     _ => return Err(unknown(w)),
@@ -351,7 +370,7 @@ impl Cpu {
                         self.pc = self.pop_pc(bus)?;
                     }
                     0x95A8 => bus.wdr()?,
-                    0x95C8 => *self.reg_mut(0) = self.program_byte(bus, self.pair(30))?, // lpm
+                    0x95C8 => *self.reg_mut(0) = Self::program_byte(bus, self.pair(30))?, // lpm
                     0x9588 => self.sleep(bus)?,
                     _ => return Err(unknown(w)),
                 },
@@ -562,7 +581,7 @@ impl Cpu {
         Ok(())
     }
 
-    fn program_byte(&self, bus: &impl Bus, addr: u16) -> Result<u8, String> {
+    fn program_byte(bus: &impl Bus, addr: u16) -> Result<u8, String> {
         let w = bus
             .fetch(u32::from(addr >> 1))
             .ok_or_else(|| format!("lpm from {addr:#06x}, outside flash"))?;
@@ -1087,6 +1106,10 @@ mod tests {
         assert!(cpu.step(&mut bus).unwrap_err().contains("outside flash"));
     }
 
+    #[expect(
+        clippy::many_single_char_names,
+        reason = "the instruction set manual's operand names"
+    )]
     fn multiply(w: u16, (d, a): (usize, u8), (r, b): (usize, u8)) -> (u16, bool, bool) {
         let (cpu, _) = run(&[w], |cpu, _| {
             cpu.set_pair(0, 0xA5A5);
@@ -1263,7 +1286,7 @@ mod tests {
     fn takes_nothing_with_sreg_i_clear() {
         let image = program(&[(3, &clears(1 << 3))], &[ldi(17, 1), NOP]);
         let (_, bus) = run(&image, |_, bus| bus.pending = 1 << 3);
-        assert!(bus.log.is_empty());
+        assert!(bus.log.is_empty(), "{:?}", bus.log);
     }
 
     const INC_R17: u16 = 0x9513;
