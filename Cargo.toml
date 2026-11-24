@@ -16,9 +16,9 @@ unsafe_op_in_unsafe_fn = "deny"
 
 [workspace.lints.clippy]
 # includes lintgroups correctness, suspicious, complexity, perf, style:
-all = { level = "deny", priority = -1 }
-pedantic = { level = "deny", priority = -1 }
-nursery = { level = "deny", priority = -1 }
+all = "deny"
+pedantic = "deny"
+nursery = "deny"
 # from clippy:restriction:
 dbg_macro = "deny"
 todo = "deny"
