@@ -333,19 +333,12 @@ fn centivolts(volts: &str) -> Result<u16, Error> {
         .ok_or(Error::Voltage)
 }
 
-#[expect(
-    clippy::option_if_let_else,
-    reason = "two suffixes to try in turn read better as if let than as nested map_or_else"
-)]
 fn ticks(duration: &str) -> Result<u16, Error> {
-    let ms = if let Some(ms) = duration.strip_suffix("ms") {
-        ms.parse().ok()
-    } else if let Some(s) = duration.strip_suffix('s') {
-        decimal(s, 3)
-    } else {
-        None
-    };
-    let ms = ms.ok_or(Error::Duration)?;
+    let ms: u32 = duration
+        .strip_suffix("ms")
+        .and_then(|ms| ms.parse().ok())
+        .or_else(|| duration.strip_suffix('s').and_then(|s| decimal(s, 3)))
+        .ok_or(Error::Duration)?;
     let rounded = u64::from(ms)
         .checked_mul(u64::from(TICKS_PER_SECOND))
         .and_then(|scaled| scaled.checked_add(500))
