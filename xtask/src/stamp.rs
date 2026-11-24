@@ -8,13 +8,14 @@ use crate::crc::STAMP_AT;
 pub const STAMP_LEN: usize = 16;
 
 const PREFIX: &[u8] = b"kr1k ";
+const ROOM: usize = STAMP_LEN - PREFIX.len();
 
 /// A fixed stamp for the simulator and the tests.
 pub const TEST: [u8; STAMP_LEN] = *b"kr1k test\xFF\xFF\xFF\xFF\xFF\xFF\xFF";
 
 pub fn format(hash: &str, dirty: bool) -> [u8; STAMP_LEN] {
     let mut stamp = [0xFF; STAMP_LEN];
-    let room = STAMP_LEN - PREFIX.len() - usize::from(dirty);
+    let room = if dirty { ROOM - 1 } else { ROOM };
     let text = PREFIX
         .iter()
         .copied()

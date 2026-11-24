@@ -10,8 +10,10 @@ use kr1k::regs::{
 };
 use kr1k::ui::Aux;
 
+use crate::int;
+
 /// Main clocks a second.
-const CLK_PER: u64 = kr1k::watchdog::CLOCK_HZ as u64;
+const CLK_PER: u64 = int::u64_from_u32(kr1k::watchdog::CLOCK_HZ);
 /// The AW2016's fastest SCL and shortest SCL low ("I2C Interface Timing").
 const SCL_MAX_HZ: u64 = 400_000;
 const T_LOW_MIN_NS: u64 = 1300;
@@ -64,8 +66,20 @@ impl Aw2016 {
         }
     }
 
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "at is GCR1, GCR2, LCTR, or a channel's LCFG or PWM, all under 0x40"
+    )]
     fn reg(&self, at: u8) -> u8 {
         self.regs[usize::from(at)]
+    }
+
+    #[expect(
+        clippy::indexing_slicing,
+        reason = "at is GCR1 or one of MODELLED, all under 0x40"
+    )]
+    fn reg_mut(&mut self, at: u8) -> &mut u8 {
+        &mut self.regs[usize::from(at)]
     }
 
     pub fn awake(&self) -> bool {
@@ -73,8 +87,8 @@ impl Aw2016 {
     }
 
     fn output(&self, channel: u8) -> Option<(u8, u8)> {
-        let cur = self.reg(LCFG1 + channel) & CUR;
-        let pwm = self.reg(PWM1 + channel);
+        let cur = self.reg(LCFG1.checked_add(channel)?) & CUR;
+        let pwm = self.reg(PWM1.checked_add(channel)?);
         let on = self.awake() && self.reg(LCTR) & 1 << channel != 0;
         (on && cur > 0 && pwm > 0).then_some((cur, pwm))
     }
@@ -121,7 +135,7 @@ impl Aw2016 {
 
     /// Standby and reset are as "Operating Mode" and "Software Reset" have them.
     pub fn write(&mut self, now: u64, at: u8, value: u8) -> Result<(), String> {
-        let late = now.saturating_sub(self.woke_at) < WAKE_CLOCKS;
+        let since = now.saturating_sub(self.woke_at);
         match at {
             RSTR if value == RESET => self.regs = [0; 0x40],
             RSTR => {
@@ -139,7 +153,7 @@ impl Aw2016 {
                 if value & CHIPEN != 0 && !self.awake() {
                     self.woke_at = now;
                 }
-                self.regs[usize::from(GCR1)] = value;
+                *self.reg_mut(GCR1) = value;
             }
             _ if !MODELLED.contains(&at) => {
                 return Err(format!(
@@ -153,12 +167,11 @@ impl Aw2016 {
                      only RSTR and GCR1 take a write, so it's dropped"
                 ));
             }
-            _ if late => {
+            _ if since < WAKE_CLOCKS => {
                 return Err(format!(
-                    "writes {value:#04x} to the AW2016's register {at:#04x} {} clocks after \
+                    "writes {value:#04x} to the AW2016's register {at:#04x} {since} clocks after \
                      CHIPEN rose, inside the {WAKE_CLOCKS} its oscillator likely needs, so it's \
-                     likely dropped",
-                    now - self.woke_at
+                     likely dropped"
                 ));
             }
             GCR2 if value & !IMAX != 0 => {
@@ -176,10 +189,10 @@ impl Aw2016 {
                 return Err(format!(
                     "writes {value:#04x} to the AW2016's LCFG{}, a pattern, fade or sync the \
                      simulator doesn't model",
-                    at - LCFG1 + 1
+                    u16::from(at.abs_diff(LCFG1)) + 1
                 ));
             }
-            _ => self.regs[usize::from(at)] = value,
+            _ => *self.reg_mut(at) = value,
         }
         Ok(())
     }
@@ -236,8 +249,8 @@ impl Twi {
     }
 
     /// Main clocks in an SCL period, by equation 1 of §29.3.2.2.1 with no rise time.
-    fn period(&self) -> u64 {
-        10 + 2 * u64::from(self.baud)
+    fn period(&self) -> u32 {
+        10 + u32::from(2 * u16::from(self.baud))
     }
 
     pub fn catch_up(&mut self, now: u64, pc1_high: bool) -> Result<(), String> {
@@ -261,7 +274,7 @@ impl Twi {
                 self.arblost = true;
                 self.buserr = true;
                 self.state = TWI_BUSSTATE_BUSY;
-                self.failures += 1;
+                self.failures = self.failures.saturating_add(1);
                 self.gave_up = true;
                 return Ok(());
             }
@@ -272,7 +285,7 @@ impl Twi {
                 if acked {
                     self.pointer = Some(None);
                 } else {
-                    self.failures += 1;
+                    self.failures = self.failures.saturating_add(1);
                     self.gave_up = true;
                 }
             }
@@ -282,10 +295,9 @@ impl Twi {
                 match self.pointer {
                     Some(None) => self.pointer = Some(Some(value)),
                     Some(Some(at)) => {
+                        let past = || format!("writes past the AW2016's registers, at {at:#04x}");
                         if usize::from(at) >= 0x40 {
-                            return Err(format!(
-                                "writes past the AW2016's registers, at {at:#04x}"
-                            ));
+                            return Err(past());
                         }
                         let was_lit = self.aw2016.lit();
                         self.aw2016.write(now, at, value)?;
@@ -296,7 +308,7 @@ impl Twi {
                                     .into(),
                             );
                         }
-                        self.pointer = Some(Some(at + 1));
+                        self.pointer = Some(Some(at.checked_add(1).ok_or_else(past)?));
                     }
                     None => return Err("sends data with no address acknowledged".into()),
                 }
@@ -342,26 +354,28 @@ impl Twi {
                         aw2016: std::mem::replace(&mut self.aw2016, Aw2016::new()),
                         baud: self.baud,
                         sessions: self.sessions,
-                        failures: self.failures + stranded,
+                        failures: self.failures.saturating_add(stranded),
                         ..Self::new()
                     };
                 }
                 TWI_ENABLE => {
-                    let ns = |clocks: u64| clocks * 1_000_000_000 / CLK_PER;
-                    let period = self.period();
+                    let ns = |clocks: u32| u64::from(clocks) * 1_000_000_000 / CLK_PER;
+                    let scl_hz = CLK_PER
+                        .checked_div(u64::from(self.period()))
+                        .unwrap_or(u64::MAX);
                     // SCL low is by equation 3.2, less the fall time.
-                    if CLK_PER / period > SCL_MAX_HZ
-                        || ns(u64::from(self.baud) + 6).saturating_sub(T_OF_MAX_NS) < T_LOW_MIN_NS
+                    if scl_hz > SCL_MAX_HZ
+                        || ns(u32::from(self.baud) + 6).saturating_sub(T_OF_MAX_NS) < T_LOW_MIN_NS
                     {
                         return Err(format!(
                             "turns the TWI host on with MBAUD {}, an SCL of {} kHz, too quick \
                              for the AW2016's 400 kHz and 1.3 µs low",
                             self.baud,
-                            CLK_PER / period / 1000
+                            scl_hz / 1000
                         ));
                     }
                     if !self.on {
-                        self.sessions += 1;
+                        self.sessions = self.sessions.saturating_add(1);
                     }
                     self.on = true;
                 }
@@ -428,7 +442,7 @@ impl Twi {
                 // (§29.3.2.2.3, §29.3.2.2.4).
                 let done = match self.fault {
                     Fault::SclLow => u64::MAX,
-                    _ => now + 10 * self.period(),
+                    _ => now.saturating_add(10 * u64::from(self.period())),
                 };
                 self.sending = Some((done, Byte::Address(value)));
             }
@@ -438,7 +452,8 @@ impl Twi {
                     return Err("writes TWI0.MDATA after a NACK".into());
                 }
                 self.clear_flags();
-                self.sending = Some((now + 9 * self.period(), Byte::Data(value)));
+                let done = now.saturating_add(9 * u64::from(self.period()));
+                self.sending = Some((done, Byte::Data(value)));
             }
             reg::TWI0_MCTRLB => {
                 if value != TWI_MCMD_STOP {
@@ -449,7 +464,7 @@ impl Twi {
                 self.ready("TWI0.MCTRLB")?;
                 self.clear_flags();
                 self.pointer = None;
-                self.stopping = Some(now + self.period());
+                self.stopping = Some(now.saturating_add(u64::from(self.period())));
             }
             _ => {
                 return Err(format!(
