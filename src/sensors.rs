@@ -162,17 +162,17 @@ mod tests {
         (0..ticks).map(|_| schedule.tick(result, lit)).collect()
     }
 
-    const fn convert(channel: Channel, setup: bool) -> Option<Convert> {
-        Some(Convert { channel, setup })
+    const fn convert(channel: Channel, setup: bool) -> Convert {
+        Convert { channel, setup }
     }
 
     fn dark_round() -> [(Option<Reading>, Option<Convert>); 16] {
         let mut expected = [(None, None); 16];
-        expected[0].1 = convert(Channel::Voltage, true);
-        expected[1].1 = convert(Channel::Voltage, false);
+        expected[0].1 = Some(convert(Channel::Voltage, true));
+        expected[1].1 = Some(convert(Channel::Voltage, false));
         expected[2].0 = Some(Reading::Voltage(7));
-        expected[11].1 = convert(Channel::Ground, true);
-        expected[12].1 = convert(Channel::Ground, false);
+        expected[11].1 = Some(convert(Channel::Ground, true));
+        expected[12].1 = Some(convert(Channel::Ground, false));
         expected[13].0 = Some(Reading::Ground(7));
         expected
     }
@@ -200,8 +200,16 @@ mod tests {
             let mut schedule = Schedule::new();
             let ticks = run(&mut schedule, 64, Some(7), lit);
             for round in ticks.chunks(16) {
-                assert_eq!(round[11].1, convert(Channel::Ground, true), "lit: {lit}");
-                assert_eq!(round[0].1, convert(Channel::Voltage, true), "lit: {lit}");
+                assert_eq!(
+                    round[11].1,
+                    Some(convert(Channel::Ground, true)),
+                    "lit: {lit}"
+                );
+                assert_eq!(
+                    round[0].1,
+                    Some(convert(Channel::Voltage, true)),
+                    "lit: {lit}"
+                );
             }
         }
     }
@@ -212,13 +220,13 @@ mod tests {
         let ticks = run(&mut schedule, 16, Some(7), true);
         let mut expected = dark_round();
         for (_, start) in &mut expected[2..8] {
-            *start = convert(Channel::Voltage, false);
+            *start = Some(convert(Channel::Voltage, false));
         }
         for (reading, _) in &mut expected[3..9] {
             *reading = Some(Reading::Quick(7));
         }
-        expected[8].1 = convert(Channel::Temperature, true);
-        expected[9].1 = convert(Channel::Temperature, false);
+        expected[8].1 = Some(convert(Channel::Temperature, true));
+        expected[9].1 = Some(convert(Channel::Temperature, false));
         expected[10].0 = Some(Reading::Temperature(7));
         assert_eq!(ticks, expected);
     }
@@ -278,7 +286,7 @@ mod tests {
         for out_at in 3..9 {
             let mut schedule = Schedule::new();
             let lit = run(&mut schedule, out_at, Some(7), true);
-            assert_eq!(lit[out_at - 1].1, convert(Channel::Voltage, false));
+            assert_eq!(lit[out_at - 1].1, Some(convert(Channel::Voltage, false)));
             assert_eq!(
                 schedule.tick(Some(9), false),
                 (Some(Reading::Quick(9)), None),
@@ -339,11 +347,11 @@ mod tests {
         run(&mut schedule, 8, Some(1), false);
         assert_eq!(
             schedule.tick(Some(1), true),
-            (None, convert(Channel::Temperature, true))
+            (None, Some(convert(Channel::Temperature, true)))
         );
         assert_eq!(
             schedule.tick(Some(1), false),
-            (None, convert(Channel::Temperature, false))
+            (None, Some(convert(Channel::Temperature, false)))
         );
         assert_eq!(
             schedule.tick(Some(1), false),

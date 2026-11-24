@@ -956,7 +956,7 @@ mod tests {
     #[test]
     fn reads_program_memory() {
         let (cpu, _) = run(&[0x9105, 0x9115, 0xC001, 0x1234], |cpu, _| {
-            cpu.set_pair(30, 6)
+            cpu.set_pair(30, 6);
         });
         assert_eq!((cpu.r[16], cpu.r[17]), (0x34, 0x12));
     }
