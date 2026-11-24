@@ -198,21 +198,14 @@ impl Aw2016 {
     }
 }
 
-#[expect(
-    clippy::struct_excessive_bools,
-    reason = "TWI0's status bits, which the datasheet keeps separate"
-)]
 pub struct Twi {
     pub fault: Fault,
     pub aw2016: Aw2016,
     baud: u8,
     on: bool,
     state: u8,
-    wif: bool,
-    rxack: bool,
-    arblost: bool,
-    buserr: bool,
-    clkhold: bool,
+    /// MSTATUS's bits other than BUSSTATE.
+    flags: u8,
     /// When the byte on the bus finishes, in main clocks, and the byte.
     sending: Option<(u64, Byte)>,
     stopping: Option<u64>,
@@ -235,11 +228,7 @@ impl Twi {
             baud: 0,
             on: false,
             state: TWI_BUSSTATE_UNKNOWN,
-            wif: false,
-            rxack: false,
-            arblost: false,
-            buserr: false,
-            clkhold: false,
+            flags: 0,
             sending: None,
             stopping: None,
             pointer: None,
@@ -272,31 +261,29 @@ impl Twi {
             return Ok(());
         }
         self.sending = None;
-        self.wif = true;
+        self.flags |= TWI_WIF;
         match (byte, self.fault) {
             // §29.3.2.2.3, case M4.
             (Byte::Address(_), Fault::SdaLow) => {
-                self.arblost = true;
-                self.buserr = true;
+                self.flags |= TWI_ARBLOST | TWI_BUSERR;
                 self.state = TWI_BUSSTATE_BUSY;
                 self.failures = self.failures.saturating_add(1);
                 self.gave_up = true;
                 return Ok(());
             }
             (Byte::Address(address), fault) => {
-                self.clkhold = true;
-                let acked = fault == Fault::None && address == ADDRESS << 1;
-                self.rxack = !acked;
-                if acked {
+                self.flags |= TWI_CLKHOLD;
+                if fault == Fault::None && address == ADDRESS << 1 {
+                    self.flags &= !TWI_RXACK;
                     self.pointer = Some(None);
                 } else {
+                    self.flags |= TWI_RXACK;
                     self.failures = self.failures.saturating_add(1);
                     self.gave_up = true;
                 }
             }
             (Byte::Data(value), _) => {
-                self.clkhold = true;
-                self.rxack = false;
+                self.flags = self.flags & !TWI_RXACK | TWI_CLKHOLD;
                 match self.pointer {
                     Some(None) => self.pointer = Some(Some(value)),
                     Some(Some(at)) => {
@@ -324,13 +311,7 @@ impl Twi {
 
     pub fn status(&mut self, now: u64, pc1_high: bool) -> Result<u8, String> {
         self.catch_up(now, pc1_high)?;
-        let flag = |on: bool, bit: u8| if on { bit } else { 0 };
-        Ok(flag(self.wif, TWI_WIF)
-            | flag(self.clkhold, TWI_CLKHOLD)
-            | flag(self.rxack, TWI_RXACK)
-            | flag(self.arblost, TWI_ARBLOST)
-            | flag(self.buserr, TWI_BUSERR)
-            | self.state)
+        Ok(self.flags | self.state)
     }
 
     fn write_mctrla(&mut self, value: u8) -> Result<(), String> {
@@ -451,15 +432,15 @@ impl Twi {
                 if value & TWI_BUSSTATE == TWI_BUSSTATE_IDLE {
                     self.state = TWI_BUSSTATE_IDLE;
                 }
-                self.wif &= value & TWI_WIF == 0;
-                self.clkhold &= value & (TWI_WIF | TWI_RIF) == 0;
-                self.arblost &= value & TWI_ARBLOST == 0;
-                self.buserr &= value & TWI_BUSERR == 0;
+                self.flags &= !(value & (TWI_WIF | TWI_ARBLOST | TWI_BUSERR));
+                if value & (TWI_WIF | TWI_RIF) != 0 {
+                    self.flags &= !TWI_CLKHOLD;
+                }
             }
             reg::TWI0_MADDR => self.write_maddr(now, value)?,
             reg::TWI0_MDATA => {
                 self.ready("TWI0.MDATA")?;
-                if self.rxack {
+                if self.flags & TWI_RXACK != 0 {
                     return Err("writes TWI0.MDATA after a NACK".into());
                 }
                 self.clear_flags();
@@ -492,17 +473,14 @@ impl Twi {
         if !self.on || self.state != TWI_BUSSTATE_OWNER {
             return Err(format!("writes {what} without owning the bus"));
         }
-        if self.sending.is_some() || !self.clkhold {
+        if self.sending.is_some() || self.flags & TWI_CLKHOLD == 0 {
             return Err(format!("writes {what} with a byte still on the bus"));
         }
         Ok(())
     }
 
     const fn clear_flags(&mut self) {
-        self.wif = false;
-        self.clkhold = false;
-        self.arblost = false;
-        self.buserr = false;
+        self.flags &= !(TWI_WIF | TWI_CLKHOLD | TWI_ARBLOST | TWI_BUSERR);
     }
 }
 
