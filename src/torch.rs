@@ -161,14 +161,10 @@ impl Torch {
     }
 
     pub fn rest_for(&mut self, ticks: u16) {
-        #[expect(
-            clippy::option_if_let_else,
-            reason = "map_or here costs the firmware 8 more instructions a tick on AVR"
-        )]
-        let ticks = match self.quiet_for() {
-            Some(quiet) => ticks.min(quiet),
-            None => 0,
+        let Some(quiet) = self.quiet_for() else {
+            return;
         };
+        let ticks = ticks.min(quiet);
         if ticks == 0 {
             return;
         }
