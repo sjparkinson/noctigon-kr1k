@@ -614,14 +614,20 @@ fn resting(mut sim: Sim, phase: PitPhase, report: &mut Report) -> Result<(), Str
         Action::Wait(20 * SECOND),
         Action::Clicks(1),
         Action::Wait(3 * SECOND),
-        Action::Clicks(3),
-        Action::Wait(12 * SECOND + 17),
         Action::Hold {
             clicks: 1,
+            ticks: SECOND,
+        },
+        Action::Wait(12 * SECOND + 17),
+        Action::Hold {
+            clicks: 2,
             ticks: 2 * SECOND,
         },
         Action::Wait(14 * SECOND),
-        Action::Clicks(3),
+        Action::Hold {
+            clicks: 1,
+            ticks: SECOND,
+        },
         Action::Wait(9 * SECOND + 40),
         Action::Clicks(1),
         Action::Wait(6 * SECOND),
@@ -658,7 +664,7 @@ fn stale_edges(mut sim: Sim, report: &mut Report) -> Result<(), String> {
 
 fn bad_bus(mut sim: Sim, fault: Fault, report: &mut Report) -> Result<(), String> {
     sim.chip.twi.fault = fault;
-    let words = "1C wait:1s 3C wait:1s 1C wait:6s 3C wait:1s 1C 1H wait:1s 1C wait:1s";
+    let words = "1C wait:1s 2H wait:1s 1C wait:6s 2H wait:1s 1C 1H wait:1s 1C wait:1s";
     let end = in_step(&mut sim, script(words)?, report)?;
     ends_off(end)?;
     if sim.chip.pc1_rises < 2 {
