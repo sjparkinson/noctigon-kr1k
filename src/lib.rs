@@ -16,6 +16,7 @@
         clippy::cast_sign_loss,
         clippy::cast_possible_wrap,
         clippy::as_conversions,
+        clippy::float_arithmetic,
     )
 )]
 
@@ -41,7 +42,8 @@ pub mod temp;
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_possible_wrap,
-    clippy::as_conversions
+    clippy::as_conversions,
+    clippy::float_arithmetic
 )]
 pub mod testing;
 pub mod thermal;
