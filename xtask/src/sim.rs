@@ -30,6 +30,7 @@ use kr1k::watchdog::{
 use crate::avr::{Bus, Cpu, I, IO_LOW_END, VECTOR_WORDS, is_call, is_two_words, ldi, ldi_operands};
 use crate::crc;
 use crate::elf::{DATA_SPACE, Elf, SRAM};
+use crate::int;
 use crate::layout::{jmp_target, word};
 use crate::stamp;
 use crate::switching::RandomSwitching;
@@ -68,11 +69,11 @@ const DAC_DRIVING: u8 = DAC_ENABLE | DAC_OUTEN;
 /// How far DAC0's 10-bit code sits up DATA (§34.5.2).
 const DAC_SHIFT: u32 = regs::DAC_DATA.trailing_zeros();
 
-const VECTOR_RTC_PIT: u8 = regs::VECTOR_RTC_PIT as u8;
-const VECTOR_TCB0: u8 = regs::VECTOR_TCB0_INT as u8;
-const VECTOR_PORTA: u8 = regs::VECTOR_PORTA_PORT as u8;
-const VECTOR_PORTC: u8 = regs::VECTOR_PORTC_PORT as u8;
-const VECTOR_PORTD: u8 = regs::VECTOR_PORTD_PORT as u8;
+const VECTOR_RTC_PIT: u8 = int::u8_of(regs::VECTOR_RTC_PIT);
+const VECTOR_TCB0: u8 = int::u8_of(regs::VECTOR_TCB0_INT);
+const VECTOR_PORTA: u8 = int::u8_of(regs::VECTOR_PORTA_PORT);
+const VECTOR_PORTC: u8 = int::u8_of(regs::VECTOR_PORTC_PORT);
+const VECTOR_PORTD: u8 = int::u8_of(regs::VECTOR_PORTD_PORT);
 const VECTORS: usize = regs::VECTORS;
 const _: () = assert!(VECTORS <= 64);
 
