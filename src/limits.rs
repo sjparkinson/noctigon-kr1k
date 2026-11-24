@@ -123,6 +123,9 @@ impl Limits {
         self.rest_for(1);
     }
 
+    /// Never inlined, since the firmware's loop reaches it two ways and would
+    /// get a copy for each.
+    #[inline(never)]
     pub const fn rest_for(&mut self, ticks: u16) {
         if ticks == 0 {
             return;
