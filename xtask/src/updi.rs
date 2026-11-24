@@ -22,39 +22,41 @@ use kr1k::regs::{
 pub mod map {
     use kr1k::regs::{self, addr, mem};
 
+    use crate::int;
+
     /// UPDI's address space (DS §36.2.2, figure 36-2), not in the ATDF.
     pub const UPDI_FLASH: u32 = 0x80_0000;
-    pub const FLASH: u16 = mem::MAPPED_PROGMEM_START as u16;
+    pub const FLASH: u16 = int::u16_of(mem::MAPPED_PROGMEM_START);
     pub const FLASH_SIZE: usize = mem::PROGMEM_SIZE;
     pub const FLASH_PAGE: usize = mem::PROGMEM_PAGE;
 
-    pub const EEPROM: u16 = mem::EEPROM_START as u16;
+    pub const EEPROM: u16 = int::u16_of(mem::EEPROM_START);
     pub const EEPROM_SIZE: usize = mem::EEPROM_SIZE;
 
-    pub const SIGNATURE: u16 = mem::SIGNATURES_START as u16;
+    pub const SIGNATURE: u16 = int::u16_of(mem::SIGNATURES_START);
     pub const AVR32DD20: [u8; 3] = regs::SIGNATURE;
 
     /// Read only, since UPDI can't write the signature row (DS table 8-5).
-    pub const SERIAL: u16 = addr::SIGROW_SERNUM0 as u16;
+    pub const SERIAL: u16 = int::u16_of(addr::SIGROW_SERNUM0);
     pub const SERIAL_SIZE: usize = addr::SIGROW_SERNUM15 - addr::SIGROW_SERNUM0 + 1;
 
     /// Read for `backup`. Nothing here writes the fuses.
-    pub const FUSES: u16 = mem::FUSES_START as u16;
+    pub const FUSES: u16 = int::u16_of(mem::FUSES_START);
     pub const FUSES_SIZE: usize = mem::FUSES_SIZE;
 
     /// LOCK.KEY, low byte first. Read for `backup`, and nothing here writes it.
-    pub const LOCK: u16 = mem::LOCKBITS_START as u16;
+    pub const LOCK: u16 = int::u16_of(mem::LOCKBITS_START);
     pub const LOCK_SIZE: usize = mem::LOCKBITS_SIZE;
     /// Any other value locks the chip (DS §8.9.2.1).
     #[cfg(test)]
     pub const UNLOCKED: [u8; LOCK_SIZE] = regs::LOCK_KEY_NOLOCK.to_le_bytes();
 
     /// Read for `backup`. Nothing here writes the user row.
-    pub const USERROW: u16 = mem::USER_SIGNATURES_START as u16;
+    pub const USERROW: u16 = int::u16_of(mem::USER_SIGNATURES_START);
     pub const USERROW_SIZE: usize = mem::USER_SIGNATURES_SIZE;
 
-    pub const NVMCTRL_CTRLA: u16 = addr::NVMCTRL_CTRLA as u16;
-    pub const NVMCTRL_STATUS: u16 = addr::NVMCTRL_STATUS as u16;
+    pub const NVMCTRL_CTRLA: u16 = int::u16_of(addr::NVMCTRL_CTRLA);
+    pub const NVMCTRL_STATUS: u16 = int::u16_of(addr::NVMCTRL_STATUS);
 }
 
 /// `send` swallows the echo of what it writes.
@@ -303,13 +305,13 @@ impl<W: Wire> Programmer<W> {
         }
 
         self.reset()?;
-        let deadline = self.wire.now() + PROGMODE_TIMEOUT;
+        let start = self.wire.now();
         loop {
             let status = self.ldcs(ASI_SYS_STATUS)?;
             if status & SYS_STATUS_LOCKSTATUS == 0 && status & SYS_STATUS_PROGSTART != 0 {
                 return Ok(());
             }
-            if self.wire.now() >= deadline {
+            if self.wire.now().duration_since(start) >= PROGMODE_TIMEOUT {
                 break;
             }
         }
@@ -342,9 +344,9 @@ impl<W: Wire> Programmer<W> {
     pub fn read(&mut self, addr: impl Into<u32>, len: usize) -> Result<Vec<u8>> {
         let addr = addr.into();
         let mut out = vec![0; len];
-        for (i, chunk) in out.chunks_mut(MAX_BLOCK).enumerate() {
-            self.st_ptr(offset(addr, i * MAX_BLOCK)?)?;
-            let mut frame = repeat(chunk.len());
+        for (chunk, at) in out.chunks_mut(MAX_BLOCK).zip((0..).step_by(MAX_BLOCK)) {
+            self.st_ptr(offset(addr, at)?)?;
+            let mut frame = repeat(chunk.len())?;
             frame.extend([SYNC, LD | PTR_INC | DATA_8]);
             self.send(&frame)?;
             self.recv(chunk)?;
@@ -364,11 +366,12 @@ impl<W: Wire> Programmer<W> {
     pub fn erase_and_write_flash(&mut self, data: &[u8]) -> Result<()> {
         fits_flash(data)?;
         self.chip_erase()?;
-        for (i, chunk) in data.chunks(map::FLASH_PAGE).enumerate() {
+        let pages = (0..).step_by(map::FLASH_PAGE);
+        for (chunk, at) in data.chunks(map::FLASH_PAGE).zip(pages) {
             if chunk.iter().all(|&b| b == 0xFF) {
                 continue;
             }
-            let page = offset(map::UPDI_FLASH, i * map::FLASH_PAGE)?;
+            let page = offset(map::UPDI_FLASH, at)?;
             self.erase_flash_page(page)?;
             self.write_flash_page(page, chunk)?;
         }
@@ -391,12 +394,13 @@ impl<W: Wire> Programmer<W> {
         if words.len() % 2 == 1 {
             words.push(0xFF);
         }
+        let repeat = repeat(words.len() / 2)?;
 
         self.wait_nvm()?;
         self.nvm_command(NVM_FLASH_WRITE)?;
         let written = self.st_ptr(page).and_then(|()| {
             let mut frame = vec![SYNC, STCS | CS_CTRLA, CTRLA_IBDLY | CTRLA_RSD];
-            frame.extend(repeat(words.len() / 2));
+            frame.extend(repeat);
             frame.extend([SYNC, ST | PTR_INC | DATA_16]);
             frame.extend(&words);
             frame.extend([SYNC, STCS | CS_CTRLA, CTRLA_IBDLY]);
@@ -422,13 +426,11 @@ impl<W: Wire> Programmer<W> {
     pub fn verify(&mut self, addr: impl Into<u32>, data: &[u8]) -> Result<()> {
         let addr = addr.into();
         let actual = self.read(addr, data.len())?;
-        match actual.iter().zip(data).position(|(a, b)| a != b) {
+        let mut bytes = actual.iter().zip(data).zip(addr..);
+        match bytes.find(|((read, wrote), _)| read != wrote) {
             None => Ok(()),
-            Some(i) => Err(format!(
-                "verify failed at 0x{:06X}: wrote {:02X}, read {:02X}",
-                addr as usize + i,
-                data[i],
-                actual[i]
+            Some(((read, wrote), at)) => Err(format!(
+                "verify failed at 0x{at:06X}: wrote {wrote:02X}, read {read:02X}"
             )),
         }
     }
@@ -546,9 +548,11 @@ fn offset(addr: u32, by: usize) -> Result<u32> {
         .ok_or_else(|| "address out of range".to_string())
 }
 
-fn repeat(count: usize) -> Vec<u8> {
-    assert!((1..=MAX_BLOCK).contains(&count), "REPEAT covers 1 to 256");
-    vec![SYNC, REPEAT, (count - 1) as u8]
+fn repeat(count: usize) -> Result<Vec<u8>> {
+    match count.checked_sub(1).map(u8::try_from) {
+        Some(Ok(more)) => Ok(vec![SYNC, REPEAT, more]),
+        _ => Err(format!("REPEAT covers 1 to {MAX_BLOCK}, not {count}")),
+    }
 }
 
 /// The datasheet's names (DS §11.5.3), which differ from the ATDF's.
