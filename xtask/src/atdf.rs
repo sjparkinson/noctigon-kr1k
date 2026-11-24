@@ -267,18 +267,42 @@ fn names(name: &str, rows: &[(u32, String)]) -> String {
 
 /// The ATDF's `initval`s stay out on purpose, because they disagree with the
 /// datasheet on ADC0.CALIB and the factory OSCCFG and SYSCFG0.
-#[expect(
-    clippy::too_many_lines,
-    reason = "one pass over the ATDF, in the order regs.rs is laid out"
-)]
 pub fn generate(xml: &str) -> Result<String, String> {
     let document = parse(xml)?;
     let file = document.child("avr-tools-device-file")?;
     let device = file.child("devices")?.child("device")?;
+    let (addr, addr_names) = addresses(&document)?;
+    let mem = memory(device)?;
+    let bits = bitfields(file)?;
+    let (vectors, vector_names) = vectors(device)?;
+    let signature = signature(device)?;
 
+    Ok(format!(
+        "/// Data-space addresses of every register.\n\
+         pub mod addr {{\n{}{}}}\n\n\
+         /// Every memory segment. All of them are in data space but PROGMEM.\n\
+         pub mod mem {{\n{}}}\n\n\
+         {}\n{}{}\n\
+         /// The device signature.\n\
+         pub const SIGNATURE: [u8; 3] = {signature:#04X?};\n",
+        addr.render(|_| "usize"),
+        names("NAMES", &addr_names),
+        // usize is 16 bits on the AVR, and the mapped-flash window ends at 0x10000.
+        mem.render(|value| if value > 0xFFFF { "u32" } else { "usize" }),
+        bits.render(|value| match value {
+            0x1_0000.. => "u32",
+            0x100.. => "u16",
+            _ => "u8",
+        }),
+        vectors.render(|_| "usize"),
+        names("VECTOR_NAMES", &vector_names),
+    ))
+}
+
+fn addresses(document: &Element) -> Result<(Consts, Vec<(u32, String)>), String> {
     let mut addr = Consts::default();
     let mut addr_names = Vec::new();
-    for r in registers(&document)? {
+    for r in registers(document)? {
         let too_big = || format!("{}.{} is too big", r.instance, r.name);
         let width = match r.size {
             1 => String::new(),
@@ -292,7 +316,10 @@ pub fn generate(xml: &str) -> Result<String, String> {
         let end = r.address.checked_add(r.size).ok_or_else(too_big)?;
         addr_names.extend((r.address..end).map(|at| (at, format!("{}.{}", r.instance, r.name))));
     }
+    Ok((addr, addr_names))
+}
 
+fn memory(device: &Element) -> Result<Consts, String> {
     let mut mem = Consts::default();
     let spaces = device.child("address-spaces")?.all("address-space");
     for segment in spaces.flat_map(|space| space.all("memory-segment")) {
@@ -310,7 +337,10 @@ pub fn generate(xml: &str) -> Result<String, String> {
             mem.add(format!("{name}_PAGE"), num(page)?, doc);
         }
     }
+    Ok(mem)
+}
 
+fn bitfields(file: &Element) -> Result<Consts, String> {
     let mut bits = Consts::default();
     for module in file.child("modules")?.all("module") {
         let prefix = module.get("name")?;
@@ -340,7 +370,10 @@ pub fn generate(xml: &str) -> Result<String, String> {
             }
         }
     }
+    Ok(bits)
+}
 
+fn vectors(device: &Element) -> Result<(Consts, Vec<(u32, String)>), String> {
     let mut vectors = Consts::default();
     let mut vector_names = Vec::new();
     let mut count = 0;
@@ -361,7 +394,10 @@ pub fn generate(xml: &str) -> Result<String, String> {
     }
     let doc = "Entries in the vector table, reset included.".to_string();
     vectors.add("VECTORS".into(), count, doc);
+    Ok((vectors, vector_names))
+}
 
+fn signature(device: &Element) -> Result<[u32; 3], String> {
     let property = |name: &str| {
         let groups = device.child("property-groups")?.all("property-group");
         groups
@@ -370,32 +406,11 @@ pub fn generate(xml: &str) -> Result<String, String> {
             .ok_or_else(|| format!("no property {name}"))?
             .num("value")
     };
-    let signature = [
+    Ok([
         property("SIGNATURE0")?,
         property("SIGNATURE1")?,
         property("SIGNATURE2")?,
-    ];
-
-    Ok(format!(
-        "/// Data-space addresses of every register.\n\
-         pub mod addr {{\n{}{}}}\n\n\
-         /// Every memory segment. All of them are in data space but PROGMEM.\n\
-         pub mod mem {{\n{}}}\n\n\
-         {}\n{}{}\n\
-         /// The device signature.\n\
-         pub const SIGNATURE: [u8; 3] = {signature:#04X?};\n",
-        addr.render(|_| "usize"),
-        names("NAMES", &addr_names),
-        // usize is 16 bits on the AVR, and the mapped-flash window ends at 0x10000.
-        mem.render(|value| if value > 0xFFFF { "u32" } else { "usize" }),
-        bits.render(|value| match value {
-            0x1_0000.. => "u32",
-            0x100.. => "u16",
-            _ => "u8",
-        }),
-        vectors.render(|_| "usize"),
-        names("VECTOR_NAMES", &vector_names),
-    ))
+    ])
 }
 
 #[cfg(test)]
